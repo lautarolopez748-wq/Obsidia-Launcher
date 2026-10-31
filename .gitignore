@@ -1,0 +1,14 @@
+# Rust/Tauri build
+obsidia-app/src-tauri/target/
+obsidia-app/src-tauri/gen/
+# Node
+obsidia-app/node_modules/
+obsidia-app/build/
+# Scripts cache
+*.log
+# OS
+.DS_Store
+Thumbs.db
+# Secrets
+obsidia-app/src-tauri/updater.key
+obsidia-app/src-tauri/updater.key.pub
