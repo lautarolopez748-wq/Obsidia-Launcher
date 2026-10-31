@@ -1,7 +1,4 @@
-mod launcher;
-
 use serde::{Deserialize, Serialize};
-use sha1::{Digest, Sha1};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -9,7 +6,7 @@ use std::time::Duration;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-pub(crate) fn new_cmd<S: AsRef<std::ffi::OsStr>>(program: S) -> Command {
+fn new_cmd<S: AsRef<std::ffi::OsStr>>(program: S) -> Command {
     let mut c = std::process::Command::new(program);
     #[cfg(windows)]
     c.creation_flags(0x08000000);
@@ -136,7 +133,7 @@ fn java_version(path: &Path) -> String {
     }
 }
 
-#[tauri::command(async)]
+#[tauri::command]
 fn detect_javas() -> Result<Vec<JavaInfo>, String> {
     let mut found: Vec<PathBuf> = Vec::new();
     // known minecraft runtimes
@@ -204,34 +201,43 @@ fn detect_javas() -> Result<Vec<JavaInfo>, String> {
     Ok(infos)
 }
 
-/// Abre el juego (descargando lo que falte). Si hay sesión de Microsoft iniciada se usa esa
-/// cuenta; si no, se juega offline con `username`. El progreso llega por el evento
-/// `launch-progress` ({ stage, done, total }).
 #[tauri::command]
-async fn launch_version(
-    app: tauri::AppHandle,
+fn find_launch_script() -> Option<PathBuf> {
+    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../obsidia/scripts/launch_vanilla.py");
+    if dev.exists() {
+        return Some(dev);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for p in [dir.join("resources").join("launch_vanilla.py"), dir.join("launch_vanilla.py")] {
+                if p.exists() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[tauri::command]
+fn launch_version(
     version: String,
     username: String,
     ram: Option<String>,
     java_path: Option<String>,
 ) -> Result<String, String> {
-    let player = match read_ms_profile() {
-        Some(p) => launcher::Player {
-            name: p.name,
-            uuid: p.uuid,
-            token: p.access_token,
-            user_type: "msa".to_string(),
-        },
-        None => launcher::offline_player(&username)?,
-    };
-    let mc = minecraft_dir();
-    let fallback = java_exe();
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        launcher::launch(&app, &mc, &version, player, ram, java_path, fallback)
-    })
-    .await
-    .map_err(|e| e.to_string())?;
-    result
+    let script = find_launch_script().ok_or_else(|| "launch_vanilla.py not found".to_string())?;
+    let script = script.canonicalize().map_err(|e| format!("script not found: {e}"))?;
+    let mut cmd = new_cmd("python");
+    cmd.arg(&script).arg(&version).arg("--username").arg(&username);
+    if let Some(r) = ram {
+        cmd.arg("--ram").arg(r);
+    }
+    if let Some(j) = java_path {
+        cmd.arg("--java").arg(j);
+    }
+    let child = cmd.spawn().map_err(|e| format!("failed to spawn python: {e}"))?;
+    Ok(format!("Lanzado {} para {} (pid {})", version, username, child.id()))
 }
 
 fn download_to(url: &str, dest: &Path) -> Result<(), String> {
@@ -256,7 +262,7 @@ fn java_exe() -> String {
     }
 }
 
-#[tauri::command(async)]
+#[tauri::command]
 fn install_fabric(mc_version: String) -> Result<String, String> {
     let installer_url = "https://maven.fabricmc.net/net/fabricmc/fabric-installer/1.1.2/fabric-installer-1.1.2.jar";
     let installer_path = minecraft_dir().join("obsidia").join("fabric-installer.jar");
@@ -280,7 +286,7 @@ fn install_fabric(mc_version: String) -> Result<String, String> {
     Ok(format!("Fabric instalado para {mc_version}\n{stdout}"))
 }
 
-#[tauri::command(async)]
+#[tauri::command]
 fn install_forge(mc_version: String) -> Result<String, String> {
     // resolve forge version from promotions
     let promos: serde_json::Value = reqwest::blocking::get(
@@ -400,15 +406,6 @@ fn list_resourcepacks() -> Result<Vec<String>, String> {
 
 #[tauri::command]
 fn delete_file_in(folder: String, name: String) -> Result<(), String> {
-    // Solo estas carpetas, y solo un nombre simple (sin "..", barras ni letras de unidad).
-    if !["mods", "shaderpacks", "resourcepacks"].contains(&folder.as_str()) {
-        return Err("Carpeta no permitida".to_string());
-    }
-    let mut comps = Path::new(&name).components();
-    match (comps.next(), comps.next()) {
-        (Some(std::path::Component::Normal(_)), None) => {}
-        _ => return Err("Nombre de archivo inválido".to_string()),
-    }
     let path = minecraft_dir().join(folder).join(&name);
     if path.is_dir() {
         fs::remove_dir_all(&path).map_err(|e| e.to_string())?;
@@ -435,26 +432,13 @@ fn list_installed_mods() -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-/// Cliente HTTP con User-Agent propio (Modrinth lo exige).
-fn http() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .user_agent(launcher::UA)
-        .build()
-        .map_err(|e| e.to_string())
-}
-
 #[tauri::command]
 async fn search_mods(query: String) -> Result<Vec<ModResult>, String> {
-    let resp = http()?
-        .get("https://api.modrinth.com/v2/search")
-        .query(&[
-            ("query", query.as_str()),
-            ("facets", "[[\"project_type:mod\"]]"),
-            ("limit", "20"),
-        ])
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+    let url = format!(
+        "https://api.modrinth.com/v2/search?query={}&facets=[[\"project_type:mod\"]]&limit=20",
+        urlencoding(&query)
+    );
+    let resp = reqwest::get(&url).await.map_err(|e| e.to_string())?;
     let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     if let Some(hits) = json.get("hits").and_then(|h| h.as_array()) {
@@ -470,75 +454,43 @@ async fn search_mods(query: String) -> Result<Vec<ModResult>, String> {
     Ok(out)
 }
 
-fn only_chars(s: &str, extra: &[char]) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || extra.contains(&c))
+fn urlencoding(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~' {
+                c.to_string()
+            } else if c == ' ' {
+                "+".to_string()
+            } else {
+                format!("%{:02X}", c as u32)
+            }
+        })
+        .collect()
 }
 
 #[tauri::command]
 async fn install_mod(slug: String, mc_version: String, loader: String) -> Result<String, String> {
-    // Los tres valores van a una URL y a una ruta: se validan antes de usarlos.
-    if !only_chars(&slug, &['-', '_']) || !only_chars(&mc_version, &['.', '-', '_']) {
-        return Err("Datos del mod inválidos".to_string());
-    }
-    if !["fabric", "forge", "neoforge", "quilt"].contains(&loader.as_str()) {
-        return Err("Loader no soportado".to_string());
-    }
-    let client = http()?;
-    let resp = client
-        .get(format!("https://api.modrinth.com/v2/project/{slug}/version"))
-        .query(&[
-            ("game_versions", format!("[\"{mc_version}\"]")),
-            ("loaders", format!("[\"{loader}\"]")),
-        ])
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+    let url = format!(
+        "https://api.modrinth.com/v2/project/{}/version?game_versions=[\"{}\"]&loaders=[\"{}\"]",
+        slug, mc_version, loader
+    );
+    let resp = reqwest::get(&url).await.map_err(|e| e.to_string())?;
     let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    let versions = json.as_array().ok_or("Modrinth no devolvió versiones")?;
-    let v = versions.first().ok_or("No hay una versión compatible de este mod")?;
-    let files = v.get("files").and_then(|f| f.as_array()).ok_or("El mod no trae archivos")?;
+    let versions = json.as_array().ok_or("no versions")?;
+    let v = versions.first().ok_or("no compatible version")?;
+    let files = v.get("files").and_then(|f| f.as_array()).ok_or("no files")?;
     let file = files
         .iter()
         .find(|f| f.get("primary").and_then(|p| p.as_bool()).unwrap_or(false))
         .or_else(|| files.first())
-        .ok_or("El mod no trae archivos")?;
-    let file_url = file.get("url").and_then(|u| u.as_str()).ok_or("El archivo no tiene URL")?;
-    let filename = file.get("filename").and_then(|u| u.as_str()).ok_or("El archivo no tiene nombre")?;
-
-    // El nombre viene de un servidor externo: solo un nombre simple que termine en .jar.
-    let mut comps = Path::new(filename).components();
-    match (comps.next(), comps.next()) {
-        (Some(std::path::Component::Normal(_)), None) if filename.to_lowercase().ends_with(".jar") => {}
-        _ => return Err("Nombre de archivo sospechoso en la respuesta de Modrinth".to_string()),
-    }
-
-    let bytes = client
-        .get(file_url)
-        .send()
-        .await
-        .and_then(|r| r.error_for_status())
-        .map_err(|e| e.to_string())?
-        .bytes()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // Verificación de integridad con el SHA1 que informa Modrinth.
-    if let Some(expected) = file
-        .get("hashes")
-        .and_then(|h| h.get("sha1"))
-        .and_then(|h| h.as_str())
-    {
-        let mut hasher = Sha1::new();
-        hasher.update(&bytes);
-        if !format!("{:x}", hasher.finalize()).eq_ignore_ascii_case(expected) {
-            return Err("El archivo descargado no coincide con su SHA1: se descartó".to_string());
-        }
-    }
-
+        .ok_or("no file")?;
+    let file_url = file.get("url").and_then(|u| u.as_str()).ok_or("no url")?;
+    let filename = file.get("filename").and_then(|u| u.as_str()).ok_or("no filename")?;
     let dest = minecraft_dir().join("mods").join(filename);
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
+    let bytes = reqwest::get(file_url).await.map_err(|e| e.to_string())?.bytes().await.map_err(|e| e.to_string())?;
     fs::write(&dest, bytes).map_err(|e| e.to_string())?;
     Ok(format!("Mod instalado: {filename}"))
 }
@@ -561,13 +513,7 @@ fn save_server(name: String, address: String, version: Option<String>) -> Result
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let mut servers = get_servers().unwrap_or_default();
-    // Misma dirección = se actualiza la entrada en vez de duplicarla.
-    if let Some(existing) = servers.iter_mut().find(|s| s.address == address) {
-        existing.name = name;
-        existing.version = version;
-    } else {
-        servers.push(ServerEntry { name, address, version });
-    }
+    servers.push(ServerEntry { name, address, version });
     let data = serde_json::to_string_pretty(&servers).map_err(|e| e.to_string())?;
     fs::write(&path, data).map_err(|e| e.to_string())?;
     Ok(())
@@ -586,24 +532,15 @@ fn delete_server(address: String) -> Result<(), String> {
     Ok(())
 }
 
-/// Acepta `host`, `host:puerto` o `ip:puerto` (puerto 25565 por defecto).
-#[tauri::command(async)]
+#[tauri::command]
 fn ping_server(address: String) -> Result<String, String> {
-    use std::net::{TcpStream, ToSocketAddrs};
-    use std::time::Instant;
-    let address = address.trim();
-    let with_port = if address.contains(':') {
-        address.to_string()
-    } else {
-        format!("{address}:25565")
-    };
-    let sock = with_port
-        .to_socket_addrs()
-        .map_err(|e| format!("dirección inválida: {e}"))?
-        .next()
-        .ok_or("no se pudo resolver la dirección")?;
+    use std::net::TcpStream;
+    use std::time::{Duration, Instant};
     let start = Instant::now();
-    match TcpStream::connect_timeout(&sock, Duration::from_secs(5)) {
+    match TcpStream::connect_timeout(
+        &address.parse().map_err(|e: std::net::AddrParseError| e.to_string())?,
+        Duration::from_secs(5),
+    ) {
         Ok(_) => Ok(format!("online ({} ms)", start.elapsed().as_millis())),
         Err(e) => Err(format!("offline: {e}")),
     }
@@ -679,7 +616,7 @@ async fn ms_login(device_code: String) -> Result<MsProfile, String> {
     let mut interval = 5u64;
     let mut ms_access = String::new();
     for _ in 0..120 {
-        tokio::time::sleep(Duration::from_secs(interval)).await;
+        std::thread::sleep(Duration::from_secs(interval));
         let resp = client
             .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token")
             .form(&[
@@ -800,14 +737,13 @@ async fn ms_login(device_code: String) -> Result<MsProfile, String> {
     Ok(profile)
 }
 
-fn read_ms_profile() -> Option<MsProfile> {
-    let data = fs::read_to_string(auth_path()).ok()?;
-    serde_json::from_str(&data).ok()
-}
-
 #[tauri::command]
 fn ms_get_profile() -> Result<Option<MsProfile>, String> {
-    Ok(read_ms_profile())
+    let path = auth_path();
+    if !path.exists() { return Ok(None); }
+    let data = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let profile: MsProfile = serde_json::from_str(&data).map_err(|e| e.to_string())?;
+    Ok(Some(profile))
 }
 
 #[tauri::command]
