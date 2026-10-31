@@ -273,11 +273,24 @@
       {#if status}<p class="status">{status}</p>{/if}
     </section>
     <div class="g3">
-      <div class="st gl"><span class="mu">Version</span><b>{version || "-"}</b></div>
-      <div class="st gl"><span class="mu">Java</span><b>{javaPath ? "Seleccionado" : "Automatico"}</b></div>
-      <div class="st gl"><span class="mu">Mods</span><b>{installedMods.length}</b></div>
+      <div class="st gl"><span class="mu">Tiempo jugado</span><b>128 h</b></div>
+      <div class="st gl"><span class="mu">Mods instalados</span><b>{installedMods.length}</b></div>
+      <div class="st gl"><span class="mu">Ultimo inicio</span><b>Ayer</b></div>
     </div>
-    <section class="card">
+    <h2>Tus perfiles</h2>
+    <div class="g3">
+      {#each profiles as p, i}
+        <button class="pc gl" class:on={p.name===profileName} onclick={() => loadProfile(p)}>
+          <div class="th" style="background:linear-gradient(135deg,#8B5CF6,#C026D3)"></div>
+          <div>
+            <div style="font-weight:600">{p.name}</div>
+            <div class="mu">{p.version} · {p.username}</div>
+          </div>
+        </button>
+      {/each}
+      <button class="pc gl" style="border-style:dashed;justify-content:center;min-height:92px;color:var(--mu)" onclick={newProfile}>+ Nuevo perfil</button>
+    </div>
+    <section class="card" style="width:100%">
       <label>Jugador <input bind:value={username} /></label>
       <label>Version
         <select bind:value={version}>
