@@ -132,6 +132,7 @@
     status = "";
     const labels: Record<string, string> = {
       version: "Preparando versión",
+      java: "Descargando Java",
       libraries: "Descargando librerías",
       assets: "Descargando recursos",
       starting: "Abriendo Minecraft",
