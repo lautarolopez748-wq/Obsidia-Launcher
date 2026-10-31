@@ -601,10 +601,6 @@ pub fn launch(
         if classifier_in_name.ends_with("-x86") && arch_name() != "x86" {
             continue;
         }
-        // Mismo grupo:artefacto(:clasificador) → gana el primero (el del hijo).
-        if !seen.insert(format!("{}:{}:{}", parts[0], parts[1], classifier_in_name)) {
-            continue;
-        }
         let base = lib["url"].as_str().unwrap_or(LIB_BASE).trim_end_matches('/').to_string();
 
         // Natives "viejas": un clasificador aparte que se extrae (no va al classpath).
@@ -617,22 +613,28 @@ pub fn launch(
                     .map(String::from)
                     .unwrap_or_else(|| maven_path(&format!("{name}:{cl}")));
                 let dest = libs_dir.join(&rel);
-                jobs.push(Job {
-                    url: art["url"]
-                        .as_str()
-                        .map(String::from)
-                        .unwrap_or_else(|| format!("{base}/{rel}")),
-                    dest: dest.clone(),
-                    sha1: art["sha1"].as_str().map(String::from),
-                    size: art["size"].as_u64(),
-                });
-                native_jars.push(dest);
+                if !native_jars.contains(&dest) {
+                    jobs.push(Job {
+                        url: art["url"]
+                            .as_str()
+                            .map(String::from)
+                            .unwrap_or_else(|| format!("{base}/{rel}")),
+                        dest: dest.clone(),
+                        sha1: art["sha1"].as_str().map(String::from),
+                        size: art["size"].as_u64(),
+                    });
+                    native_jars.push(dest);
+                }
             }
         }
 
         // Jar principal.
         let art = &lib["downloads"]["artifact"];
-        if art.is_object() || lib.get("natives").is_none() {
+        // Mismo grupo:artefacto(:clasificador) → gana el primero (el del hijo). Mojang repite
+        // a veces la misma librería en dos entradas (una con `natives`): por eso el filtro va
+        // solo acá y no corta el procesamiento de las natives de arriba.
+        let key = format!("{}:{}:{}", parts[0], parts[1], classifier_in_name);
+        if (art.is_object() || lib.get("natives").is_none()) && seen.insert(key) {
             let rel = art["path"]
                 .as_str()
                 .map(String::from)
@@ -653,7 +655,7 @@ pub fn launch(
                 });
             }
             // LWJGL 3: las natives vienen como jar con ":natives-…" en el nombre.
-            if name.contains(":natives-") {
+            if name.contains(":natives-") && !native_jars.contains(&dest) {
                 native_jars.push(dest.clone());
             }
             classpath.push(dest);
