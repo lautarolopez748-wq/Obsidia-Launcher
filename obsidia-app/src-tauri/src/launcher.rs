@@ -25,6 +25,8 @@ const MANIFEST: &str = "https://piston-meta.mojang.com/mc/game/version_manifest_
 const ASSET_BASE: &str = "https://resources.download.minecraft.net";
 const LIB_BASE: &str = "https://libraries.minecraft.net";
 const DOWNLOAD_THREADS: usize = 8;
+const RUNTIME_ALL: &str =
+    "https://launchermeta.mojang.com/v1/products/java-runtime/2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json";
 
 const CP_SEP: &str = if cfg!(windows) { ";" } else { ":" };
 
@@ -422,24 +424,83 @@ fn java_major(java: &str) -> Option<u32> {
     }
 }
 
-/// Prioridad: Java elegido por el usuario > runtime de Mojang indicado por la versión > respaldo.
-fn pick_java(mc: &Path, v: &Value, user: Option<String>, fallback: String) -> String {
-    if let Some(j) = user.filter(|s| !s.trim().is_empty()) {
-        return j;
+fn runtime_platform() -> Option<&'static str> {
+    if !cfg!(windows) {
+        return None;
     }
-    if let Some(comp) = v["javaVersion"]["component"].as_str() {
-        let exe = mc
-            .join("runtime")
-            .join(comp)
-            .join("windows-x64")
-            .join(comp)
-            .join("bin")
-            .join("java.exe");
-        if exe.is_file() {
-            return exe.to_string_lossy().to_string();
+    Some(match arch_name() {
+        "x86" => "windows-x86",
+        "arm64" => "windows-arm64",
+        _ => "windows-x64",
+    })
+}
+
+/// Java que pide la versión (p. ej. "jre-legacy" = Java 8, "java-runtime-delta" = Java 21):
+/// si no está en `.minecraft/runtime`, se baja de Mojang con verificación SHA1.
+/// Devuelve la ruta a java.exe, o None si esta plataforma no se soporta.
+fn ensure_runtime(
+    app: &AppHandle,
+    c: &reqwest::blocking::Client,
+    mc: &Path,
+    component: &str,
+) -> Result<Option<String>, String> {
+    let Some(platform) = runtime_platform() else { return Ok(None) };
+    if component.is_empty() || !component.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_') {
+        return Err(format!("Nombre de runtime inválido: {component}"));
+    }
+    let base = mc.join("runtime").join(component).join(platform);
+    let root = base.join(component);
+    let java = root.join("bin").join("java.exe");
+    let partial = base.join(".obsidia-partial");
+
+    // Ya instalado (por Obsidia o por el launcher oficial) y sin descarga a medias.
+    if java.is_file() && !partial.exists() {
+        return Ok(Some(java.to_string_lossy().to_string()));
+    }
+
+    let all = get_json(c, RUNTIME_ALL)?;
+    let url = all[platform][component][0]["manifest"]["url"]
+        .as_str()
+        .ok_or_else(|| format!("Mojang no ofrece el Java '{component}' para {platform}"))?
+        .to_string();
+    let manifest = get_json(c, &url)?;
+
+    fs::create_dir_all(&root).map_err(|e| format!("{}: {e}", root.display()))?;
+    fs::write(&partial, b"").map_err(|e| format!("{}: {e}", partial.display()))?;
+
+    let mut jobs: Vec<Job> = Vec::new();
+    if let Some(files) = manifest["files"].as_object() {
+        for (rel, f) in files {
+            // Rutas del servidor: se rechazan las absolutas o con "..".
+            if rel.is_empty() || rel.contains('\\') || rel.contains(':') || rel.split('/').any(|p| p.is_empty() || p == "..") {
+                continue;
+            }
+            match f["type"].as_str() {
+                Some("directory") => {
+                    let _ = fs::create_dir_all(root.join(rel));
+                }
+                Some("file") => {
+                    let raw = &f["downloads"]["raw"];
+                    let Some(u) = raw["url"].as_str() else { continue };
+                    jobs.push(Job {
+                        url: u.to_string(),
+                        dest: root.join(rel),
+                        sha1: raw["sha1"].as_str().map(String::from),
+                        size: raw["size"].as_u64(),
+                    });
+                }
+                _ => {}
+            }
         }
     }
-    fallback
+    download_all(c, jobs, |d, t| progress(app, "java", d, t))?;
+    let _ = fs::remove_file(&partial);
+
+    if java.is_file() {
+        Ok(Some(java.to_string_lossy().to_string()))
+    } else {
+        Err("El Java se descargó pero no encuentro java.exe".to_string())
+    }
 }
 
 // ───────────────────────────────── Natives ───────────────────────────────────
@@ -487,7 +548,22 @@ pub fn launch(
     progress(app, "version", 1, 1);
 
     // 2) Java: se comprueba antes de bajar nada, para fallar rápido.
-    let java = pick_java(mc, &v, java_path, fallback_java);
+    // Prioridad: Java elegido por el usuario > Java que pide la versión (se descarga si falta) > respaldo.
+    let mut warn = String::new();
+    let java = match java_path.filter(|p| !p.trim().is_empty()) {
+        Some(j) => j,
+        None => match v["javaVersion"]["component"].as_str() {
+            Some(comp) => match ensure_runtime(app, &c, mc, comp) {
+                Ok(Some(j)) => j,
+                Ok(None) => fallback_java,
+                Err(e) => {
+                    warn = format!(" (Aviso: no pude preparar el Java de Mojang: {e})");
+                    fallback_java
+                }
+            },
+            None => fallback_java,
+        },
+    };
     let required = v["javaVersion"]["majorVersion"].as_u64().map(|n| n as u32);
     if let (Some(req), Some(have)) = (required, java_major(&java)) {
         if have < req {
@@ -724,7 +800,7 @@ pub fn launch(
     progress(app, "starting", 1, 1);
 
     Ok(format!(
-        "Minecraft {version} iniciado como {} (pid {}). Log: {}",
+        "Minecraft {version} iniciado como {} (pid {}). Log: {}{warn}",
         player.name,
         child.id(),
         log_path.display()
