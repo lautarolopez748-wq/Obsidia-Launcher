@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
   import { check } from "@tauri-apps/plugin-updater";
   import { onMount } from "svelte";
 
@@ -64,7 +65,8 @@
   onMount(async () => {
     try {
       installed = await invoke<string[]>("get_installed_versions");
-      remote = await invoke<string[]>("list_versions");
+      // Sin internet la lista remota falla: no debe impedir cargar el resto.
+      remote = await invoke<string[]>("list_versions").catch(() => [] as string[]);
       profiles = await invoke<Profile[]>("get_profiles");
       javas = await invoke<JavaInfo[]>("detect_javas");
       installedMods = await invoke<string[]>("list_installed_mods");
@@ -128,10 +130,20 @@
     if (!version) return;
     loading = true;
     status = "";
+    const labels: Record<string, string> = {
+      version: "Preparando versión",
+      libraries: "Descargando librerías",
+      assets: "Descargando recursos",
+      starting: "Abriendo Minecraft",
+    };
+    const unlisten = await listen<{ stage: string; done: number; total: number }>("launch-progress", (e) => {
+      const { stage, done, total } = e.payload;
+      status = `${labels[stage] ?? stage}…` + (total > 1 ? ` ${Math.round((done / total) * 100)}%` : "");
+    });
     try {
       status = await invoke<string>("launch_version", { version, username, ram, javaPath: javaPath || null });
     } catch (e) { status = String(e); }
-    finally { loading = false; }
+    finally { unlisten(); loading = false; }
   }
 
   async function doSearchMods() {
