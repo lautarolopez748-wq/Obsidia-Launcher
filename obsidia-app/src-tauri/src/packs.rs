@@ -33,11 +33,10 @@ pub fn list_names(mc: &Path) -> Vec<String> {
     if let Ok(entries) = fs::read_dir(packs_dir(mc)) {
         for e in entries.flatten() {
             let p = e.path();
-            if p.is_file() || p.is_dir() {
-                if let Some(n) = e.file_name().to_str() {
+            if (p.is_file() || p.is_dir())
+                && let Some(n) = e.file_name().to_str() {
                     names.push(n.to_string());
                 }
-            }
         }
     }
     names.sort();
