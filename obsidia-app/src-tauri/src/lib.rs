@@ -219,6 +219,7 @@ async fn launch_version(
     username: String,
     ram: Option<String>,
     java_path: Option<String>,
+    server: Option<String>,
 ) -> Result<String, String> {
     let player = match read_ms_profile() {
         Some(p) => launcher::Player {
@@ -232,7 +233,7 @@ async fn launch_version(
     let mc = minecraft_dir();
     let fallback = java_exe();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        launcher::launch(&app, &mc, &version, player, ram, java_path, fallback)
+        launcher::launch(&app, &mc, &version, player, ram, java_path, fallback, server)
     })
     .await
     .map_err(|e| e.to_string())?;
