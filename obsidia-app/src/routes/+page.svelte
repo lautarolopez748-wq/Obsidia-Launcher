@@ -22,7 +22,7 @@ let accHtml = '';
     files:{ mods:[], shaders:[], packs:[] },
     results:{ mods:null, shaders:null, packs:null }, searching:false, seq:0, busy:{},
     sv:[], af:false, rf:false, es:null, ns:'', na:'',
-    np:false, npEdit:-1, npName:'', npVersion:'', npLoader:'Vanilla', npRam:4, npJava:'', npErr:'', npDel:false, npBusy:false,
+    np:false, npEdit:-1, npName:'', npVersion:'', npLoader:'Vanilla', npRam:4, npJava:'', npErr:'', npDel:false, npBusy:false, npFullscreen:false,
     javas:[]
   };
 
@@ -63,8 +63,7 @@ let accHtml = '';
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
         <div><label class="mu" for="np-ram">RAM asignada</label><select id="np-ram" class="srch" style="width:100%;margin-top:6px">${rams.map(r=>`<option value="${r}" ${r==S.npRam?'selected':''}>${r} GB</option>`).join('')}</select></div>
         <div><label class="mu" for="np-java">Java</label><select id="np-java" class="srch" style="width:100%;margin-top:6px"><option value="">Automático (recomendado)</option>${S.javas.map(j=>`<option value="${esc(j.path)}" ${j.path==S.npJava?'selected':''}>${esc(j.version||j.path)}</option>`).join('')}</select></div>
-      </div>
-      ${S.npErr?`<div style="font-size:13px;color:#FCD34D">${esc(S.npErr)}</div>`:''}
+<div style="display:flex;align-items:center;gap:10px"><input type="checkbox" id="np-fullscreen" ${S.npFullscreen?'checked':''}><label class="mu" for="np-fullscreen">Pantalla completa</label></div>
       <div style="display:flex;gap:10px;justify-content:space-between;margin-top:6px">
         <div>${S.npEdit>=0?`<button class="sec" style="height:44px;color:#F87171" data-act="npdel">${S.npDel?'¿Seguro? Tocá de nuevo':'Eliminar perfil'}</button>`:''}</div>
         <div style="display:flex;gap:10px"><button class="sec" style="height:44px" data-act="npclose">Cancelar</button><button class="ib" style="margin:0;height:44px;padding:0 24px" data-act="npcreate" ${S.npBusy?'disabled':''}>${S.npEdit>=0?'Guardar':'Crear perfil'}</button></div>
@@ -273,7 +272,7 @@ let accHtml = '';
       // Volver a aplicar la skin elegida: si cambió el pack activo, igual queda puesta.
       if (S.ms) invoke('remove_offline_skin').catch(()=>{});
       else if (S.skins[S.sk]) await applySkinToGame(true);
-      const msg = await invoke('launch_version', { version:id, username:S.nick, ram:p.ram+'G', javaPath:p.java||null, server:server||null });
+      const msg = await invoke('launch_version', { version:id, username:S.nick, ram:p.ram+'G', javaPath:p.java||null, server:server||null, fullscreen:!!p.fullscreen });
       S.pg = 100; S.launchMsg = msg; render();
       setTimeout(() => { S.pg = null; render(); }, 2500);
     } catch(e){
@@ -289,7 +288,7 @@ let accHtml = '';
     const list = await invoke('get_profiles').catch(()=>[]);
     P = (list||[]).map(p => {
       const loader = p.loader || 'Vanilla';
-      return { n:p.name, version:p.version, loader, ram:normRam(p.ram), java:p.java_path||'', username:p.username, s:loader+' · '+p.version };
+      return { n:p.name, version:p.version, loader, ram:normRam(p.ram), java:p.java_path||'', username:p.username, fullscreen:!!p.fullscreen, s:loader+' · '+p.version };
     });
     let i = P.findIndex(x => x.n === select);
     if (i < 0) { try { i = P.findIndex(x => x.n === localStorage.getItem('obsidia.sel')); } catch(e){ i = -1; } }
@@ -301,24 +300,24 @@ let accHtml = '';
   }
   function openNew(){
     S.np = true; S.npEdit = -1; S.npName = ''; S.npVersion = VERSIONS[0] || '1.21.4'; S.npLoader = 'Vanilla';
-    S.npRam = Math.min(S.defRam, S.totalRam); S.npJava = ''; S.npErr = ''; S.npDel = false; S.npBusy = false; render();
+    S.npRam = Math.min(S.defRam, S.totalRam); S.npJava = ''; S.npErr = ''; S.npDel = false; S.npBusy = false; S.npFullscreen = false; render();
   }
   function openEdit(i){
     const p = P[i]; if (!p) return;
     S.np = true; S.npEdit = i; S.npName = p.n; S.npVersion = p.version; S.npLoader = p.loader || 'Vanilla';
-    S.npRam = p.ram; S.npJava = p.java || ''; S.npErr = ''; S.npDel = false; S.npBusy = false; render();
+    S.npRam = p.ram; S.npJava = p.java || ''; S.npErr = ''; S.npDel = false; S.npBusy = false; S.npFullscreen = !!p.fullscreen; render();
   }
   async function saveProfileFromModal(){
     const val = id => { const e = Q(id); return e ? e.value : ''; };
     const name = val('#np-name').trim() || ('Perfil '+(P.length+1));
     S.npName = name; S.npVersion = val('#np-version'); S.npLoader = val('#np-loader') || 'Vanilla';
-    S.npRam = +val('#np-ram') || 4; S.npJava = val('#np-java');
+    S.npRam = +val('#np-ram') || 4; S.npJava = val('#np-java'); S.npFullscreen = !!(Q('#np-fullscreen') && Q('#np-fullscreen').checked);
     const old = S.npEdit >= 0 ? P[S.npEdit] : null;
     if (P.some((x,i) => x.n === name && i !== S.npEdit)){ S.npErr = 'Ya existe un perfil con ese nombre.'; render(); return; }
     S.npBusy = true;
     try {
       if (old && old.n !== name) await invoke('delete_profile', { name:old.n });
-      await invoke('save_profile', { profile:{ name, version:S.npVersion, username:S.nick, ram:S.npRam+'G', java_path:S.npJava||null, loader:S.npLoader } });
+      await invoke('save_profile', { profile:{ name, version:S.npVersion, username:S.nick, ram:S.npRam+'G', java_path:S.npJava||null, loader:S.npLoader, fullscreen:S.npFullscreen } });
       await loadProfiles(name);
       selectProfile(S.p);
       S.np = false; S.npEdit = -1; S.npErr = '';
@@ -550,3 +549,4 @@ let accHtml = '';
   <main id="view"></main>
 </div></div>
 <Toast />
+
