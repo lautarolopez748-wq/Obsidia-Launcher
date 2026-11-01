@@ -70,17 +70,15 @@ fn mc_dir() -> PathBuf {
 }
 
 pub fn client_id() -> String {
-    if let Ok(v) = std::env::var("OBSIDIA_MS_CLIENT_ID") {
-        if !v.trim().is_empty() {
+    if let Ok(v) = std::env::var("OBSIDIA_MS_CLIENT_ID")
+        && !v.trim().is_empty() {
             return v.trim().to_string();
         }
-    }
     let path = mc_dir().join("obsidia").join("ms_client_id.txt");
-    if let Ok(v) = fs::read_to_string(&path) {
-        if !v.trim().is_empty() {
+    if let Ok(v) = fs::read_to_string(&path)
+        && !v.trim().is_empty() {
             return v.trim().to_string();
         }
-    }
     DEFAULT_CLIENT_ID.to_string()
 }
 

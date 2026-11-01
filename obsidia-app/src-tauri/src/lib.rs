@@ -73,11 +73,10 @@ fn get_installed_versions() -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     if let Ok(entries) = fs::read_dir(&dir) {
         for entry in entries.flatten() {
-            if entry.path().is_dir() {
-                if let Some(name) = entry.file_name().to_str() {
+            if entry.path().is_dir()
+                && let Some(name) = entry.file_name().to_str() {
                     out.push(name.to_string());
                 }
-            }
         }
     }
     out.sort();
@@ -93,14 +92,13 @@ async fn list_versions() -> Result<Vec<String>, String> {
     let mut ids = Vec::new();
     if let Some(versions) = json.get("versions").and_then(|v| v.as_array()) {
         for v in versions {
-            if v.get("type").and_then(|t| t.as_str()) == Some("release") {
-                if let Some(id) = v.get("id").and_then(|i| i.as_str()) {
+            if v.get("type").and_then(|t| t.as_str()) == Some("release")
+                && let Some(id) = v.get("id").and_then(|i| i.as_str()) {
                     ids.push(id.to_string());
                     if ids.len() >= 60 {
                         break;
                     }
                 }
-            }
         }
     }
     Ok(ids)
@@ -191,8 +189,8 @@ fn detect_javas() -> Result<Vec<JavaInfo>, String> {
     let mut found: Vec<PathBuf> = Vec::new();
     // known minecraft runtimes
     let mc = minecraft_dir().join("runtime");
-    if mc.exists() {
-        if let Ok(entries) = fs::read_dir(&mc) {
+    if mc.exists()
+        && let Ok(entries) = fs::read_dir(&mc) {
             for e in entries.flatten() {
                 let bin = e.path().join("windows-x64").join(e.file_name()).join("bin").join("java.exe");
                 // generic fallback search
@@ -201,7 +199,6 @@ fn detect_javas() -> Result<Vec<JavaInfo>, String> {
                 else if alt.exists() { found.push(alt); }
             }
         }
-    }
     // common program files
     let candidates = [
         "C:\\Program Files\\Eclipse Adoptium",
@@ -274,12 +271,12 @@ async fn launch_version(
         None => launcher::offline_player(&username)?,
     };
     let mc = minecraft_dir();
-    let result = tauri::async_runtime::spawn_blocking(move || {
+    
+    tauri::async_runtime::spawn_blocking(move || {
         launcher::launch(&app, &mc, &gd, &version, player, ram, java_path, java_exe, server, fullscreen.unwrap_or(false))
     })
     .await
-    .map_err(|e| e.to_string())?;
-    result
+    .map_err(|e| e.to_string())?
 }
 
 fn sha1_hex(bytes: &[u8]) -> String {
@@ -312,11 +309,10 @@ fn download_verified(url: &str, dest: &Path) -> Result<(), String> {
         return Err(format!("El SHA1 publicado para {url} no es válido"));
     }
 
-    if let Ok(existing) = fs::read(dest) {
-        if sha1_hex(&existing) == expected {
+    if let Ok(existing) = fs::read(dest)
+        && sha1_hex(&existing) == expected {
             return Ok(());
         }
-    }
 
     let bytes = client
         .get(url)
@@ -529,11 +525,10 @@ fn list_shaderpacks(instance: Option<String>) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     if let Ok(entries) = fs::read_dir(&dir) {
         for e in entries.flatten() {
-            if e.path().is_file() || e.path().is_dir() {
-                if let Some(name) = e.file_name().to_str() {
+            if (e.path().is_file() || e.path().is_dir())
+                && let Some(name) = e.file_name().to_str() {
                     out.push(name.to_string());
                 }
-            }
         }
     }
     out.sort();
@@ -546,11 +541,10 @@ fn list_resourcepacks(instance: Option<String>) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     if let Ok(entries) = fs::read_dir(&dir) {
         for e in entries.flatten() {
-            if e.path().is_file() || e.path().is_dir() {
-                if let Some(name) = e.file_name().to_str() {
+            if (e.path().is_file() || e.path().is_dir())
+                && let Some(name) = e.file_name().to_str() {
                     out.push(name.to_string());
                 }
-            }
         }
     }
     out.sort();
@@ -622,11 +616,10 @@ fn list_installed_mods(instance: Option<String>) -> Result<Vec<String>, String> 
     let mut out = Vec::new();
     if let Ok(entries) = fs::read_dir(&dir) {
         for e in entries.flatten() {
-            if e.path().is_file() {
-                if let Some(name) = e.file_name().to_str() {
+            if e.path().is_file()
+                && let Some(name) = e.file_name().to_str() {
                     out.push(name.to_string());
                 }
-            }
         }
     }
     out.sort();

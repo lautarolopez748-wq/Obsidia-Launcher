@@ -146,12 +146,11 @@ fn download(c: &reqwest::blocking::Client, job: &Job) -> Result<(), String> {
             .and_then(|r| r.bytes());
         match res {
             Ok(bytes) => {
-                if let Some(expected) = &job.sha1 {
-                    if !sha1_hex(&bytes).eq_ignore_ascii_case(expected) {
+                if let Some(expected) = &job.sha1
+                    && !sha1_hex(&bytes).eq_ignore_ascii_case(expected) {
                         last = format!("SHA1 incorrecto al descargar {}", job.url);
                         continue;
                     }
-                }
                 // Se escribe a un .part y se renombra: nunca queda un archivo a medias.
                 let mut tmp = job.dest.clone().into_os_string();
                 tmp.push(".part");
@@ -212,7 +211,7 @@ where
                     errors.lock().unwrap().push(e);
                 }
                 let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                if n % 25 == 0 || n == total {
+                if n.is_multiple_of(25) || n == total {
                     on_progress(n, total);
                 }
             });
@@ -259,22 +258,19 @@ fn rules_allow(rules: Option<&Value>) -> bool {
     let mut allowed = false;
     for r in arr {
         if let Some(os) = r.get("os") {
-            if let Some(n) = os.get("name").and_then(Value::as_str) {
-                if n != os_name() {
+            if let Some(n) = os.get("name").and_then(Value::as_str)
+                && n != os_name() {
                     continue;
                 }
-            }
-            if let Some(a) = os.get("arch").and_then(Value::as_str) {
-                if a != arch_name() {
+            if let Some(a) = os.get("arch").and_then(Value::as_str)
+                && a != arch_name() {
                     continue;
                 }
-            }
         }
-        if let Some(f) = r.get("features").and_then(Value::as_object) {
-            if f.values().any(|v| v.as_bool() == Some(true)) {
+        if let Some(f) = r.get("features").and_then(Value::as_object)
+            && f.values().any(|v| v.as_bool() == Some(true)) {
                 continue;
             }
-        }
         allowed = r.get("action").and_then(Value::as_str) != Some("disallow");
     }
     allowed
@@ -438,7 +434,7 @@ fn java_major(java: &str) -> Option<u32> {
     let start = text.find('"')? + 1;
     let rest = &text[start..];
     let end = rest.find('"')?;
-    let mut parts = rest[..end].split(|c: char| c == '.' || c == '_' || c == '-' || c == '+');
+    let mut parts = rest[..end].split(['.', '_', '-', '+']);
     let first: u32 = parts.next()?.parse().ok()?;
     if first == 1 {
         parts.next()?.parse().ok()
@@ -664,14 +660,13 @@ pub fn launch(
         },
     };
     let required = v["javaVersion"]["majorVersion"].as_u64().map(|n| n as u32);
-    if let (Some(req), Some(have)) = (required, java_major(&java)) {
-        if have < req {
+    if let (Some(req), Some(have)) = (required, java_major(&java))
+        && have < req {
             return Err(format!(
                 "Esta versión necesita Java {req} o superior y '{java}' es Java {have}. \
                  Elegí otro Java en Ajustes."
             ));
         }
-    }
 
     let libs_dir = mc.join("libraries");
     let natives_dir = mc.join("versions").join(version).join("natives");
@@ -703,8 +698,8 @@ pub fn launch(
         let base = lib["url"].as_str().unwrap_or(LIB_BASE).trim_end_matches('/').to_string();
 
         // Natives "viejas": un clasificador aparte que se extrae (no va al classpath).
-        if let Some(map) = lib["natives"].as_object() {
-            if let Some(cl) = map.get(os_name()).and_then(Value::as_str) {
+        if let Some(map) = lib["natives"].as_object()
+            && let Some(cl) = map.get(os_name()).and_then(Value::as_str) {
                 let cl = cl.replace("${arch}", if arch_name() == "x86" { "32" } else { "64" });
                 let art = &lib["downloads"]["classifiers"][cl.as_str()];
                 let rel = art["path"]
@@ -725,7 +720,6 @@ pub fn launch(
                     native_jars.push(dest);
                 }
             }
-        }
 
         // Jar principal.
         let art = &lib["downloads"]["artifact"];
