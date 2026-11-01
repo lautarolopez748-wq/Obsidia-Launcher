@@ -5,7 +5,7 @@
 import Sidebar from "$lib/components/Sidebar.svelte";
 import Toast from "$lib/components/Toast.svelte";
 
-import { I, ic, TABS, G, TRASH, M, LOADERS, RAMS, STG, LBL, esc, norm, validName, normRam } from "$lib/utils.js";
+import { I, ic, TABS, G, TRASH, M, LOADERS, RAMS, STG, LBL, esc, norm, validName, normRam, head, skinFace, accCard, modCard, trb, resCard, irisBanner } from "$lib/utils.js";
 
   // ───────────── Estado ─────────────
   let P = [];
@@ -39,21 +39,10 @@ let accHtml = '';
 
   const sw = (k,l,d) => `<div class="row gl"><div><div style="font-weight:600">${l}</div><div class="mu">${d}</div></div><button class="sw" role="switch" aria-label="${l}" aria-checked="${S.t[k]}" data-act="tg" data-k="${k}"></button></div>`;
   const seg = () => `<div class="seg">${[['mods','Mods'],['shaders','Shaders'],['packs','Resource packs']].map(s=>`<button class="${S.sec==s[0]?'on':''}" data-act="seg" data-s="${s[0]}">${s[1]}</button>`).join('')}</div>`;
-  const trb = (kind, file, h) => `<button class="mb" style="width:${h}px;height:${h}px;padding:0;color:#F87171" aria-label="Eliminar ${esc(file)}" data-act="fdel" data-kind="${kind}" data-file="${esc(file)}">${TRASH}</button>`;
 
   // ───────────── Skins ─────────────
   // Cara por defecto (Steve).
-  const head = s => `<svg width="${s}" height="${s}" viewBox="0 0 8 8" shape-rendering="crispEdges" aria-hidden="true" style="border-radius:8px;flex:none"><rect width="8" height="8" fill="#E0A97B"/><rect width="8" height="3" fill="#3B2A1E"/><rect y="3" width="1" height="2" fill="#3B2A1E"/><rect x="7" y="3" width="1" height="2" fill="#3B2A1E"/><rect x="1" y="4" width="2" height="1" fill="#fff"/><rect x="5" y="4" width="2" height="1" fill="#fff"/><rect x="2" y="4" width="1" height="1" fill="#3B5BDB"/><rect x="5" y="4" width="1" height="1" fill="#3B5BDB"/><rect x="3" y="6" width="2" height="1" fill="#B5835A"/></svg>`;
-  // Recorta la cara (8,8) y la capa del sombrero (40,8) de una skin de 64 px de ancho.
-  function skinFace(i, size){
-    const url = (i >= 0 && i < S.skins.length) ? S.skins[i] : null;
-    // Solo data URLs PNG: evita inyectar CSS si localStorage quedó manipulado.
-    if (!url || !/^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(String(url))) return head(size);
-    const bs = size * 8;
-    const layer = x => `<div style="position:absolute;inset:0;background:url('${url}') -${x}px -${size}px/${bs}px auto no-repeat;image-rendering:pixelated"></div>`;
-    return `<div style="position:relative;width:${size}px;height:${size}px;overflow:hidden;border-radius:8px;flex:none;background:#1a1a2e">${layer(size)}${layer(size*5)}</div>`;
-  }
-  function accCard(){ return `${skinFace(S.sk,40)}<div><div style="font-weight:600">${esc(S.nick)||'Jugador'}</div><div class="mu">${S.ms?'Cuenta Microsoft':'Cuenta offline'}</div></div>`; }
+  // accCard moved to utils.js
 
   // ───────────── Perfiles ─────────────
   function cards(){
@@ -109,23 +98,6 @@ let accHtml = '';
   function profiles(){ return `<h1>Perfiles</h1><div class="mu">Elegí con cuál jugar o creá uno nuevo.</div><div class="g3">${cards()}${newCard}</div>`; }
 
   // ───────────── Mods / shaders / resource packs ─────────────
-  function modCard(m){
-    const inst = findFile('mods', m[4]);
-    const busy = S.busy[m[4]];
-    return `<div class="mc gl"><div style="display:flex;align-items:center;gap:12px"><div class="mi" style="background:${m[3]}"></div><b>${esc(m[0])}</b></div><div class="mu" style="line-height:1.5">${esc(m[1])}</div><div style="display:flex;gap:10px;margin-top:auto"><button class="ib ${inst?'in':''}" style="flex:1;margin:0" ${inst||busy?'disabled':''} data-act="inst" data-kind="mods" data-slug="${esc(m[4])}">${busy?'Instalando…':inst?'Instalado ✓':'Instalar'}</button>${inst?trb('mods',inst,38):''}</div></div>`;
-  }
-  function resCard(kind, r){
-    const inst = findFile(kind, r.slug);
-    const busy = S.busy[r.slug];
-    const thumb = kind==='mods'
-      ? `<div style="display:flex;align-items:center;gap:12px"><div class="mi" style="background:linear-gradient(135deg,#8B5CF6,#22D3EE)"></div><b>${esc(r.title)}</b></div>`
-      : `<div style="height:88px;border-radius:12px;background:${kind==='packs'?'repeating-linear-gradient(90deg,rgba(0,0,0,.14) 0 8px,transparent 8px 16px),linear-gradient(135deg,#34D399,#22D3EE)':'linear-gradient(135deg,#FBBF24,#F472B6)'}"></div><b>${esc(r.title)}</b>`;
-    return `<div class="mc gl">${thumb}<div class="mu" style="line-height:1.5">${esc(r.description)}</div><div class="mu" style="font-size:12px">${(r.downloads||0).toLocaleString('es-AR')} descargas</div><div style="display:flex;gap:10px;margin-top:auto"><button class="ib ${inst?'in':''}" style="flex:1;margin:0" ${inst||busy?'disabled':''} data-act="inst" data-kind="${kind}" data-slug="${esc(r.slug)}">${busy?'Instalando…':inst?'Instalado ✓':'Instalar'}</button>${inst?trb(kind,inst,38):''}<button class="sec" style="height:38px;padding:0 14px" data-act="openmod" data-kind="${kind}" data-slug="${esc(r.slug)}">Ver</button></div></div>`;
-  }
-  function irisBanner(){
-    const busy = S.busy['iris'];
-    return `<div class="gl" style="grid-column:1/-1;display:flex;justify-content:space-between;align-items:center;gap:16px;padding:16px 20px;border-color:rgba(251,191,36,.45)"><div><b>Los shaders necesitan Iris Shaders</b><div class="mu">Instalalo en este perfil (necesita Fabric) para poder activarlos.</div></div><button class="ib" style="margin:0;padding:0 22px" ${busy?'disabled':''} data-act="inst" data-kind="mods" data-slug="iris">${busy?'Instalando…':'Instalar Iris'}</button></div>`;
-  }
   function installedList(kind){
     const files = S.files[kind];
     if (!files.length) return '';
@@ -135,14 +107,14 @@ let accHtml = '';
   function grid(){
     const kind = S.sec, q = S.q.trim(), res = S.results[kind];
     let h = '';
-    if (kind==='shaders' && !findFile('mods','iris')) h += irisBanner();
+    if (kind==='shaders' && !findFile('mods','iris')) h += irisBanner(S.busy['iris']);
     if (kind==='mods' && !q){
       const list = M.filter(m => S.f=='Todos' || m[2]==S.f);
-      h += list.map(modCard).join('') || '<div class="mu">No hay resultados.</div>';
+      h += list.map(m => modCard(m, S.busy[m[4]], findFile('mods', m[4]))).join('') || '<div class="mu">No hay resultados.</div>';
     } else if (!res){
       h += `<div class="mu">${S.searching?'Buscando en Modrinth…':'Cargando…'}</div>`;
     } else {
-      h += res.length ? res.map(r => resCard(kind, r)).join('') : '<div class="mu">No hay resultados en Modrinth.</div>';
+      h += res.length ? res.map(r => resCard(kind, r, S.busy[r.slug], findFile(kind, r.slug))).join('') : '<div class="mu">No hay resultados en Modrinth.</div>';
     }
     return h + installedList(kind);
   }
@@ -232,7 +204,7 @@ let accHtml = '';
     const ok = validName(S.nick);
     const help = 'En modo offline la skin se aplica con un resource pack automático y solo la ves vos. Con cuenta Microsoft se usa tu skin oficial.';
     const model = (m,l) => `<button class="chip ${S.skmodel==m?'on':''}" data-act="skinmodel" data-m="${m}">${l}</button>`;
-    return `<h1>Mi cuenta</h1><div style="display:grid;grid-template-columns:1fr 1.3fr;gap:16px;align-items:start"><div class="gl" style="padding:26px;display:flex;flex-direction:column;align-items:center;gap:18px">${skinFace(S.sk,132)}<div style="width:100%"><label class="mu" for="nick">Nombre de jugador</label><input id="nick" class="srch" style="width:100%;margin-top:6px" maxlength="16" autocomplete="off" value="${esc(S.nick)}" ${S.ms?'disabled':''}><div id="nm" style="margin-top:8px;font-size:13px;color:${ok?'#6EE7B7':'#FCD34D'}">${ok?'Nombre válido ✓':'Usá de 3 a 16 letras, números o guion bajo.'}</div></div></div><div style="display:flex;flex-direction:column;gap:16px"><div class="gl" style="padding:20px 22px;display:flex;flex-direction:column;gap:10px"><b>Tipo de cuenta</b><div style="color:${S.ms?'#6EE7B7':'#C9C7DD'}">${S.ms?'Cuenta Microsoft vinculada':'Estás jugando en modo offline'}</div><div class="mu">${S.ms?'Podés entrar a servidores premium y usar tu skin oficial.':'En modo offline no podés entrar a servidores que verifican la cuenta.'}</div>${S.ms?'<button class="sec" style="height:44px" data-act="mso">Cerrar sesión</button>':`<button class="ib" style="margin:0;height:44px" ${S.ml?'disabled':''} data-act="ms">${S.ml?'Esperando a Microsoft…':'Iniciar sesión con Microsoft'}</button>`}</div><div class="gl" style="padding:20px 22px;display:flex;flex-direction:column;gap:14px"><b>Skin</b><div class="mu">${help}</div><div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><span class="mu">Modelo:</span>${model('classic','Clásico')}${model('slim','Fino')}</div><div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px">${S.skins.map((u,i)=>`<button class="pc gl ${i==S.sk?'on':''}" style="flex-direction:column;padding:12px" data-act="skin" data-i="${i}">${skinFace(i,56)}<span class="mu">Skin ${i+1}</span></button>`).join('')}${S.skins.length===0?`<div class="mu" style="grid-column:1/-1">No hay skins cargadas. Subí una para empezar (máx. 4).</div>`:''}</div><input type="file" id="skinfile" accept="image/png" style="display:none"><div style="display:flex;gap:10px;flex-wrap:wrap"><button class="ib" style="margin:0;height:44px;flex:1;min-width:180px" data-act="skinup" ${S.skins.length>=4?'disabled':''}>${S.skins.length>=4?'Límite de 4 skins alcanzado':'Subir skin (PNG)'}</button><button class="sec" style="height:44px" data-act="skindel">Quitar skin del juego</button></div></div></div></div>`;
+    return `<h1>Mi cuenta</h1><div style="display:grid;grid-template-columns:1fr 1.3fr;gap:16px;align-items:start"><div class="gl" style="padding:26px;display:flex;flex-direction:column;align-items:center;gap:18px">${skinFace(S.sk,132,S.skins)}<div style="width:100%"><label class="mu" for="nick">Nombre de jugador</label><input id="nick" class="srch" style="width:100%;margin-top:6px" maxlength="16" autocomplete="off" value="${esc(S.nick)}" ${S.ms?'disabled':''}><div id="nm" style="margin-top:8px;font-size:13px;color:${ok?'#6EE7B7':'#FCD34D'}">${ok?'Nombre válido ✓':'Usá de 3 a 16 letras, números o guion bajo.'}</div></div></div><div style="display:flex;flex-direction:column;gap:16px"><div class="gl" style="padding:20px 22px;display:flex;flex-direction:column;gap:10px"><b>Tipo de cuenta</b><div style="color:${S.ms?'#6EE7B7':'#C9C7DD'}">${S.ms?'Cuenta Microsoft vinculada':'Estás jugando en modo offline'}</div><div class="mu">${S.ms?'Podés entrar a servidores premium y usar tu skin oficial.':'En modo offline no podés entrar a servidores que verifican la cuenta.'}</div>${S.ms?'<button class="sec" style="height:44px" data-act="mso">Cerrar sesión</button>':`<button class="ib" style="margin:0;height:44px" ${S.ml?'disabled':''} data-act="ms">${S.ml?'Esperando a Microsoft…':'Iniciar sesión con Microsoft'}</button>`}</div><div class="gl" style="padding:20px 22px;display:flex;flex-direction:column;gap:14px"><b>Skin</b><div class="mu">${help}</div><div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><span class="mu">Modelo:</span>${model('classic','Clásico')}${model('slim','Fino')}</div><div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px">${S.skins.map((u,i)=>`<button class="pc gl ${i==S.sk?'on':''}" style="flex-direction:column;padding:12px" data-act="skin" data-i="${i}">${skinFace(i,56,S.skins)}<span class="mu">Skin ${i+1}</span></button>`).join('')}${S.skins.length===0?`<div class="mu" style="grid-column:1/-1">No hay skins cargadas. Subí una para empezar (máx. 4).</div>`:''}</div><input type="file" id="skinfile" accept="image/png" style="display:none"><div style="display:flex;gap:10px;flex-wrap:wrap"><button class="ib" style="margin:0;height:44px;flex:1;min-width:180px" data-act="skinup" ${S.skins.length>=4?'disabled':''}>${S.skins.length>=4?'Límite de 4 skins alcanzado':'Subir skin (PNG)'}</button><button class="sec" style="height:44px" data-act="skindel">Quitar skin del juego</button></div></div></div></div>`;
   }
   function saveSkins(){ try { localStorage.setItem('obsidia.skins', JSON.stringify(S.skins)); localStorage.setItem('obsidia.sk', String(S.sk)); localStorage.setItem('obsidia.skmodel', S.skmodel); } catch(e){} }
 
@@ -244,7 +216,7 @@ let accHtml = '';
   // ───────────── Render ─────────────
   function render(){
     document.body.classList.toggle('lite', S.t.lite);
-    accHtml = accCard();
+    accHtml = accCard(S.sk, S.nick, S.ms, S.skins);
     navHtml = TABS.map(t=>`<button class="${t[0]==S.tab?'on':''}" data-act="go" data-t="${t[0]}">${ic(t[0])}${t[1]}</button>`).join('');
     let html = { home, profiles, mods, servers, settings, account }[S.tab]();
     if (S.np) html += npModal();
