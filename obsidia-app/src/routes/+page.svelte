@@ -219,8 +219,8 @@
     S.busy[slug] = 1; refreshGrid();
     try {
       if (kind==='mods') await invoke('install_mod', { slug, mcVersion:p.version, loader:p.loader.toLowerCase() });
-      else if (kind==='shaders') await invoke('install_shaderpack', { slug });
-      else await invoke('install_resourcepack', { slug });
+      else if (kind==='shaders') await invoke('install_shaderpack', { slug, mcVersion: (P[S.p]&&P[S.p].version)||null });
+      else await invoke('install_resourcepack', { slug, mcVersion: (P[S.p]&&P[S.p].version)||null });
       toast('Instalado correctamente.');
     } catch(e){ toast('No se pudo instalar: '+e, true); }
     delete S.busy[slug];

@@ -638,16 +638,16 @@ async fn install_mod(slug: String, mc_version: String, loader: String) -> Result
 }
 
 #[tauri::command]
-async fn install_shaderpack(slug: String) -> Result<String, String> {
-    download_project_file(&slug, "shaderpacks").await
+async fn install_shaderpack(slug: String, mc_version: Option<String>) -> Result<String, String> {
+    download_project_file(&slug, "shaderpacks", mc_version.as_deref()).await
 }
 
-#[tauri::command]
-async fn install_resourcepack(slug: String) -> Result<String, String> {
-    download_project_file(&slug, "resourcepacks").await
+#[tauri::command(async)]
+async fn install_resourcepack(slug: String, mc_version: Option<String>) -> Result<String, String> {
+    download_project_file(&slug, "resourcepacks", mc_version.as_deref()).await
 }
 
-async fn download_project_file(slug: &str, folder: &str) -> Result<String, String> {
+async fn download_project_file(slug: &str, folder: &str, mc_version: Option<&str>) -> Result<String, String> {
     if !only_chars(slug, &['-', '_']) {
         return Err("Slug inválido".to_string());
     }
@@ -655,11 +655,11 @@ async fn download_project_file(slug: &str, folder: &str) -> Result<String, Strin
         return Err("Carpeta inválida".to_string());
     }
     let client = http()?;
-    let resp = client
-        .get(format!("https://api.modrinth.com/v2/project/{slug}/version"))
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut req = client.get(format!("https://api.modrinth.com/v2/project/{slug}/version"));
+    if let Some(v) = mc_version {
+        req = req.query(&[("game_versions", format!("[\"{v}\"]"))]);
+    }
+    let resp = req.send().await.map_err(|e| e.to_string())?;
     let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
     let versions = json.as_array().ok_or("Modrinth no devolvió versiones")?;
     let v = versions.first().ok_or("No hay una versión compatible")?;
@@ -674,7 +674,7 @@ async fn download_project_file(slug: &str, folder: &str) -> Result<String, Strin
 
     let mut comps = Path::new(filename).components();
     match (comps.next(), comps.next()) {
-        (Some(std::path::Component::Normal(_)), None) => {}
+        (Some(std::path::Component::Normal(_)), None) if filename.to_lowercase().ends_with(".zip") => {}
         _ => return Err("Nombre de archivo sospechoso".to_string()),
     }
 
@@ -687,6 +687,19 @@ async fn download_project_file(slug: &str, folder: &str) -> Result<String, Strin
         .bytes()
         .await
         .map_err(|e| e.to_string())?;
+
+    if let Some(expected) = file
+        .get("hashes")
+        .and_then(|h| h.get("sha1"))
+        .and_then(|h| h.as_str())
+    {
+        use sha1::{Digest, Sha1};
+        let mut hasher = Sha1::new();
+        hasher.update(&bytes);
+        if !format!("{:x}", hasher.finalize()).eq_ignore_ascii_case(expected) {
+            return Err("El archivo descargado no coincide con su SHA1: se descartó".to_string());
+        }
+    }
 
     let dest = minecraft_dir().join(folder).join(filename);
     if let Some(parent) = dest.parent() {
