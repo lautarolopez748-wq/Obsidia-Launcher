@@ -254,6 +254,9 @@ fn detect_javas() -> Result<Vec<JavaInfo>, String> {
 /// Abre el juego (descargando lo que falte). Si hay sesión de Microsoft iniciada se usa esa
 /// cuenta; si no, se juega offline con `username`. El progreso llega por el evento
 /// `launch-progress` ({ stage, done, total }).
+// Cada parámetro es un campo del objeto que manda la interfaz con `invoke`; agruparlos acá
+// cambiaría esa API, así que se deja la lista plana.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 async fn launch_version(
     app: tauri::AppHandle,
@@ -271,10 +274,13 @@ async fn launch_version(
         None => launcher::offline_player(&username)?,
     };
     let mc = minecraft_dir();
-    
-    tauri::async_runtime::spawn_blocking(move || {
-        launcher::launch(&app, &mc, &gd, &version, player, ram, java_path, java_exe, server, fullscreen.unwrap_or(false))
-    })
+    let opts = launcher::LaunchOptions {
+        ram,
+        java_path,
+        server,
+        fullscreen: fullscreen.unwrap_or(false),
+    };
+    tauri::async_runtime::spawn_blocking(move || launcher::launch(&app, &mc, &gd, &version, player, opts, java_exe))
     .await
     .map_err(|e| e.to_string())?
 }
