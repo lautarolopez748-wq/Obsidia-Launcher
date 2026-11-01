@@ -34,6 +34,7 @@
     defRam:4, totalRam:16, t:{ lite:false },
     nick:'Jugador', ms:false, ml:false, msc:null,
     skins:[], sk:-1, skmodel:'classic',
+    pstate:[],
     files:{ mods:[], shaders:[], packs:[] },
     results:{ mods:null, shaders:null, packs:null }, searching:false, seq:0, busy:{},
     sv:[], af:false, rf:false, es:null, ns:'', na:'',
@@ -164,19 +165,35 @@
     }
     return h + installedList(kind);
   }
+  // Panel de orden de resource packs (lee y escribe options.txt).
+  function packsPanel(){
+    const list = S.pstate || [];
+    if (!list.length) return `<div class="gl" style="padding:18px 20px"><b>Resource packs</b><div class="mu" style="margin-top:6px">No hay packs instalados todavía. Instalá uno abajo y aparece acá.</div></div>`;
+    const en = list.filter(x=>x.enabled).length;
+    const rows = list.map((x,i)=>`<div style="display:flex;align-items:center;gap:12px;padding:8px 12px;border-radius:12px;background:rgba(255,255,255,.04)"><button class="sw" role="switch" aria-label="${esc(x.name)}" aria-checked="${x.enabled}" data-act="ptg" data-i="${i}"></button><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(x.name)}</span><button class="mb" data-act="pup" data-i="${i}" ${x.enabled&&i>0?'':'disabled'} aria-label="Subir ${esc(x.name)}">↑</button><button class="mb" data-act="pdown" data-i="${i}" ${x.enabled&&i<en-1?'':'disabled'} aria-label="Bajar ${esc(x.name)}">↓</button></div>`).join('');
+    return `<div class="gl" style="padding:18px 20px;display:flex;flex-direction:column;gap:10px"><div style="display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap"><div><b>Resource packs</b><div class="mu">El orden es la prioridad: el de arriba gana.</div></div><button class="sec" style="height:38px;padding:0 16px" data-act="pauto">Ordenar automático</button></div>${rows}</div>`;
+  }
   function mods(){
     const p = P[S.p];
     const ph = { mods:'Buscar en Modrinth…', shaders:'Buscar shaders…', packs:'Buscar resource packs…' }[S.sec];
-    return `<div style="display:flex;justify-content:space-between;align-items:center"><h1>Mods</h1><div class="gl" style="padding:9px 16px;color:#C9C7DD;font-size:14px">Perfil: ${p?esc(p.n)+' · '+esc(p.loader||'Vanilla'):'—'}</div></div>${seg()}<input id="q" class="srch" aria-label="${ph}" placeholder="${ph}" value="${esc(S.q)}">${S.sec==='mods'&&!S.q.trim()?`<div class="chips">${['Todos','Optimización','Gráficos','Utilidades'].map(c=>`<button class="chip ${c==S.f?'on':''}" data-act="f" data-c="${c}">${c}</button>`).join('')}</div>`:''}<div class="g3" id="grid">${grid()}</div>`;
+    return `<div style="display:flex;justify-content:space-between;align-items:center"><h1>Mods</h1><div class="gl" style="padding:9px 16px;color:#C9C7DD;font-size:14px">Perfil: ${p?esc(p.n)+' · '+esc(p.loader||'Vanilla'):'—'}</div></div>${seg()}${S.sec==='packs'?packsPanel():''}<input id="q" class="srch" aria-label="${ph}" placeholder="${ph}" value="${esc(S.q)}">${S.sec==='mods'&&!S.q.trim()?`<div class="chips">${['Todos','Optimización','Gráficos','Utilidades'].map(c=>`<button class="chip ${c==S.f?'on':''}" data-act="f" data-c="${c}">${c}</button>`).join('')}</div>`:''}<div class="g3" id="grid">${grid()}</div>`;
   }
 
   async function refreshFiles(){
-    const [m, s, r] = await Promise.all([
+    const [m, s, r, ps] = await Promise.all([
       invoke('list_installed_mods').catch(()=>[]),
       invoke('list_shaderpacks').catch(()=>[]),
-      invoke('list_resourcepacks').catch(()=>[])
+      invoke('list_resourcepacks').catch(()=>[]),
+      invoke('get_resourcepack_state').catch(()=>[])
     ]);
     S.files = { mods:m||[], shaders:s||[], packs:r||[] };
+    S.pstate = ps||[];
+  }
+  async function savePacks(){
+    const active = S.pstate.filter(x=>x.enabled).map(x=>x.name);
+    try { await invoke('save_resourcepack_state', { active }); }
+    catch(e){ toast('No se pudo guardar el orden de packs: '+e, true); }
+    await refreshFiles(); refreshGrid();
   }
 
   async function doSearch(){
@@ -379,6 +396,10 @@
     else if (a=='f'){ S.f = d.c; render(); }
     else if (a=='tg'){ S.t[d.k] = !S.t[d.k]; persistSettings(); render(); }
     else if (a=='seg'){ S.sec = d.s; S.q = ''; render(); doSearch(); }
+    else if (a=='ptg'){ const x = S.pstate[+d.i]; if (x){ x.enabled = !x.enabled; S.pstate = [...S.pstate.filter(p=>p.enabled), ...S.pstate.filter(p=>!p.enabled)]; savePacks(); render(); } }
+    else if (a=='pup'){ const i = +d.i; if (i>0 && S.pstate[i].enabled && S.pstate[i-1].enabled){ [S.pstate[i-1], S.pstate[i]] = [S.pstate[i], S.pstate[i-1]]; savePacks(); render(); } }
+    else if (a=='pdown'){ const i = +d.i; if (i<S.pstate.length-1 && S.pstate[i].enabled && S.pstate[i+1].enabled){ [S.pstate[i+1], S.pstate[i]] = [S.pstate[i], S.pstate[i+1]]; savePacks(); render(); } }
+    else if (a=='pauto'){ S.pstate = [...S.pstate].sort((x,y) => (Number(y.enabled)-Number(x.enabled)) || x.name.localeCompare(y.name)); savePacks(); render(); }
     else if (a=='inst'){ doInstall(d.kind, d.slug); }
     else if (a=='fdel'){
       const folder = { mods:'mods', shaders:'shaderpacks', packs:'resourcepacks' }[d.kind];
