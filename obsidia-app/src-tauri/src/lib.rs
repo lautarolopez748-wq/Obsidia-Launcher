@@ -88,45 +88,68 @@ async fn list_versions() -> Result<Vec<String>, String> {
     Ok(ids)
 }
 
-#[tauri::command]
-fn get_profiles() -> Result<Vec<Profile>, String> {
-    let path = profiles_path();
+/// Lee una lista JSON. Si el archivo no existe devuelve una lista vacía; si existe pero está
+/// dañado NO lo da por vacío (el siguiente guardado lo borraría): hace una copia `.bak` y
+/// devuelve un error para que nadie lo pise.
+fn read_json_list<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>, String> {
     if !path.exists() {
         return Ok(vec![]);
     }
-    let data = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let profiles: Vec<Profile> = serde_json::from_str(&data).unwrap_or_default();
-    Ok(profiles)
+    let data = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    serde_json::from_str(&data).map_err(|e| {
+        let backup = path.with_extension("json.bak");
+        let _ = fs::copy(path, &backup);
+        format!(
+            "{} está dañado ({e}). Guardé una copia en {} y no lo toqué.",
+            path.display(),
+            backup.display()
+        )
+    })
+}
+
+/// Escribe un archivo de forma atómica: primero a `.tmp` y después se renombra encima.
+fn write_atomic(path: &Path, data: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    fs::write(&tmp, data).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    fs::rename(&tmp, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("{}: {e}", path.display())
+    })
+}
+
+fn write_json_list<T: Serialize>(path: &Path, list: &[T]) -> Result<(), String> {
+    let data = serde_json::to_string_pretty(list).map_err(|e| e.to_string())?;
+    write_atomic(path, &data)
+}
+
+#[tauri::command]
+fn get_profiles() -> Result<Vec<Profile>, String> {
+    read_json_list(&profiles_path())
 }
 
 #[tauri::command]
 fn save_profile(profile: Profile) -> Result<(), String> {
     let path = profiles_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let mut profiles = get_profiles().unwrap_or_default();
+    let mut profiles = read_json_list::<Profile>(&path)?;
     if let Some(existing) = profiles.iter_mut().find(|p| p.name == profile.name) {
         *existing = profile;
     } else {
         profiles.push(profile);
     }
-    let data = serde_json::to_string_pretty(&profiles).map_err(|e| e.to_string())?;
-    fs::write(&path, data).map_err(|e| e.to_string())?;
-    Ok(())
+    write_json_list(&path, &profiles)
 }
 
 #[tauri::command]
 fn delete_profile(name: String) -> Result<(), String> {
     let path = profiles_path();
-    let mut profiles = get_profiles().unwrap_or_default();
+    let mut profiles = read_json_list::<Profile>(&path)?;
     profiles.retain(|p| p.name != name);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let data = serde_json::to_string_pretty(&profiles).map_err(|e| e.to_string())?;
-    fs::write(&path, data).map_err(|e| e.to_string())?;
-    Ok(())
+    write_json_list(&path, &profiles)
 }
 
 fn java_version(path: &Path) -> String {
@@ -231,9 +254,8 @@ async fn launch_version(
         None => launcher::offline_player(&username)?,
     };
     let mc = minecraft_dir();
-    let fallback = java_exe();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        launcher::launch(&app, &mc, &version, player, ram, java_path, fallback, server, fullscreen.unwrap_or(false))
+        launcher::launch(&app, &mc, &version, player, ram, java_path, java_exe, server, fullscreen.unwrap_or(false))
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -513,85 +535,53 @@ fn http() -> Result<reqwest::Client, String> {
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-async fn search_mods(query: String) -> Result<Vec<ModResult>, String> {
+/// Busca proyectos en Modrinth (`project_type`: mod, shader o resourcepack).
+async fn search_modrinth(query: String, project_type: &str) -> Result<Vec<ModResult>, String> {
+    let facets = format!("[[\"project_type:{project_type}\"]]");
     let resp = http()?
         .get("https://api.modrinth.com/v2/search")
-        .query(&[
-            ("query", query.as_str()),
-            ("facets", "[[\"project_type:mod\"]]"),
-            ("limit", "20"),
-        ])
+        .query(&[("query", query.as_str()), ("facets", facets.as_str()), ("limit", "20")])
         .send()
         .await
         .map_err(|e| e.to_string())?;
     let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let text = |h: &serde_json::Value, k: &str| h.get(k).and_then(|s| s.as_str()).unwrap_or("").to_string();
     let mut out = Vec::new();
     if let Some(hits) = json.get("hits").and_then(|h| h.as_array()) {
         for h in hits {
             out.push(ModResult {
-                slug: h.get("slug").and_then(|s| s.as_str()).unwrap_or("").to_string(),
-                title: h.get("title").and_then(|s| s.as_str()).unwrap_or("").to_string(),
-                description: h.get("description").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                slug: text(h, "slug"),
+                title: text(h, "title"),
+                description: text(h, "description"),
                 downloads: h.get("downloads").and_then(|d| d.as_u64()).unwrap_or(0),
             });
         }
     }
     Ok(out)
+}
+
+#[tauri::command]
+async fn search_mods(query: String) -> Result<Vec<ModResult>, String> {
+    search_modrinth(query, "mod").await
 }
 
 #[tauri::command]
 async fn search_shaders(query: String) -> Result<Vec<ModResult>, String> {
-    let resp = http()?
-        .get("https://api.modrinth.com/v2/search")
-        .query(&[
-            ("query", query.as_str()),
-            ("facets", "[[\"project_type:shader\"]]"),
-            ("limit", "20"),
-        ])
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    let mut out = Vec::new();
-    if let Some(hits) = json.get("hits").and_then(|h| h.as_array()) {
-        for h in hits {
-            out.push(ModResult {
-                slug: h.get("slug").and_then(|s| s.as_str()).unwrap_or("").to_string(),
-                title: h.get("title").and_then(|s| s.as_str()).unwrap_or("").to_string(),
-                description: h.get("description").and_then(|s| s.as_str()).unwrap_or("").to_string(),
-                downloads: h.get("downloads").and_then(|d| d.as_u64()).unwrap_or(0),
-            });
-        }
-    }
-    Ok(out)
+    search_modrinth(query, "shader").await
 }
 
 #[tauri::command]
 async fn search_resourcepacks(query: String) -> Result<Vec<ModResult>, String> {
-    let resp = http()?
-        .get("https://api.modrinth.com/v2/search")
-        .query(&[
-            ("query", query.as_str()),
-            ("facets", "[[\"project_type:resourcepack\"]]"),
-            ("limit", "20"),
-        ])
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    let mut out = Vec::new();
-    if let Some(hits) = json.get("hits").and_then(|h| h.as_array()) {
-        for h in hits {
-            out.push(ModResult {
-                slug: h.get("slug").and_then(|s| s.as_str()).unwrap_or("").to_string(),
-                title: h.get("title").and_then(|s| s.as_str()).unwrap_or("").to_string(),
-                description: h.get("description").and_then(|s| s.as_str()).unwrap_or("").to_string(),
-                downloads: h.get("downloads").and_then(|d| d.as_u64()).unwrap_or(0),
-            });
-        }
-    }
-    Ok(out)
+    search_modrinth(query, "resourcepack").await
+}
+
+/// Modrinth devuelve primero lo más nuevo, alphas y betas incluidas: se prefiere la
+/// primera versión estable y solo si no hay ninguna se usa la primera de la lista.
+fn pick_version(versions: &[serde_json::Value]) -> Option<&serde_json::Value> {
+    versions
+        .iter()
+        .find(|v| v.get("version_type").and_then(|t| t.as_str()) == Some("release"))
+        .or_else(|| versions.first())
 }
 
 fn only_chars(s: &str, extra: &[char]) -> bool {
@@ -619,7 +609,7 @@ async fn install_mod(slug: String, mc_version: String, loader: String) -> Result
         .map_err(|e| e.to_string())?;
     let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
     let versions = json.as_array().ok_or("Modrinth no devolvió versiones")?;
-    let v = versions.first().ok_or("No hay una versión compatible de este mod")?;
+    let v = pick_version(versions).ok_or("No hay una versión compatible de este mod")?;
     let files = v.get("files").and_then(|f| f.as_array()).ok_or("El mod no trae archivos")?;
     let file = files
         .iter()
@@ -692,7 +682,7 @@ async fn download_project_file(slug: &str, folder: &str, mc_version: Option<&str
     let resp = req.send().await.map_err(|e| e.to_string())?;
     let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
     let versions = json.as_array().ok_or("Modrinth no devolvió versiones")?;
-    let v = versions.first().ok_or("No hay una versión compatible")?;
+    let v = pick_version(versions).ok_or("No hay una versión compatible")?;
     let files = v.get("files").and_then(|f| f.as_array()).ok_or("El proyecto no trae archivos")?;
     let file = files
         .iter()
@@ -759,22 +749,13 @@ fn get_total_ram() -> Result<u64, String> {
 
 #[tauri::command]
 fn get_servers() -> Result<Vec<ServerEntry>, String> {
-    let path = servers_path();
-    if !path.exists() {
-        return Ok(vec![]);
-    }
-    let data = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let servers: Vec<ServerEntry> = serde_json::from_str(&data).unwrap_or_default();
-    Ok(servers)
+    read_json_list(&servers_path())
 }
 
 #[tauri::command]
 fn save_server(name: String, address: String, version: Option<String>) -> Result<(), String> {
     let path = servers_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let mut servers = get_servers().unwrap_or_default();
+    let mut servers = read_json_list::<ServerEntry>(&path)?;
     // Misma dirección = se actualiza la entrada en vez de duplicarla.
     if let Some(existing) = servers.iter_mut().find(|s| s.address == address) {
         existing.name = name;
@@ -782,22 +763,15 @@ fn save_server(name: String, address: String, version: Option<String>) -> Result
     } else {
         servers.push(ServerEntry { name, address, version });
     }
-    let data = serde_json::to_string_pretty(&servers).map_err(|e| e.to_string())?;
-    fs::write(&path, data).map_err(|e| e.to_string())?;
-    Ok(())
+    write_json_list(&path, &servers)
 }
 
 #[tauri::command]
 fn delete_server(address: String) -> Result<(), String> {
     let path = servers_path();
-    let mut servers = get_servers().unwrap_or_default();
+    let mut servers = read_json_list::<ServerEntry>(&path)?;
     servers.retain(|s| s.address != address);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let data = serde_json::to_string_pretty(&servers).map_err(|e| e.to_string())?;
-    fs::write(&path, data).map_err(|e| e.to_string())?;
-    Ok(())
+    write_json_list(&path, &servers)
 }
 
 /// Acepta `host`, `host:puerto` o `ip:puerto` (puerto 25565 por defecto).
@@ -841,8 +815,7 @@ fn save_settings(settings: AppSettings) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let data = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
-    fs::write(&path, data).map_err(|e| e.to_string())?;
-    Ok(())
+    write_atomic(&path, &data)
 }
 
 // El login de Microsoft vive en auth.rs: los tokens van al Credential Manager.
@@ -855,6 +828,11 @@ async fn ms_device_code() -> Result<auth::DeviceCode, String> {
 #[tauri::command]
 async fn ms_login(device_code: String) -> Result<auth::MsProfile, String> {
     auth::wait_for_login(&device_code).await
+}
+
+#[tauri::command]
+fn ms_cancel() {
+    auth::cancel_login();
 }
 
 #[tauri::command]
@@ -905,9 +883,66 @@ pub fn run() {
             save_settings,
             ms_device_code,
             ms_login,
+            ms_cancel,
             ms_get_profile,
             ms_logout
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("obsidia-test-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn json_danado_no_se_pisa_y_queda_respaldo() {
+        let dir = tmp_dir("danado");
+        let path = dir.join("profiles.json");
+        fs::write(&path, "{ esto no es json").unwrap();
+        assert!(read_json_list::<Profile>(&path).is_err());
+        // El original sigue intacto y hay una copia de respaldo.
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{ esto no es json");
+        assert!(dir.join("profiles.json.bak").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archivo_inexistente_es_lista_vacia() {
+        let dir = tmp_dir("vacio");
+        assert!(read_json_list::<Profile>(&dir.join("nada.json")).unwrap().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn escritura_atomica_ida_y_vuelta() {
+        let dir = tmp_dir("atomica");
+        let path = dir.join("sub").join("servers.json");
+        let lista = vec![ServerEntry { name: "A".into(), address: "a.net".into(), version: None }];
+        write_json_list(&path, &lista).unwrap();
+        let leida: Vec<ServerEntry> = read_json_list(&path).unwrap();
+        assert_eq!(leida.len(), 1);
+        assert_eq!(leida[0].address, "a.net");
+        assert!(!dir.join("sub").join("servers.json.tmp").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prefiere_versiones_release() {
+        let v = vec![
+            json!({"id":"beta","version_type":"beta"}),
+            json!({"id":"rel","version_type":"release"}),
+        ];
+        assert_eq!(pick_version(&v).unwrap()["id"], "rel");
+        let solo_beta = vec![json!({"id":"beta","version_type":"beta"})];
+        assert_eq!(pick_version(&solo_beta).unwrap()["id"], "beta");
+        assert!(pick_version(&[]).is_none());
+    }
 }

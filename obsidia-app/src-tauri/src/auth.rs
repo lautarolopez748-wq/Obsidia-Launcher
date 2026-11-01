@@ -8,6 +8,7 @@ use crate::launcher;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// ID de la app registrada en Azure (cuentas personales de Microsoft, device code).
@@ -52,7 +53,18 @@ fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}fn mc_dir() -> PathBuf {
+}
+
+/// Cada login nuevo (o cada cancelación) sube este contador; un login en espera que ve
+/// otro número sabe que lo cancelaron y termina sin guardar nada.
+static LOGIN_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// Cancela el login que esté esperando el código de Microsoft.
+pub fn cancel_login() {
+    LOGIN_GEN.fetch_add(1, Ordering::SeqCst);
+}
+
+fn mc_dir() -> PathBuf {
     let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(appdata).join(".minecraft")
 }
@@ -307,8 +319,14 @@ async fn minecraft_profile(mc_access: &str) -> Result<MsProfile, String> {
 pub async fn wait_for_login(device_code: &str) -> Result<MsProfile, String> {
     let mut interval = 5u64;
     let mut ms_tokens: Option<MsTokens> = None;
+    // Un login nuevo cancela al anterior que siguiera esperando.
+    let my_gen = LOGIN_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    let cancelled = || LOGIN_GEN.load(Ordering::SeqCst) != my_gen;
     for _ in 0..120 {
         tokio::time::sleep(Duration::from_secs(interval)).await;
+        if cancelled() {
+            return Err("Login cancelado".to_string());
+        }
         match token_request(&[
             ("grant_type", "urn:ietf:params:oauth:grant-type:device_code".to_string()),
             ("client_id", client_id()),
@@ -329,6 +347,10 @@ pub async fn wait_for_login(device_code: &str) -> Result<MsProfile, String> {
         }
     }
     let tokens = ms_tokens.ok_or("Se agotó el tiempo de espera del login")?;
+    // Si lo cancelaron justo mientras Microsoft respondía, no se guarda ninguna sesión.
+    if cancelled() {
+        return Err("Login cancelado".to_string());
+    }
 
     let refresh = tokens
         .refresh_token
@@ -337,6 +359,9 @@ pub async fn wait_for_login(device_code: &str) -> Result<MsProfile, String> {
         .to_string();
     let (mc_access, expires_in) = xbox_to_minecraft(&tokens.access_token).await?;
     let profile = minecraft_profile(&mc_access).await?;
+    if cancelled() {
+        return Err("Login cancelado".to_string());
+    }
 
     write_refresh(&refresh)?;
     write_stored(&Stored {

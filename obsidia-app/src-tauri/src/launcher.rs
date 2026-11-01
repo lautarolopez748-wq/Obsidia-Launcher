@@ -116,6 +116,10 @@ fn is_up_to_date(job: &Job) -> bool {
         if meta.len() != size {
             return false;
         }
+        // Mismo tamaño que el publicado por Mojang: se da por válido sin releerlo entero.
+        // Los archivos ya se verificaron con SHA1 al bajarlos y se escriben de forma atómica,
+        // así que hashear miles de assets en cada arranque solo hacía lento el JUGAR.
+        return true;
     }
     if let Some(expected) = &job.sha1 {
         return fs::read(&job.dest)
@@ -627,7 +631,8 @@ pub fn launch(
     player: Player,
     ram: Option<String>,
     java_path: Option<String>,
-    fallback_java: String,
+    // Se llama solo si hace falta: buscar Javas instalados lanza `java -version` en cada uno.
+    fallback_java: impl FnOnce() -> String,
     server: Option<String>,
     fullscreen: bool,
 ) -> Result<String, String> {
@@ -646,13 +651,13 @@ pub fn launch(
         None => match v["javaVersion"]["component"].as_str() {
             Some(comp) => match ensure_runtime(app, &c, mc, comp) {
                 Ok(Some(j)) => j,
-                Ok(None) => fallback_java,
+                Ok(None) => fallback_java(),
                 Err(e) => {
                     warn = format!(" (Aviso: no pude preparar el Java de Mojang: {e})");
-                    fallback_java
+                    fallback_java()
                 }
             },
-            None => fallback_java,
+            None => fallback_java(),
         },
     };
     let required = v["javaVersion"]["majorVersion"].as_u64().map(|n| n as u32);
