@@ -6,7 +6,6 @@ mod skin;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::fs;
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -41,6 +40,25 @@ pub struct Profile {
     pub loader: Option<String>,
     #[serde(default)]
     pub fullscreen: bool,
+    /// Identificador de la instancia (carpeta propia con mods, packs, config y mundos).
+    /// Los perfiles viejos no lo traen y siguen usando `.minecraft` tal cual.
+    #[serde(default)]
+    pub id: Option<String>,
+}
+
+/// Carpeta de juego de una instancia. Sin id (perfiles viejos) es `.minecraft`; con id es
+/// `.minecraft/obsidia/instances/<id>`. `libraries`, `assets`, `versions` y `runtime` siguen
+/// compartidos en `.minecraft` para no bajar lo mismo varias veces.
+fn game_dir(instance: Option<&str>) -> Result<PathBuf, String> {
+    match instance.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(minecraft_dir()),
+        Some(id) => {
+            if id.len() > 48 || !only_chars(id, &['-', '_']) {
+                return Err("Identificador de instancia inválido".to_string());
+            }
+            Ok(minecraft_dir().join("obsidia").join("instances").join(id))
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -248,46 +266,122 @@ async fn launch_version(
     java_path: Option<String>,
     server: Option<String>,
     fullscreen: Option<bool>,
+    instance: Option<String>,
 ) -> Result<String, String> {
+    let gd = game_dir(instance.as_deref())?;
     let player = match auth::player().await? {
         Some(p) => p,
         None => launcher::offline_player(&username)?,
     };
     let mc = minecraft_dir();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        launcher::launch(&app, &mc, &version, player, ram, java_path, java_exe, server, fullscreen.unwrap_or(false))
+        launcher::launch(&app, &mc, &gd, &version, player, ram, java_path, java_exe, server, fullscreen.unwrap_or(false))
     })
     .await
     .map_err(|e| e.to_string())?;
     result
 }
 
-fn download_to(url: &str, dest: &Path) -> Result<(), String> {
+fn sha1_hex(bytes: &[u8]) -> String {
+    let mut h = Sha1::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
+}
+
+/// Descarga un instalador y comprueba su SHA1 contra el archivo `<url>.sha1` que publica el
+/// mismo Maven. Si ya está descargado y coincide no se vuelve a bajar; nunca se ejecuta un
+/// archivo cuyo hash no se pudo comprobar.
+fn download_verified(url: &str, dest: &Path) -> Result<(), String> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    if dest.exists() && dest.metadata().map(|m| m.len() > 0).unwrap_or(false) {
-        return Ok(());
-    }
     let client = reqwest::blocking::Client::builder()
+        .user_agent(launcher::UA)
         .timeout(Duration::from_secs(300))
         .build()
         .map_err(|e| e.to_string())?;
-    let mut resp = client.get(url).send().map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        return Err(format!("download failed: HTTP {}", resp.status()));
+
+    let sum = client
+        .get(format!("{url}.sha1"))
+        .send()
+        .and_then(|r| r.error_for_status())
+        .and_then(|r| r.text())
+        .map_err(|e| format!("No pude obtener el SHA1 de {url}: {e}"))?;
+    let expected = sum.split_whitespace().next().unwrap_or("").to_lowercase();
+    if expected.len() != 40 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("El SHA1 publicado para {url} no es válido"));
     }
-    let tmp = dest.with_extension("part");
-    let mut file = fs::File::create(&tmp).map_err(|e| e.to_string())?;
-    io::copy(&mut resp, &mut file).map_err(|e| e.to_string())?;
-    file.flush().map_err(|e| e.to_string())?;
-    drop(file);
-    if tmp.metadata().map(|m| m.len() == 0).unwrap_or(true) {
-        let _ = fs::remove_file(&tmp);
-        return Err("downloaded file is empty".to_string());
+
+    if let Ok(existing) = fs::read(dest) {
+        if sha1_hex(&existing) == expected {
+            return Ok(());
+        }
     }
-    fs::rename(&tmp, dest).map_err(|e| e.to_string())?;
-    Ok(())
+
+    let bytes = client
+        .get(url)
+        .send()
+        .and_then(|r| r.error_for_status())
+        .and_then(|r| r.bytes())
+        .map_err(|e| format!("{url}: {e}"))?;
+    if sha1_hex(&bytes) != expected {
+        return Err(format!("El instalador descargado de {url} no coincide con su SHA1: se descartó"));
+    }
+
+    let mut tmp = dest.as_os_str().to_owned();
+    tmp.push(".part");
+    let tmp = PathBuf::from(tmp);
+    fs::write(&tmp, &bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    if dest.exists() {
+        let _ = fs::remove_file(dest);
+    }
+    fs::rename(&tmp, dest).map_err(|e| format!("{}: {e}", dest.display()))
+}
+
+/// Respaldo si no se puede consultar la lista de instaladores de Fabric.
+const FABRIC_INSTALLER_FALLBACK: (&str, &str) = (
+    "1.1.2",
+    "https://maven.fabricmc.net/net/fabricmc/fabric-installer/1.1.2/fabric-installer-1.1.2.jar",
+);
+
+/// (versión, url) del instalador estable más nuevo de Fabric.
+fn fabric_installer() -> (String, String) {
+    let fallback = || (FABRIC_INSTALLER_FALLBACK.0.to_string(), FABRIC_INSTALLER_FALLBACK.1.to_string());
+    let Ok(client) = reqwest::blocking::Client::builder()
+        .user_agent(launcher::UA)
+        .timeout(Duration::from_secs(30))
+        .build()
+    else {
+        return fallback();
+    };
+    let list: Option<serde_json::Value> = client
+        .get("https://meta.fabricmc.net/v2/versions/installer")
+        .send()
+        .and_then(|r| r.error_for_status())
+        .and_then(|r| r.json())
+        .ok();
+    list.as_ref()
+        .and_then(|l| l.as_array())
+        .and_then(|a| a.iter().find(|v| v.get("stable").and_then(|s| s.as_bool()) == Some(true)))
+        .and_then(|v| {
+            let ver = v.get("version")?.as_str()?;
+            let url = v.get("url")?.as_str()?;
+            // Solo desde el Maven oficial de Fabric y con un nombre de versión simple.
+            let ok = url.starts_with("https://maven.fabricmc.net/")
+                && !ver.is_empty()
+                && ver.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+            ok.then(|| (ver.to_string(), url.to_string()))
+        })
+        .unwrap_or_else(fallback)
+}
+
+/// Versión de Minecraft que va a una URL y al nombre de un archivo: se valida antes de usarla.
+fn check_mc_version(v: &str) -> Result<(), String> {
+    if only_chars(v, &['.', '-', '_']) {
+        Ok(())
+    } else {
+        Err("Versión de Minecraft inválida".to_string())
+    }
 }
 
 fn java_exe() -> String {
@@ -308,10 +402,13 @@ fn ensure_launcher_profiles() {
 
 #[tauri::command(async)]
 fn install_fabric(mc_version: String) -> Result<String, String> {
+    check_mc_version(&mc_version)?;
     ensure_launcher_profiles();
-    let installer_url = "https://maven.fabricmc.net/net/fabricmc/fabric-installer/1.1.2/fabric-installer-1.1.2.jar";
-    let installer_path = minecraft_dir().join("obsidia").join("fabric-installer.jar");
-    download_to(installer_url, &installer_path)?;
+    let (installer_ver, installer_url) = fabric_installer();
+    let installer_path = minecraft_dir()
+        .join("obsidia")
+        .join(format!("fabric-installer-{installer_ver}.jar"));
+    download_verified(&installer_url, &installer_path)?;
     let java = java_exe();
     let out = new_cmd(java)
         .arg("-jar")
@@ -333,6 +430,7 @@ fn install_fabric(mc_version: String) -> Result<String, String> {
 
 #[tauri::command(async)]
 fn install_forge(mc_version: String) -> Result<String, String> {
+    check_mc_version(&mc_version)?;
     ensure_launcher_profiles();
     // resolve forge version from promotions
     let resp = reqwest::blocking::get(
@@ -343,20 +441,27 @@ fn install_forge(mc_version: String) -> Result<String, String> {
         return Err(format!("forge promotions request failed: HTTP {}", resp.status()));
     }
     let promos: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
-    let key = format!("{mc_version}-latest");
-    let forge_ver = promos
-        .get("promos")
-        .and_then(|p| p.get(&key))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| format!("no forge version for {mc_version}"))?
-        .to_string();
+    // Se prefiere la versión recomendada y, si no hay, la más nueva.
+    let promo = |kind: &str| {
+        promos
+            .get("promos")
+            .and_then(|p| p.get(format!("{mc_version}-{kind}")))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    };
+    let forge_ver = promo("recommended")
+        .or_else(|| promo("latest"))
+        .ok_or_else(|| format!("no forge version for {mc_version}"))?;
+    if !only_chars(&forge_ver, &['.', '-', '_']) {
+        return Err("Versión de Forge inválida".to_string());
+    }
     let url = format!(
         "https://maven.minecraftforge.net/net/minecraftforge/forge/{mc_version}-{forge_ver}/forge-{mc_version}-{forge_ver}-installer.jar"
     );
     let installer_path = minecraft_dir()
         .join("obsidia")
         .join(format!("forge-installer-{mc_version}.jar"));
-    download_to(&url, &installer_path)?;
+    download_verified(&url, &installer_path)?;
     let java = java_exe();
     let out = new_cmd(java)
         .arg("-jar")
@@ -419,8 +524,8 @@ fn servers_path() -> PathBuf {
 }
 
 #[tauri::command]
-fn list_shaderpacks() -> Result<Vec<String>, String> {
-    let dir = minecraft_dir().join("shaderpacks");
+fn list_shaderpacks(instance: Option<String>) -> Result<Vec<String>, String> {
+    let dir = game_dir(instance.as_deref())?.join("shaderpacks");
     let mut out = Vec::new();
     if let Ok(entries) = fs::read_dir(&dir) {
         for e in entries.flatten() {
@@ -436,8 +541,8 @@ fn list_shaderpacks() -> Result<Vec<String>, String> {
 }
 
 #[tauri::command]
-fn list_resourcepacks() -> Result<Vec<String>, String> {
-    let dir = minecraft_dir().join("resourcepacks");
+fn list_resourcepacks(instance: Option<String>) -> Result<Vec<String>, String> {
+    let dir = game_dir(instance.as_deref())?.join("resourcepacks");
     let mut out = Vec::new();
     if let Ok(entries) = fs::read_dir(&dir) {
         for e in entries.flatten() {
@@ -454,14 +559,14 @@ fn list_resourcepacks() -> Result<Vec<String>, String> {
 
 /// Estado de los resource packs: activos en orden de prioridad y el resto.
 #[tauri::command(async)]
-fn get_resourcepack_state() -> Result<Vec<packs::PackState>, String> {
-    Ok(packs::get_state(&minecraft_dir()))
+fn get_resourcepack_state(instance: Option<String>) -> Result<Vec<packs::PackState>, String> {
+    Ok(packs::get_state(&game_dir(instance.as_deref())?))
 }
 
 /// Guarda qué packs están activos y en qué orden (la lista llega ya priorizada).
 #[tauri::command(async)]
-fn save_resourcepack_state(active: Vec<String>) -> Result<(), String> {
-    packs::save_state(&minecraft_dir(), active)
+fn save_resourcepack_state(active: Vec<String>, instance: Option<String>) -> Result<(), String> {
+    packs::save_state(&game_dir(instance.as_deref())?, active)
 }
 
 /// Genera el resource pack `ObsidiaSkin` y lo activa en `options.txt`.
@@ -471,6 +576,7 @@ fn apply_offline_skin(
     skin_png_base64: String,
     model: String,
     mc_version: Option<String>,
+    instance: Option<String>,
 ) -> Result<String, String> {
     if auth::has_session() {
         return Err(
@@ -480,18 +586,18 @@ fn apply_offline_skin(
     }
     let png = skin::decode_skin(&skin_png_base64)?;
     skin::normalize_model(&model)?;
-    skin::apply_skin(&minecraft_dir(), &png, &model, mc_version.as_deref())?;
+    skin::apply_skin(&game_dir(instance.as_deref())?, &png, &model, mc_version.as_deref())?;
     Ok("Skin aplicada al juego (resource pack ObsidiaSkin).".to_string())
 }
 
 /// Borra el resource pack de skin y su entrada de `options.txt`.
 #[tauri::command(async)]
-fn remove_offline_skin() -> Result<(), String> {
-    skin::remove_skin(&minecraft_dir())
+fn remove_offline_skin(instance: Option<String>) -> Result<(), String> {
+    skin::remove_skin(&game_dir(instance.as_deref())?)
 }
 
 #[tauri::command]
-fn delete_file_in(folder: String, name: String) -> Result<(), String> {
+fn delete_file_in(folder: String, name: String, instance: Option<String>) -> Result<(), String> {
     // Solo estas carpetas, y solo un nombre simple (sin "..", barras ni letras de unidad).
     if !["mods", "shaderpacks", "resourcepacks"].contains(&folder.as_str()) {
         return Err("Carpeta no permitida".to_string());
@@ -501,7 +607,7 @@ fn delete_file_in(folder: String, name: String) -> Result<(), String> {
         (Some(std::path::Component::Normal(_)), None) => {}
         _ => return Err("Nombre de archivo inválido".to_string()),
     }
-    let path = minecraft_dir().join(folder).join(&name);
+    let path = game_dir(instance.as_deref())?.join(folder).join(&name);
     if path.is_dir() {
         fs::remove_dir_all(&path).map_err(|e| e.to_string())?;
     } else {
@@ -511,8 +617,8 @@ fn delete_file_in(folder: String, name: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn list_installed_mods() -> Result<Vec<String>, String> {
-    let dir = minecraft_dir().join("mods");
+fn list_installed_mods(instance: Option<String>) -> Result<Vec<String>, String> {
+    let dir = game_dir(instance.as_deref())?.join("mods");
     let mut out = Vec::new();
     if let Ok(entries) = fs::read_dir(&dir) {
         for e in entries.flatten() {
@@ -589,7 +695,12 @@ fn only_chars(s: &str, extra: &[char]) -> bool {
 }
 
 #[tauri::command]
-async fn install_mod(slug: String, mc_version: String, loader: String) -> Result<String, String> {
+async fn install_mod(
+    slug: String,
+    mc_version: String,
+    loader: String,
+    instance: Option<String>,
+) -> Result<String, String> {
     // Los tres valores van a una URL y a una ruta: se validan antes de usarlos.
     if !only_chars(&slug, &['-', '_']) || !only_chars(&mc_version, &['.', '-', '_']) {
         return Err("Datos del mod inválidos".to_string());
@@ -649,7 +760,7 @@ async fn install_mod(slug: String, mc_version: String, loader: String) -> Result
         }
     }
 
-    let dest = minecraft_dir().join("mods").join(filename);
+    let dest = game_dir(instance.as_deref())?.join("mods").join(filename);
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -658,16 +769,29 @@ async fn install_mod(slug: String, mc_version: String, loader: String) -> Result
 }
 
 #[tauri::command]
-async fn install_shaderpack(slug: String, mc_version: Option<String>) -> Result<String, String> {
-    download_project_file(&slug, "shaderpacks", mc_version.as_deref()).await
+async fn install_shaderpack(
+    slug: String,
+    mc_version: Option<String>,
+    instance: Option<String>,
+) -> Result<String, String> {
+    download_project_file(&slug, "shaderpacks", mc_version.as_deref(), instance.as_deref()).await
 }
 
 #[tauri::command(async)]
-async fn install_resourcepack(slug: String, mc_version: Option<String>) -> Result<String, String> {
-    download_project_file(&slug, "resourcepacks", mc_version.as_deref()).await
+async fn install_resourcepack(
+    slug: String,
+    mc_version: Option<String>,
+    instance: Option<String>,
+) -> Result<String, String> {
+    download_project_file(&slug, "resourcepacks", mc_version.as_deref(), instance.as_deref()).await
 }
 
-async fn download_project_file(slug: &str, folder: &str, mc_version: Option<&str>) -> Result<String, String> {
+async fn download_project_file(
+    slug: &str,
+    folder: &str,
+    mc_version: Option<&str>,
+    instance: Option<&str>,
+) -> Result<String, String> {
     if !only_chars(slug, &['-', '_']) {
         return Err("Slug inválido".to_string());
     }
@@ -721,7 +845,7 @@ async fn download_project_file(slug: &str, folder: &str, mc_version: Option<&str
         }
     }
 
-    let dest = minecraft_dir().join(folder).join(filename);
+    let dest = game_dir(instance)?.join(folder).join(filename);
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -932,6 +1056,35 @@ mod tests {
         assert_eq!(leida[0].address, "a.net");
         assert!(!dir.join("sub").join("servers.json.tmp").exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn carpeta_de_instancia() {
+        // Sin id: perfiles viejos, siguen en .minecraft.
+        assert_eq!(game_dir(None).unwrap(), minecraft_dir());
+        assert_eq!(game_dir(Some("  ")).unwrap(), minecraft_dir());
+        // Con id: carpeta propia dentro de obsidia/instances.
+        let d = game_dir(Some("pabc-123_x")).unwrap();
+        assert!(d.ends_with(Path::new("obsidia").join("instances").join("pabc-123_x")));
+        // Ids que intentan salirse de la carpeta se rechazan.
+        assert!(game_dir(Some("../etc")).is_err());
+        assert!(game_dir(Some("a/b")).is_err());
+        assert!(game_dir(Some("a\\b")).is_err());
+        assert!(game_dir(Some("C:")).is_err());
+    }
+
+    #[test]
+    fn version_de_minecraft_valida() {
+        assert!(check_mc_version("1.21.4").is_ok());
+        assert!(check_mc_version("24w14a").is_ok());
+        assert!(check_mc_version("../x").is_err());
+        assert!(check_mc_version("1.21/4").is_err());
+        assert!(check_mc_version("").is_err());
+    }
+
+    #[test]
+    fn sha1_conocido() {
+        assert_eq!(sha1_hex(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
     }
 
     #[test]
