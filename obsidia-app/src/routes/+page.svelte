@@ -228,7 +228,8 @@ let accHtml = '';
     const inst = await invoke('get_installed_versions').catch(()=>[]);
     const mc = p.version.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const rx = p.loader==='Fabric' ? new RegExp('^fabric-loader-.+-'+mc+'$') : new RegExp('^'+mc+'-forge-');
-    return (inst||[]).filter(v => rx.test(v)).pop() || null;
+    // Orden numérico ("0.16.10" > "0.9.3"); el orden alfabético elegiría el loader equivocado.
+    return (inst||[]).filter(v => rx.test(v)).sort((a,b) => a.localeCompare(b, undefined, { numeric:true })).pop() || null;
   }
   async function launchVersionId(p){
     if (!p.loader || p.loader==='Vanilla') return p.version;
@@ -316,8 +317,9 @@ let accHtml = '';
     if (P.some((x,i) => x.n === name && i !== S.npEdit)){ S.npErr = 'Ya existe un perfil con ese nombre.'; render(); return; }
     S.npBusy = true;
     try {
-      if (old && old.n !== name) await invoke('delete_profile', { name:old.n });
+      // Primero se guarda el nuevo y recién después se borra el viejo: si algo falla no se pierde el perfil.
       await invoke('save_profile', { profile:{ name, version:S.npVersion, username:S.nick, ram:S.npRam+'G', java_path:S.npJava||null, loader:S.npLoader, fullscreen:S.npFullscreen } });
+      if (old && old.n !== name) await invoke('delete_profile', { name:old.n });
       await loadProfiles(name);
       selectProfile(S.p);
       S.np = false; S.npEdit = -1; S.npErr = '';
@@ -326,6 +328,9 @@ let accHtml = '';
   }
 
   // ───────────── Eventos ─────────────
+  // Cerrar el modal de Microsoft también cancela la espera en Rust: así no queda una sesión
+  // guardada en segundo plano mientras la interfaz dice "offline".
+  function closeMs(){ invoke('ms_cancel').catch(()=>{}); S.msc = null; render(); }
   async function onClick(e){
     const b = e.target.closest('[data-act]');
     if (!b) return;
@@ -396,10 +401,10 @@ let accHtml = '';
         S.msc = dc; render();
         const profile = await invoke('ms_login', { deviceCode:dc.device_code });
         if (S.msc){ S.ms = true; S.nick = (profile && profile.name) ? profile.name : S.nick; persistSettings(); toast('Sesión de Microsoft iniciada.'); }
-      } catch(err){ toast('No se pudo iniciar sesión: '+err, true); }
+      } catch(err){ if (S.msc) toast('No se pudo iniciar sesión: '+err, true); }
       S.ml = false; S.msc = null; render();
     }
-    else if (a=='msclose'){ if (e.target !== b) return; S.msc = null; render(); }
+    else if (a=='msclose'){ if (e.target !== b) return; closeMs(); }
     else if (a=='msopen'){ invoke('plugin:opener|open_url', { url:d.url }).catch(() => window.open(d.url, '_blank')); }
     else if (a=='mscopy'){ try { await navigator.clipboard.writeText(d.code); toast('Código copiado.'); } catch(err){} }
     else if (a=='mso'){ invoke('ms_logout').catch(()=>{}); S.ms = false; render(); }
@@ -431,7 +436,7 @@ let accHtml = '';
   }
   function onKey(e){
     if ((e.key==='Enter' || e.key===' ') && e.target.matches && e.target.matches('[role=button][data-act]')){ e.preventDefault(); e.target.click(); }
-    if (e.key==='Escape' && (S.np || S.msc)){ S.np = false; S.msc = null; S.npEdit = -1; render(); }
+    if (e.key==='Escape' && (S.np || S.msc)){ if (S.msc) invoke('ms_cancel').catch(()=>{}); S.np = false; S.msc = null; S.npEdit = -1; render(); }
   }
 
   // ───────────── Arranque ─────────────
