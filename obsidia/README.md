@@ -46,3 +46,6 @@ Objetivo: de los más bonitos visualmente y de los más optimizados.
 - Datos reales en la interfaz (todo lo del prototipo es de ejemplo)
 - Avisar de dependencias al borrar un mod (por ejemplo Fabric API)
 - Verificar que el nombre "Obsidia" no esté usado por otro launcher
+
+## Estado actual
+- Tareas 1-7 en progreso; 8 (instalador/updater) pendiente por falta de Node/npm; 9 nombre verificado (Obsidia).
