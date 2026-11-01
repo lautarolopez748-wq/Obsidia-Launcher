@@ -619,6 +619,17 @@ pub fn server_args(server: &str, mc_version: &str) -> Result<Vec<String>, String
 
 // ─────────────────────────────── Lanzamiento ─────────────────────────────────
 
+/// Lo que el perfil (o el botón "Unirse") le pide al lanzamiento.
+pub struct LaunchOptions {
+    /// Memoria máxima: "4G", "3072M"… Si falta o es rara se usa 2G.
+    pub ram: Option<String>,
+    /// Java elegido por el usuario. Vacío o `None` = automático.
+    pub java_path: Option<String>,
+    /// Servidor al que entrar directo (`host` o `host:puerto`).
+    pub server: Option<String>,
+    pub fullscreen: bool,
+}
+
 /// Prepara todo (descargas incluidas) y abre el juego. Bloqueante: llamarlo desde un hilo aparte.
 pub fn launch(
     app: &AppHandle,
@@ -627,13 +638,11 @@ pub fn launch(
     game_dir: &Path,
     version: &str,
     player: Player,
-    ram: Option<String>,
-    java_path: Option<String>,
+    opts: LaunchOptions,
     // Se llama solo si hace falta: buscar Javas instalados lanza `java -version` en cada uno.
     fallback_java: impl FnOnce() -> String,
-    server: Option<String>,
-    fullscreen: bool,
 ) -> Result<String, String> {
+    let LaunchOptions { ram, java_path, server, fullscreen } = opts;
     let c = client()?;
     fs::create_dir_all(game_dir).map_err(|e| format!("{}: {e}", game_dir.display()))?;
 
