@@ -6,6 +6,7 @@ mod skin;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -38,6 +39,8 @@ pub struct Profile {
     /// "Vanilla", "Fabric" o "Forge". Los perfiles viejos no lo traen: queda en None.
     #[serde(default)]
     pub loader: Option<String>,
+    #[serde(default)]
+    pub fullscreen: bool,
 }
 
 #[derive(Serialize)]
@@ -221,6 +224,7 @@ async fn launch_version(
     ram: Option<String>,
     java_path: Option<String>,
     server: Option<String>,
+    fullscreen: Option<bool>,
 ) -> Result<String, String> {
     let player = match auth::player().await? {
         Some(p) => p,
@@ -229,7 +233,7 @@ async fn launch_version(
     let mc = minecraft_dir();
     let fallback = java_exe();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        launcher::launch(&app, &mc, &version, player, ram, java_path, fallback, server)
+        launcher::launch(&app, &mc, &version, player, ram, java_path, fallback, server, fullscreen.unwrap_or(false))
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -240,12 +244,27 @@ fn download_to(url: &str, dest: &Path) -> Result<(), String> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    if dest.exists() {
+    if dest.exists() && dest.metadata().map(|m| m.len() > 0).unwrap_or(false) {
         return Ok(());
     }
-    let resp = reqwest::blocking::get(url).map_err(|e| e.to_string())?;
-    let bytes = resp.bytes().map_err(|e| e.to_string())?;
-    fs::write(dest, bytes).map_err(|e| e.to_string())?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut resp = client.get(url).send().map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("download failed: HTTP {}", resp.status()));
+    }
+    let tmp = dest.with_extension("part");
+    let mut file = fs::File::create(&tmp).map_err(|e| e.to_string())?;
+    io::copy(&mut resp, &mut file).map_err(|e| e.to_string())?;
+    file.flush().map_err(|e| e.to_string())?;
+    drop(file);
+    if tmp.metadata().map(|m| m.len() == 0).unwrap_or(true) {
+        let _ = fs::remove_file(&tmp);
+        return Err("downloaded file is empty".to_string());
+    }
+    fs::rename(&tmp, dest).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -294,12 +313,14 @@ fn install_fabric(mc_version: String) -> Result<String, String> {
 fn install_forge(mc_version: String) -> Result<String, String> {
     ensure_launcher_profiles();
     // resolve forge version from promotions
-    let promos: serde_json::Value = reqwest::blocking::get(
+    let resp = reqwest::blocking::get(
         "https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json",
     )
-    .map_err(|e| e.to_string())?
-    .json()
     .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("forge promotions request failed: HTTP {}", resp.status()));
+    }
+    let promos: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
     let key = format!("{mc_version}-latest");
     let forge_ver = promos
         .get("promos")

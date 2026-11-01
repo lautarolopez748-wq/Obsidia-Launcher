@@ -107,19 +107,23 @@ struct Job {
     size: Option<u64>,
 }
 
-/// ¿Ya está bien el archivo? Si conocemos el tamaño alcanza con compararlo (rápido);
-/// si no, se compara el SHA1; si no hay ninguno de los dos, basta con que exista.
 fn is_up_to_date(job: &Job) -> bool {
     let Ok(meta) = fs::metadata(&job.dest) else { return false };
+    if meta.len() == 0 {
+        return false;
+    }
     if let Some(size) = job.size {
-        return meta.len() == size;
+        if meta.len() != size {
+            return false;
+        }
     }
-    match &job.sha1 {
-        Some(expected) => fs::read(&job.dest)
+    if let Some(expected) = &job.sha1 {
+        return fs::read(&job.dest)
             .map(|b| sha1_hex(&b).eq_ignore_ascii_case(expected))
-            .unwrap_or(false),
-        None => true,
+            .unwrap_or(false);
     }
+    // Sin hash no se puede garantizar integridad: forzar re-descarga.
+    false
 }
 
 fn download(c: &reqwest::blocking::Client, job: &Job) -> Result<(), String> {
@@ -149,7 +153,22 @@ fn download(c: &reqwest::blocking::Client, job: &Job) -> Result<(), String> {
                 tmp.push(".part");
                 let tmp = PathBuf::from(tmp);
                 fs::write(&tmp, &bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
-                fs::rename(&tmp, &job.dest).map_err(|e| format!("{}: {e}", job.dest.display()))?;
+                // Reemplazo seguro compatible con Windows: nunca se borra el archivo
+                // válido antes de confirmar que el temporal quedó completo.
+                let backup = job.dest.with_extension("old");
+                if job.dest.exists() {
+                    let _ = fs::remove_file(&backup);
+                    fs::rename(&job.dest, &backup).map_err(|e| format!("{}: {e}", job.dest.display()))?;
+                }
+                if let Err(e) = fs::rename(&tmp, &job.dest) {
+                    // Restaurar el original si el reemplazo falla.
+                    if backup.exists() {
+                        let _ = fs::rename(&backup, &job.dest);
+                    }
+                    return Err(format!("{}: {e}", job.dest.display()));
+                }
+                let _ = fs::remove_file(&backup);
+                let _ = fs::remove_file(&tmp);
                 return Ok(());
             }
             Err(e) => last = format!("{}: {e}", job.url),
@@ -610,6 +629,7 @@ pub fn launch(
     java_path: Option<String>,
     fallback_java: String,
     server: Option<String>,
+    fullscreen: bool,
 ) -> Result<String, String> {
     let c = client()?;
 
@@ -853,6 +873,11 @@ pub fn launch(
                 args.push(e);
             }
         }
+    }
+
+    // Pantalla completa por perfil.
+    if fullscreen {
+        args.push("--fullscreen".to_string());
     }
 
     // Entrar directo al servidor elegido (si lo hay).
