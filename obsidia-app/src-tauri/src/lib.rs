@@ -1,3 +1,4 @@
+mod auth;
 mod launcher;
 mod packs;
 mod skin;
@@ -221,13 +222,8 @@ async fn launch_version(
     java_path: Option<String>,
     server: Option<String>,
 ) -> Result<String, String> {
-    let player = match read_ms_profile() {
-        Some(p) => launcher::Player {
-            name: p.name,
-            uuid: p.uuid,
-            token: p.access_token,
-            user_type: "msa".to_string(),
-        },
+    let player = match auth::player().await? {
+        Some(p) => p,
         None => launcher::offline_player(&username)?,
     };
     let mc = minecraft_dir();
@@ -424,7 +420,7 @@ fn apply_offline_skin(
     model: String,
     mc_version: Option<String>,
 ) -> Result<String, String> {
-    if read_ms_profile().is_some() {
+    if auth::has_session() {
         return Err(
             "Tenés una cuenta Microsoft: el juego ya usa tu skin oficial y no se aplica el pack offline."
                 .to_string(),
@@ -806,190 +802,26 @@ fn save_settings(settings: AppSettings) -> Result<(), String> {
     Ok(())
 }
 
-const MS_CLIENT_ID: &str = "14d82eec-204b-4c2f-b7e8-296a70dab67e";
+// El login de Microsoft vive en auth.rs: los tokens van al Credential Manager.
 
-#[derive(Serialize, Deserialize, Clone)]
-pub struct DeviceCode {
-    pub device_code: String,
-    pub user_code: String,
-    pub verification_uri: String,
-    pub expires_in: u64,
-    pub interval: u64,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct MsProfile {
-    pub name: String,
-    pub uuid: String,
-    pub access_token: String,
-}
-
-fn auth_path() -> PathBuf {
-    minecraft_dir().join("obsidia").join("auth.json")
+#[tauri::command]
+async fn ms_device_code() -> Result<auth::DeviceCode, String> {
+    auth::request_device_code().await
 }
 
 #[tauri::command]
-async fn ms_device_code() -> Result<DeviceCode, String> {
-    let client = reqwest::Client::new();
-    let resp = client
-        .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode")
-        .form(&[("client_id", MS_CLIENT_ID), ("scope", "XboxLive.signin offline_access")])
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    Ok(DeviceCode {
-        device_code: json.get("device_code").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        user_code: json.get("user_code").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        verification_uri: json.get("verification_uri").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        expires_in: json.get("expires_in").and_then(|v| v.as_u64()).unwrap_or(900),
-        interval: json.get("interval").and_then(|v| v.as_u64()).unwrap_or(5),
-    })
+async fn ms_login(device_code: String) -> Result<auth::MsProfile, String> {
+    auth::wait_for_login(&device_code).await
 }
 
 #[tauri::command]
-async fn ms_login(device_code: String) -> Result<MsProfile, String> {
-    let client = reqwest::Client::new();
-    // poll token
-    let mut interval = 5u64;
-    let mut ms_access = String::new();
-    for _ in 0..120 {
-        tokio::time::sleep(Duration::from_secs(interval)).await;
-        let resp = client
-            .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token")
-            .form(&[
-                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-                ("client_id", MS_CLIENT_ID),
-                ("device_code", &device_code),
-            ])
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-        if let Some(tok) = json.get("access_token").and_then(|v| v.as_str()) {
-            ms_access = tok.to_string();
-            break;
-        }
-        let err = json.get("error").and_then(|v| v.as_str()).unwrap_or("");
-        if err == "authorization_pending" {
-            continue;
-        }
-        if err == "slow_down" {
-            interval += 5;
-            continue;
-        }
-        return Err(format!("token error: {err} {}", json.get("error_description").and_then(|v| v.as_str()).unwrap_or("")));
-    }
-    if ms_access.is_empty() {
-        return Err("timeout waiting for login".to_string());
-    }
-
-    // xbox live
-    let xbl_body = serde_json::json!({
-        "Properties": {
-            "AuthMethod": "RPS",
-            "SiteName": "user.auth.xboxlive.com",
-            "RpsTicket": format!("d={}", ms_access)
-        },
-        "RelyingParty": "http://auth.xboxlive.com",
-        "TokenType": "JWT"
-    });
-    let xbl_resp: serde_json::Value = client
-        .post("https://user.auth.xboxlive.com/user/authenticate")
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json")
-        .json(&xbl_body)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
-    let xbl_token = xbl_resp.get("Token").and_then(|v| v.as_str()).ok_or("no xbl token")?.to_string();
-    let uhs = xbl_resp
-        .get("DisplayClaims")
-        .and_then(|d| d.get("xui"))
-        .and_then(|x| x.as_array())
-        .and_then(|a| a.first())
-        .and_then(|o| o.get("uhs"))
-        .and_then(|v| v.as_str())
-        .ok_or("no uhs")?
-        .to_string();
-
-    // xsts
-    let xsts_body = serde_json::json!({
-        "Properties": {
-            "SandboxId": "RETAIL",
-            "UserTokens": [xbl_token]
-        },
-        "RelyingParty": "rp://api.minecraftservices.com/",
-        "TokenType": "JWT"
-    });
-    let xsts_resp: serde_json::Value = client
-        .post("https://xsts.auth.xboxlive.com/xsts/authorize")
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json")
-        .json(&xsts_body)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
-    let xsts_token = xsts_resp.get("Token").and_then(|v| v.as_str()).ok_or("no xsts token")?.to_string();
-
-    // minecraft login
-    let mc_body = serde_json::json!({
-        "identityToken": format!("XBL3.0 x={};{}", uhs, xsts_token)
-    });
-    let mc_resp: serde_json::Value = client
-        .post("https://api.minecraftservices.com/authentication/login_with_xbox")
-        .header("Content-Type", "application/json")
-        .json(&mc_body)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
-    let mc_access = mc_resp.get("access_token").and_then(|v| v.as_str()).ok_or("no mc access")?.to_string();
-
-    // profile
-    let profile_resp: serde_json::Value = client
-        .get("https://api.minecraftservices.com/minecraft/profile")
-        .bearer_auth(&mc_access)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
-    let name = profile_resp.get("name").and_then(|v| v.as_str()).unwrap_or("Player").to_string();
-    let uuid = profile_resp.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-
-    let profile = MsProfile { name, uuid, access_token: mc_access };
-    // save
-    let path = auth_path();
-    if let Some(parent) = path.parent() { let _ = fs::create_dir_all(parent); }
-    if let Ok(data) = serde_json::to_string_pretty(&profile) { let _ = fs::write(&path, data); }
-    Ok(profile)
-}
-
-fn read_ms_profile() -> Option<MsProfile> {
-    let data = fs::read_to_string(auth_path()).ok()?;
-    serde_json::from_str(&data).ok()
-}
-
-#[tauri::command]
-fn ms_get_profile() -> Result<Option<MsProfile>, String> {
-    Ok(read_ms_profile())
+async fn ms_get_profile() -> Result<Option<auth::MsProfile>, String> {
+    auth::current_profile().await
 }
 
 #[tauri::command]
 fn ms_logout() -> Result<(), String> {
-    let path = auth_path();
-    if path.exists() { let _ = fs::remove_file(&path); }
-    Ok(())
+    auth::logout()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
