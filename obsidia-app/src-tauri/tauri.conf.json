@@ -25,7 +25,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ1OEM3NjVGNUU4MTlFRkIKUldUN25vRmVYM2FNUmFyUzdnUmNOaDNDT2FER3hFRkxDeDYxNUNuSFIrME5NUXh4YzRjRys5RHEK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDM1QzI3RkUxRkE0MTZBMzIKUldReWFrSDY0WC9DTmNQSWV6QkcwaVpBK0h5WVdmSTNBL0tYcUx3dHZmWm9qRWtJVjVQVjJlakkK",
       "endpoints": [
         "https://github.com/lautarolopez748-wq/Obsidia-Launcher/releases/latest/download/latest.json"
       ]
