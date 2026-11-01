@@ -6,7 +6,7 @@
 
 use base64::Engine;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Nombre de la carpeta dentro de `resourcepacks`.
 const PACK_NAME: &str = "ObsidiaSkin";
@@ -106,7 +106,7 @@ pub fn pack_meta_json(version: Option<&str>) -> String {
 // ───────────────────────────── options.txt ─────────────────────────────────────
 
 /// Extrae la lista de un renglón `clave:["a","b"]`. Si algo no parsea, devuelve vacío.
-fn parse_pack_list(line: &str) -> Vec<String> {
+pub fn parse_pack_list(line: &str) -> Vec<String> {
     let (Some(start), Some(end)) = (line.find('['), line.rfind(']')) else {
         return Vec::new();
     };
@@ -116,42 +116,51 @@ fn parse_pack_list(line: &str) -> Vec<String> {
     serde_json::from_str::<Vec<String>>(&line[start..=end]).unwrap_or_default()
 }
 
-/// Reescribe un renglón `clave:[...]`: agrega la entrada al principio (prioridad más alta)
-/// o la quita. No toca las demás líneas ni sus saltos de línea. Si el renglón no existe
-/// y hay que agregar, se crea al final.
-pub fn edit_pack_list(options: &str, key: &str, entry: &str, enabled: bool) -> String {
+/// Escribe el renglón `clave:[...]` con la lista exacta dada. Crea el renglón si falta.
+pub fn set_pack_entries(options: &str, key: &str, packs: &[String]) -> String {
     let eol = if options.contains("\r\n") { "\r\n" } else { "\n" };
     let trailing = options.ends_with('\n');
-    let mut lines: Vec<String> = options
-        .split('\n')
-        .map(|l| l.trim_end_matches('\r').to_string())
-        .collect();
+    let mut lines: Vec<String> = if options.is_empty() {
+        Vec::new()
+    } else {
+        options
+            .split('\n')
+            .map(|l| l.trim_end_matches('\r').to_string())
+            .collect()
+    };
     if trailing {
-        lines.pop(); // el split deja un "" extra cuando termina en salto de línea
+        lines.pop();
     }
-
-    let idx = lines.iter().position(|l| l.starts_with(key));
-    // Quitar algo de un renglón que no existe no debe crear el renglón.
-    if idx.is_none() && !enabled {
-        return options.to_string();
-    }
-    let mut packs = idx.map(|i| parse_pack_list(&lines[i])).unwrap_or_default();
-    packs.retain(|p| p != entry);
-    if enabled {
-        packs.insert(0, entry.to_string());
-    }
-
-    let new_line = format!("{key}{}", serde_json::to_string(&packs).unwrap_or_else(|_| "[]".into()));
-    match idx {
+    let new_line = format!("{key}{}", serde_json::to_string(packs).unwrap_or_else(|_| "[]".into()));
+    match lines.iter().position(|l| l.starts_with(key)) {
         Some(i) => lines[i] = new_line,
         None => lines.push(new_line),
     }
-
     let mut out = lines.join(eol);
     if trailing {
         out.push_str(eol);
     }
     out
+}
+
+/// Reescribe un renglón `clave:[...]`: agrega la entrada al principio (prioridad más alta)
+/// o la quita. No toca las demás líneas ni sus saltos de línea. Si el renglón no existe
+/// y hay que agregar, se crea al final.
+pub fn edit_pack_list(options: &str, key: &str, entry: &str, enabled: bool) -> String {
+    let line = options
+        .split('\n')
+        .map(|l| l.trim_end_matches('\r'))
+        .find(|l| l.starts_with(key));
+    // Quitar algo de un renglón que no existe no debe crear el renglón.
+    if line.is_none() && !enabled {
+        return options.to_string();
+    }
+    let mut packs = line.map(parse_pack_list).unwrap_or_default();
+    packs.retain(|p| p != entry);
+    if enabled {
+        packs.insert(0, entry.to_string());
+    }
+    set_pack_entries(options, key, &packs)
 }
 
 /// Activa/desactiva el pack y lo saca de `incompatibleResourcePacks`

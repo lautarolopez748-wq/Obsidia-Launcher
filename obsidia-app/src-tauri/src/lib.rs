@@ -1,4 +1,5 @@
 mod launcher;
+mod packs;
 mod skin;
 
 use serde::{Deserialize, Serialize};
@@ -400,6 +401,18 @@ fn list_resourcepacks() -> Result<Vec<String>, String> {
     }
     out.sort();
     Ok(out)
+}
+
+/// Estado de los resource packs: activos en orden de prioridad y el resto.
+#[tauri::command(async)]
+fn get_resourcepack_state() -> Result<Vec<packs::PackState>, String> {
+    Ok(packs::get_state(&minecraft_dir()))
+}
+
+/// Guarda qué packs están activos y en qué orden (la lista llega ya priorizada).
+#[tauri::command(async)]
+fn save_resourcepack_state(active: Vec<String>) -> Result<(), String> {
+    packs::save_state(&minecraft_dir(), active)
 }
 
 /// Genera el resource pack `ObsidiaSkin` y lo activa en `options.txt`.
@@ -995,6 +1008,8 @@ pub fn run() {
             install_forge,
             list_shaderpacks,
             list_resourcepacks,
+            get_resourcepack_state,
+            save_resourcepack_state,
             apply_offline_skin,
             remove_offline_skin,
             delete_file_in,
