@@ -32,6 +32,9 @@ pub struct Profile {
     pub username: String,
     pub ram: String,
     pub java_path: Option<String>,
+    /// "Vanilla", "Fabric" o "Forge". Los perfiles viejos no lo traen: queda en None.
+    #[serde(default)]
+    pub loader: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -656,7 +659,7 @@ async fn download_project_file(slug: &str, folder: &str) -> Result<String, Strin
     Ok(filename.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_total_ram() -> Result<u64, String> {
     #[cfg(windows)]
     {

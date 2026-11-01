@@ -34,9 +34,6 @@
   "bundle": {
     "active": true,
     "createUpdaterArtifacts": true,
-    "resources": [
-      "../../obsidia/scripts/launch_vanilla.py"
-    ],
     "targets": "all",
     "icon": [
       "icons/32x32.png",
