@@ -33,7 +33,7 @@
     pg:null, stage:'version', launchErr:'', launchMsg:'',
     defRam:4, totalRam:16, t:{ lite:false },
     nick:'Jugador', ms:false, ml:false, msc:null,
-    skins:[], sk:-1,
+    skins:[], sk:-1, skmodel:'classic',
     files:{ mods:[], shaders:[], packs:[] },
     results:{ mods:null, shaders:null, packs:null }, searching:false, seq:0, busy:{},
     sv:[], af:false, rf:false, es:null, ns:'', na:'',
@@ -232,9 +232,11 @@
   // ───────────── Cuenta ─────────────
   function account(){
     const ok = validName(S.nick);
-    return `<h1>Mi cuenta</h1><div style="display:grid;grid-template-columns:1fr 1.3fr;gap:16px;align-items:start"><div class="gl" style="padding:26px;display:flex;flex-direction:column;align-items:center;gap:18px">${skinFace(S.sk,132)}<div style="width:100%"><label class="mu" for="nick">Nombre de jugador</label><input id="nick" class="srch" style="width:100%;margin-top:6px" maxlength="16" autocomplete="off" value="${esc(S.nick)}" ${S.ms?'disabled':''}><div id="nm" style="margin-top:8px;font-size:13px;color:${ok?'#6EE7B7':'#FCD34D'}">${ok?'Nombre válido ✓':'Usá de 3 a 16 letras, números o guion bajo.'}</div></div></div><div style="display:flex;flex-direction:column;gap:16px"><div class="gl" style="padding:20px 22px;display:flex;flex-direction:column;gap:10px"><b>Tipo de cuenta</b><div style="color:${S.ms?'#6EE7B7':'#C9C7DD'}">${S.ms?'Cuenta Microsoft vinculada':'Estás jugando en modo offline'}</div><div class="mu">${S.ms?'Podés entrar a servidores premium y usar tu skin oficial.':'En modo offline no podés entrar a servidores que verifican la cuenta.'}</div>${S.ms?'<button class="sec" style="height:44px" data-act="mso">Cerrar sesión</button>':`<button class="ib" style="margin:0;height:44px" ${S.ml?'disabled':''} data-act="ms">${S.ml?'Esperando a Microsoft…':'Iniciar sesión con Microsoft'}</button>`}</div><div class="gl" style="padding:20px 22px;display:flex;flex-direction:column;gap:14px"><b>Skin</b><div class="mu">Vista previa en el launcher. Para verla dentro del juego hace falta una cuenta Microsoft.</div><div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px">${S.skins.map((u,i)=>`<button class="pc gl ${i==S.sk?'on':''}" style="flex-direction:column;padding:12px" data-act="skin" data-i="${i}">${skinFace(i,56)}<span class="mu">Skin ${i+1}</span></button>`).join('')}${S.skins.length===0?`<div class="mu" style="grid-column:1/-1">No hay skins cargadas. Subí una para empezar (máx. 4).</div>`:''}</div><input type="file" id="skinfile" accept="image/png" style="display:none"><button class="ib" style="margin:0;height:44px" data-act="skinup" ${S.skins.length>=4?'disabled':''}>${S.skins.length>=4?'Límite de 4 skins alcanzado':'Subir skin (PNG)'}</button></div></div></div>`;
+    const help = 'En modo offline la skin se aplica con un resource pack automático y solo la ves vos. Con cuenta Microsoft se usa tu skin oficial.';
+    const model = (m,l) => `<button class="chip ${S.skmodel==m?'on':''}" data-act="skinmodel" data-m="${m}">${l}</button>`;
+    return `<h1>Mi cuenta</h1><div style="display:grid;grid-template-columns:1fr 1.3fr;gap:16px;align-items:start"><div class="gl" style="padding:26px;display:flex;flex-direction:column;align-items:center;gap:18px">${skinFace(S.sk,132)}<div style="width:100%"><label class="mu" for="nick">Nombre de jugador</label><input id="nick" class="srch" style="width:100%;margin-top:6px" maxlength="16" autocomplete="off" value="${esc(S.nick)}" ${S.ms?'disabled':''}><div id="nm" style="margin-top:8px;font-size:13px;color:${ok?'#6EE7B7':'#FCD34D'}">${ok?'Nombre válido ✓':'Usá de 3 a 16 letras, números o guion bajo.'}</div></div></div><div style="display:flex;flex-direction:column;gap:16px"><div class="gl" style="padding:20px 22px;display:flex;flex-direction:column;gap:10px"><b>Tipo de cuenta</b><div style="color:${S.ms?'#6EE7B7':'#C9C7DD'}">${S.ms?'Cuenta Microsoft vinculada':'Estás jugando en modo offline'}</div><div class="mu">${S.ms?'Podés entrar a servidores premium y usar tu skin oficial.':'En modo offline no podés entrar a servidores que verifican la cuenta.'}</div>${S.ms?'<button class="sec" style="height:44px" data-act="mso">Cerrar sesión</button>':`<button class="ib" style="margin:0;height:44px" ${S.ml?'disabled':''} data-act="ms">${S.ml?'Esperando a Microsoft…':'Iniciar sesión con Microsoft'}</button>`}</div><div class="gl" style="padding:20px 22px;display:flex;flex-direction:column;gap:14px"><b>Skin</b><div class="mu">${help}</div><div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><span class="mu">Modelo:</span>${model('classic','Clásico')}${model('slim','Fino')}</div><div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px">${S.skins.map((u,i)=>`<button class="pc gl ${i==S.sk?'on':''}" style="flex-direction:column;padding:12px" data-act="skin" data-i="${i}">${skinFace(i,56)}<span class="mu">Skin ${i+1}</span></button>`).join('')}${S.skins.length===0?`<div class="mu" style="grid-column:1/-1">No hay skins cargadas. Subí una para empezar (máx. 4).</div>`:''}</div><input type="file" id="skinfile" accept="image/png" style="display:none"><div style="display:flex;gap:10px;flex-wrap:wrap"><button class="ib" style="margin:0;height:44px;flex:1;min-width:180px" data-act="skinup" ${S.skins.length>=4?'disabled':''}>${S.skins.length>=4?'Límite de 4 skins alcanzado':'Subir skin (PNG)'}</button><button class="sec" style="height:44px" data-act="skindel">Quitar skin del juego</button></div></div></div></div>`;
   }
-  function saveSkins(){ try { localStorage.setItem('obsidia.skins', JSON.stringify(S.skins)); localStorage.setItem('obsidia.sk', String(S.sk)); } catch(e){} }
+  function saveSkins(){ try { localStorage.setItem('obsidia.skins', JSON.stringify(S.skins)); localStorage.setItem('obsidia.sk', String(S.sk)); localStorage.setItem('obsidia.skmodel', S.skmodel); } catch(e){} }
 
   // ───────────── Ajustes ─────────────
   function settings(){
@@ -270,6 +272,17 @@
     if (!id) throw new Error('No encontré el loader '+p.loader+' después de instalarlo.');
     return id;
   }
+  // Aplica la skin elegida al resource pack del juego (solo modo offline).
+  async function applySkinToGame(silent){
+    if (S.ms){ if (!silent) toast('Con cuenta Microsoft se usa tu skin oficial: no se aplica el pack offline.', true); return false; }
+    const url = S.skins[S.sk];
+    if (!url) return false;
+    try {
+      await invoke('apply_offline_skin', { skinPngBase64:String(url), model:S.skmodel||'classic', mcVersion:(P[S.p]&&P[S.p].version)||null });
+      if (!silent) toast('Skin aplicada al juego.');
+      return true;
+    } catch(e){ if (!silent) toast('No se pudo aplicar la skin: '+e, true); return false; }
+  }
   async function play(){
     if (S.pg !== null) return;
     const p = P[S.p];
@@ -288,6 +301,9 @@
     } catch(e){ /* sin eventos: igual se lanza */ }
     try {
       const id = await launchVersionId(p);
+      // Volver a aplicar la skin elegida: si cambió el pack activo, igual queda puesta.
+      if (S.ms) invoke('remove_offline_skin').catch(()=>{});
+      else if (S.skins[S.sk]) await applySkinToGame(true);
       const msg = await invoke('launch_version', { version:id, username:S.nick, ram:p.ram+'G', javaPath:p.java||null });
       S.pg = 100; S.launchMsg = msg; render();
       setTimeout(() => { S.pg = null; render(); }, 2500);
@@ -395,7 +411,12 @@
       if (s){ try { await navigator.clipboard.writeText(s.a); toast('Dirección copiada: pegala en Multijugador → Conexión directa.'); } catch(err){} }
       S.tab = 'home'; render(); play();
     }
-    else if (a=='skin'){ S.sk = +d.i; saveSkins(); render(); }
+    else if (a=='skin'){ S.sk = +d.i; saveSkins(); render(); applySkinToGame(); }
+    else if (a=='skinmodel'){ S.skmodel = d.m==='slim'?'slim':'classic'; saveSkins(); render(); applySkinToGame(); }
+    else if (a=='skindel'){
+      try { await invoke('remove_offline_skin'); toast('Skin quitada del juego.'); }
+      catch(err){ toast('No se pudo quitar la skin: '+err, true); }
+    }
     else if (a=='skinup'){ const fi = Q('#skinfile'); if (fi) fi.click(); }
     else if (a=='ms'){
       S.ml = true; render();
@@ -418,7 +439,7 @@
       const f = e.target.files && e.target.files[0];
       if (f && S.skins.length < 4){
         const rd = new FileReader();
-        rd.onload = () => { S.skins.push(String(rd.result)); S.sk = S.skins.length - 1; saveSkins(); render(); };
+        rd.onload = () => { S.skins.push(String(rd.result)); S.sk = S.skins.length - 1; saveSkins(); render(); applySkinToGame(); };
         rd.readAsDataURL(f);
       }
       e.target.value = '';
@@ -461,7 +482,7 @@
         S.nick = settings.username || S.nick;
       }
       if (msProfile){ S.ms = true; S.nick = msProfile.name || S.nick; }
-      try { S.skins = JSON.parse(localStorage.getItem('obsidia.skins') || '[]').slice(0,4); S.sk = Math.min(+localStorage.getItem('obsidia.sk') || (S.skins.length?0:-1), S.skins.length-1); } catch(e){}
+      try { S.skins = JSON.parse(localStorage.getItem('obsidia.skins') || '[]').slice(0,4); S.sk = Math.min(+localStorage.getItem('obsidia.sk') || (S.skins.length?0:-1), S.skins.length-1); S.skmodel = localStorage.getItem('obsidia.skmodel')==='slim'?'slim':'classic'; } catch(e){}
       await loadProfiles();
       await loadServers();
       await refreshFiles();

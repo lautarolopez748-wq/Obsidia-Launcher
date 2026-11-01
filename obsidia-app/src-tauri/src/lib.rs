@@ -1,4 +1,5 @@
 mod launcher;
+mod skin;
 
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
@@ -399,6 +400,32 @@ fn list_resourcepacks() -> Result<Vec<String>, String> {
     }
     out.sort();
     Ok(out)
+}
+
+/// Genera el resource pack `ObsidiaSkin` y lo activa en `options.txt`.
+/// Solo tiene sentido en modo offline: con cuenta Microsoft el juego usa la skin oficial.
+#[tauri::command(async)]
+fn apply_offline_skin(
+    skin_png_base64: String,
+    model: String,
+    mc_version: Option<String>,
+) -> Result<String, String> {
+    if read_ms_profile().is_some() {
+        return Err(
+            "Tenés una cuenta Microsoft: el juego ya usa tu skin oficial y no se aplica el pack offline."
+                .to_string(),
+        );
+    }
+    let png = skin::decode_skin(&skin_png_base64)?;
+    skin::normalize_model(&model)?;
+    skin::apply_skin(&minecraft_dir(), &png, &model, mc_version.as_deref())?;
+    Ok("Skin aplicada al juego (resource pack ObsidiaSkin).".to_string())
+}
+
+/// Borra el resource pack de skin y su entrada de `options.txt`.
+#[tauri::command(async)]
+fn remove_offline_skin() -> Result<(), String> {
+    skin::remove_skin(&minecraft_dir())
 }
 
 #[tauri::command]
@@ -968,6 +995,8 @@ pub fn run() {
             install_forge,
             list_shaderpacks,
             list_resourcepacks,
+            apply_offline_skin,
+            remove_offline_skin,
             delete_file_in,
             list_installed_mods,
             search_mods,
