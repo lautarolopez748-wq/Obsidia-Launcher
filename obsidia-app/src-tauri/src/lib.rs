@@ -470,6 +470,60 @@ async fn search_mods(query: String) -> Result<Vec<ModResult>, String> {
     Ok(out)
 }
 
+#[tauri::command]
+async fn search_shaders(query: String) -> Result<Vec<ModResult>, String> {
+    let resp = http()?
+        .get("https://api.modrinth.com/v2/search")
+        .query(&[
+            ("query", query.as_str()),
+            ("facets", "[[\"project_type:shader\"]]"),
+            ("limit", "20"),
+        ])
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    if let Some(hits) = json.get("hits").and_then(|h| h.as_array()) {
+        for h in hits {
+            out.push(ModResult {
+                slug: h.get("slug").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                title: h.get("title").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                description: h.get("description").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                downloads: h.get("downloads").and_then(|d| d.as_u64()).unwrap_or(0),
+            });
+        }
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+async fn search_resourcepacks(query: String) -> Result<Vec<ModResult>, String> {
+    let resp = http()?
+        .get("https://api.modrinth.com/v2/search")
+        .query(&[
+            ("query", query.as_str()),
+            ("facets", "[[\"project_type:resourcepack\"]]"),
+            ("limit", "20"),
+        ])
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    if let Some(hits) = json.get("hits").and_then(|h| h.as_array()) {
+        for h in hits {
+            out.push(ModResult {
+                slug: h.get("slug").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                title: h.get("title").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                description: h.get("description").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                downloads: h.get("downloads").and_then(|d| d.as_u64()).unwrap_or(0),
+            });
+        }
+    }
+    Ok(out)
+}
+
 fn only_chars(s: &str, extra: &[char]) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || extra.contains(&c))
 }
@@ -541,6 +595,83 @@ async fn install_mod(slug: String, mc_version: String, loader: String) -> Result
     }
     fs::write(&dest, bytes).map_err(|e| e.to_string())?;
     Ok(format!("Mod instalado: {filename}"))
+}
+
+#[tauri::command]
+async fn install_shaderpack(slug: String) -> Result<String, String> {
+    download_project_file(&slug, "shaderpacks").await
+}
+
+#[tauri::command]
+async fn install_resourcepack(slug: String) -> Result<String, String> {
+    download_project_file(&slug, "resourcepacks").await
+}
+
+async fn download_project_file(slug: &str, folder: &str) -> Result<String, String> {
+    if !only_chars(slug, &['-', '_']) {
+        return Err("Slug inválido".to_string());
+    }
+    if !["shaderpacks", "resourcepacks"].contains(&folder) {
+        return Err("Carpeta inválida".to_string());
+    }
+    let client = http()?;
+    let resp = client
+        .get(format!("https://api.modrinth.com/v2/project/{slug}/version"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let versions = json.as_array().ok_or("Modrinth no devolvió versiones")?;
+    let v = versions.first().ok_or("No hay una versión compatible")?;
+    let files = v.get("files").and_then(|f| f.as_array()).ok_or("El proyecto no trae archivos")?;
+    let file = files
+        .iter()
+        .find(|f| f.get("primary").and_then(|p| p.as_bool()).unwrap_or(false))
+        .or_else(|| files.first())
+        .ok_or("El proyecto no trae archivos")?;
+    let file_url = file.get("url").and_then(|u| u.as_str()).ok_or("El archivo no tiene URL")?;
+    let filename = file.get("filename").and_then(|u| u.as_str()).ok_or("El archivo no tiene nombre")?;
+
+    let mut comps = Path::new(filename).components();
+    match (comps.next(), comps.next()) {
+        (Some(std::path::Component::Normal(_)), None) => {}
+        _ => return Err("Nombre de archivo sospechoso".to_string()),
+    }
+
+    let bytes = client
+        .get(file_url)
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| e.to_string())?
+        .bytes()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let dest = minecraft_dir().join(folder).join(filename);
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    fs::write(&dest, bytes).map_err(|e| e.to_string())?;
+    Ok(filename.to_string())
+}
+
+#[tauri::command]
+fn get_total_ram() -> Result<u64, String> {
+    #[cfg(windows)]
+    {
+        if let Ok(out) = new_cmd("powershell")
+            .args(["-NoProfile", "-Command", "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory"])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if let Ok(bytes) = text.trim().parse::<u64>() {
+                let gb = bytes / (1024 * 1024 * 1024);
+                return Ok(gb.max(2));
+            }
+        }
+    }
+    Ok(16)
 }
 
 #[tauri::command]
@@ -837,7 +968,12 @@ pub fn run() {
             delete_file_in,
             list_installed_mods,
             search_mods,
+            search_shaders,
+            search_resourcepacks,
             install_mod,
+            install_shaderpack,
+            install_resourcepack,
+            get_total_ram,
             get_servers,
             save_server,
             delete_server,
