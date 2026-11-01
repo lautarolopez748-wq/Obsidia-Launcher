@@ -258,8 +258,16 @@ fn java_exe() -> String {
     }
 }
 
+fn ensure_launcher_profiles() {
+    let path = minecraft_dir().join("launcher_profiles.json");
+    if !path.exists() {
+        let _ = std::fs::write(&path, "{\"profiles\":{},\"settings\":{}}");
+    }
+}
+
 #[tauri::command(async)]
 fn install_fabric(mc_version: String) -> Result<String, String> {
+    ensure_launcher_profiles();
     let installer_url = "https://maven.fabricmc.net/net/fabricmc/fabric-installer/1.1.2/fabric-installer-1.1.2.jar";
     let installer_path = minecraft_dir().join("obsidia").join("fabric-installer.jar");
     download_to(installer_url, &installer_path)?;
@@ -284,6 +292,7 @@ fn install_fabric(mc_version: String) -> Result<String, String> {
 
 #[tauri::command(async)]
 fn install_forge(mc_version: String) -> Result<String, String> {
+    ensure_launcher_profiles();
     // resolve forge version from promotions
     let promos: serde_json::Value = reqwest::blocking::get(
         "https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json",
