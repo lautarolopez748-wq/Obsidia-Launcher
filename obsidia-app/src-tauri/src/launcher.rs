@@ -627,6 +627,8 @@ pub fn server_args(server: &str, mc_version: &str) -> Result<Vec<String>, String
 pub fn launch(
     app: &AppHandle,
     mc: &Path,
+    // Carpeta de juego de la instancia (mods, config, mundos, options.txt). `mc` queda para lo compartido.
+    game_dir: &Path,
     version: &str,
     player: Player,
     ram: Option<String>,
@@ -637,6 +639,7 @@ pub fn launch(
     fullscreen: bool,
 ) -> Result<String, String> {
     let c = client()?;
+    fs::create_dir_all(game_dir).map_err(|e| format!("{}: {e}", game_dir.display()))?;
 
     // 1) Versión
     progress(app, "version", 0, 1);
@@ -849,7 +852,7 @@ pub fn launch(
     vars.insert("auth_xuid", String::new());
     vars.insert("version_name", version.to_string());
     vars.insert("version_type", v["type"].as_str().unwrap_or("release").to_string());
-    vars.insert("game_directory", s(mc));
+    vars.insert("game_directory", s(game_dir));
     vars.insert("assets_root", s(&assets_root));
     vars.insert("game_assets", s(&assets_root.join("virtual").join("legacy")));
     vars.insert("assets_index_name", asset_id);
@@ -900,7 +903,7 @@ pub fn launch(
 
     let child = new_cmd(&java)
         .args(&args)
-        .current_dir(mc)
+        .current_dir(game_dir)
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err))
         .spawn()

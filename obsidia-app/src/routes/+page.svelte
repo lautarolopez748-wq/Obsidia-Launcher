@@ -28,6 +28,10 @@ let accHtml = '';
 
   // ───────────── Utilidades ─────────────
   const Q = s => document.querySelector(s);
+  // Instancia del perfil activo: cada perfil nuevo tiene su carpeta con mods, packs y mundos.
+  // Los perfiles viejos (sin id) siguen usando .minecraft.
+  const inst = () => (P[S.p] && P[S.p].id) || null;
+  const newId = () => 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
   const findFile = (kind, key) => S.files[kind].find(f => norm(f).includes(norm(key)));
   const refreshGrid = () => { const g = Q('#grid'); if (g) g.innerHTML = grid(); };
 
@@ -133,17 +137,17 @@ let accHtml = '';
 
   async function refreshFiles(){
     const [m, s, r, ps] = await Promise.all([
-      invoke('list_installed_mods').catch(()=>[]),
-      invoke('list_shaderpacks').catch(()=>[]),
-      invoke('list_resourcepacks').catch(()=>[]),
-      invoke('get_resourcepack_state').catch(()=>[])
+      invoke('list_installed_mods', { instance:inst() }).catch(()=>[]),
+      invoke('list_shaderpacks', { instance:inst() }).catch(()=>[]),
+      invoke('list_resourcepacks', { instance:inst() }).catch(()=>[]),
+      invoke('get_resourcepack_state', { instance:inst() }).catch(()=>[])
     ]);
     S.files = { mods:m||[], shaders:s||[], packs:r||[] };
     S.pstate = ps||[];
   }
   async function savePacks(){
     const active = S.pstate.filter(x=>x.enabled).map(x=>x.name);
-    try { await invoke('save_resourcepack_state', { active }); }
+    try { await invoke('save_resourcepack_state', { active, instance:inst() }); }
     catch(e){ toast('No se pudo guardar el orden de packs: '+e, true); }
     await refreshFiles(); refreshGrid();
   }
@@ -169,9 +173,9 @@ let accHtml = '';
     }
     S.busy[slug] = 1; refreshGrid();
     try {
-      if (kind==='mods') await invoke('install_mod', { slug, mcVersion:p.version, loader:p.loader.toLowerCase() });
-      else if (kind==='shaders') await invoke('install_shaderpack', { slug, mcVersion: (P[S.p]&&P[S.p].version)||null });
-      else await invoke('install_resourcepack', { slug, mcVersion: (P[S.p]&&P[S.p].version)||null });
+      if (kind==='mods') await invoke('install_mod', { slug, mcVersion:p.version, loader:p.loader.toLowerCase(), instance:inst() });
+      else if (kind==='shaders') await invoke('install_shaderpack', { slug, mcVersion: (P[S.p]&&P[S.p].version)||null, instance:inst() });
+      else await invoke('install_resourcepack', { slug, mcVersion: (P[S.p]&&P[S.p].version)||null, instance:inst() });
       toast('Instalado correctamente.');
     } catch(e){ toast('No se pudo instalar: '+e, true); }
     delete S.busy[slug];
@@ -194,7 +198,7 @@ let accHtml = '';
     S.rf = false; if (S.tab==='servers') render();
   }
   async function loadServers(){
-    const list = await invoke('get_servers').catch(()=>[]);
+    const list = await invoke('get_servers').catch(e => { toast(String(e), true); return []; });
     S.sv = (list||[]).map(s => ({ n:s.name, a:s.address, v:s.version, on:null, pg:0 }));
   }
 
@@ -247,7 +251,7 @@ let accHtml = '';
     const url = S.skins[S.sk];
     if (!url) return false;
     try {
-      await invoke('apply_offline_skin', { skinPngBase64:String(url), model:S.skmodel||'classic', mcVersion:(P[S.p]&&P[S.p].version)||null });
+      await invoke('apply_offline_skin', { skinPngBase64:String(url), model:S.skmodel||'classic', mcVersion:(P[S.p]&&P[S.p].version)||null, instance:inst() });
       if (!silent) toast('Skin aplicada al juego.');
       return true;
     } catch(e){ if (!silent) toast('No se pudo aplicar la skin: '+e, true); return false; }
@@ -271,9 +275,9 @@ let accHtml = '';
     try {
       const id = await launchVersionId(p);
       // Volver a aplicar la skin elegida: si cambió el pack activo, igual queda puesta.
-      if (S.ms) invoke('remove_offline_skin').catch(()=>{});
+      if (S.ms) invoke('remove_offline_skin', { instance:inst() }).catch(()=>{});
       else if (S.skins[S.sk]) await applySkinToGame(true);
-      const msg = await invoke('launch_version', { version:id, username:S.nick, ram:p.ram+'G', javaPath:p.java||null, server:server||null, fullscreen:!!p.fullscreen });
+      const msg = await invoke('launch_version', { version:id, username:S.nick, ram:p.ram+'G', javaPath:p.java||null, server:server||null, fullscreen:!!p.fullscreen, instance:p.id||null });
       S.pg = 100; S.launchMsg = msg; render();
       setTimeout(() => { S.pg = null; render(); }, 2500);
     } catch(e){
@@ -286,10 +290,11 @@ let accHtml = '';
     try { await invoke('save_settings', { settings:{ ram:S.defRam+'G', java_path:null, light_mode:S.t.lite, console:false, username:S.nick } }); } catch(e){ console.error(e); }
   }
   async function loadProfiles(select){
-    const list = await invoke('get_profiles').catch(()=>[]);
+    // Si profiles.json está dañado se avisa (con la ruta del respaldo) en vez de mostrar una lista vacía sin explicación.
+    const list = await invoke('get_profiles').catch(e => { toast(String(e), true); return []; });
     P = (list||[]).map(p => {
       const loader = p.loader || 'Vanilla';
-      return { n:p.name, version:p.version, loader, ram:normRam(p.ram), java:p.java_path||'', username:p.username, fullscreen:!!p.fullscreen, s:loader+' · '+p.version };
+      return { n:p.name, version:p.version, loader, ram:normRam(p.ram), java:p.java_path||'', username:p.username, fullscreen:!!p.fullscreen, id:p.id||'', s:loader+' · '+p.version };
     });
     let i = P.findIndex(x => x.n === select);
     if (i < 0) { try { i = P.findIndex(x => x.n === localStorage.getItem('obsidia.sel')); } catch(e){ i = -1; } }
@@ -318,7 +323,7 @@ let accHtml = '';
     S.npBusy = true;
     try {
       // Primero se guarda el nuevo y recién después se borra el viejo: si algo falla no se pierde el perfil.
-      await invoke('save_profile', { profile:{ name, version:S.npVersion, username:S.nick, ram:S.npRam+'G', java_path:S.npJava||null, loader:S.npLoader, fullscreen:S.npFullscreen } });
+      await invoke('save_profile', { profile:{ name, version:S.npVersion, username:S.nick, ram:S.npRam+'G', java_path:S.npJava||null, loader:S.npLoader, fullscreen:S.npFullscreen, id:(old ? old.id : newId()) || null } });
       if (old && old.n !== name) await invoke('delete_profile', { name:old.n });
       await loadProfiles(name);
       selectProfile(S.p);
@@ -336,7 +341,7 @@ let accHtml = '';
     if (!b) return;
     const a = b.dataset.act, d = b.dataset;
     if (a=='go'){ S.tab = d.t; render(); if (d.t==='servers') pingAll(); if (d.t==='mods'){ refreshFiles().then(()=>{ if (S.tab==='mods') doSearch(); }); } }
-    else if (a=='sel'){ selectProfile(+d.i); render(); }
+    else if (a=='sel'){ selectProfile(+d.i); render(); refreshFiles(); }
     else if (a=='play'){ play(); }
     else if (a=='new'){ openNew(); }
     else if (a=='ped'){ openEdit(+d.i); }
@@ -359,7 +364,7 @@ let accHtml = '';
     else if (a=='inst'){ doInstall(d.kind, d.slug); }
     else if (a=='fdel'){
       const folder = { mods:'mods', shaders:'shaderpacks', packs:'resourcepacks' }[d.kind];
-      try { await invoke('delete_file_in', { folder, name:d.file }); toast('Eliminado.'); }
+      try { await invoke('delete_file_in', { folder, name:d.file, instance:inst() }); toast('Eliminado.'); }
       catch(err){ toast('No se pudo eliminar: '+err, true); }
       await refreshFiles(); refreshGrid();
     }
@@ -390,7 +395,7 @@ let accHtml = '';
     else if (a=='skin'){ S.sk = +d.i; saveSkins(); render(); applySkinToGame(); }
     else if (a=='skinmodel'){ S.skmodel = d.m==='slim'?'slim':'classic'; saveSkins(); render(); applySkinToGame(); }
     else if (a=='skindel'){
-      try { await invoke('remove_offline_skin'); toast('Skin quitada del juego.'); }
+      try { await invoke('remove_offline_skin', { instance:inst() }); toast('Skin quitada del juego.'); }
       catch(err){ toast('No se pudo quitar la skin: '+err, true); }
     }
     else if (a=='skinup'){ const fi = Q('#skinfile'); if (fi) fi.click(); }
