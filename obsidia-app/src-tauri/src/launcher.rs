@@ -528,6 +528,76 @@ fn extract_natives(jar: &Path, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
+// ─────────────────────────────── Servidores ──────────────────────────────────
+
+/// Separa `host`, `host:puerto` o `[ipv6]:puerto`. Puerto por defecto: 25565.
+fn split_server(server: &str) -> Result<(String, u16), String> {
+    let s = server.trim();
+    if s.is_empty() {
+        return Err("La dirección del servidor está vacía".to_string());
+    }
+    let (host, port) = if let Some(rest) = s.strip_prefix('[') {
+        let end = rest.find(']').ok_or("Dirección IPv6 inválida")?;
+        let host = &rest[..end];
+        let tail = &rest[end + 1..];
+        let port = match tail.strip_prefix(':') {
+            Some(p) => p,
+            None if tail.is_empty() => "25565",
+            None => return Err(format!("Dirección de servidor inválida: {server}")),
+        };
+        (host, port)
+    } else {
+        match s.rsplit_once(':') {
+            Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => (h, p),
+            Some(_) => return Err(format!("Puerto inválido en {server}")),
+            None => (s, "25565"),
+        }
+    };
+    if host.is_empty()
+        || !host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'))
+    {
+        return Err(format!("Dirección de servidor inválida: {server}"));
+    }
+    let port: u16 = port.parse().map_err(|_| format!("Puerto inválido: {port}"))?;
+    if port == 0 {
+        return Err("Puerto inválido: 0".to_string());
+    }
+    Ok((host.to_string(), port))
+}
+
+/// ¿La versión soporta `--quickPlayMultiplayer`? Se agregó en 1.20.
+fn supports_quick_play(version: &str) -> bool {
+    let mut parts = version.split('.');
+    let Some(major) = parts.next().and_then(|p| p.parse::<u32>().ok()) else {
+        return true; // snapshot o versión rara: asumimos moderna
+    };
+    let minor = parts.next().and_then(|p| p.parse::<u32>().ok()).unwrap_or(0);
+    (major, minor) >= (1, 20)
+}
+
+/// Argumentos para entrar directo a un servidor. En 1.20+ usa quick play;
+/// en versiones viejas `--server`/`--port`.
+pub fn server_args(server: &str, mc_version: &str) -> Result<Vec<String>, String> {
+    let (host, port) = split_server(server)?;
+    if supports_quick_play(mc_version) {
+        let addr = if host.contains(':') {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        };
+        Ok(vec!["--quickPlayMultiplayer".to_string(), addr])
+    } else {
+        Ok(vec![
+            "--server".to_string(),
+            host,
+            "--port".to_string(),
+            port.to_string(),
+        ])
+    }
+}
+
 // ─────────────────────────────── Lanzamiento ─────────────────────────────────
 
 /// Prepara todo (descargas incluidas) y abre el juego. Bloqueante: llamarlo desde un hilo aparte.
@@ -539,6 +609,7 @@ pub fn launch(
     ram: Option<String>,
     java_path: Option<String>,
     fallback_java: String,
+    server: Option<String>,
 ) -> Result<String, String> {
     let c = client()?;
 
@@ -784,6 +855,11 @@ pub fn launch(
         }
     }
 
+    // Entrar directo al servidor elegido (si lo hay).
+    if let Some(server) = server.as_deref().filter(|s| !s.trim().is_empty()) {
+        args.extend(server_args(server, &root_id)?);
+    }
+
     // 7) Abrir el juego, con su salida en un log.
     progress(app, "starting", 0, 1);
     let log_dir = mc.join("obsidia").join("logs");
@@ -815,6 +891,33 @@ pub fn launch(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn servidores_modernos_y_viejos() {
+        assert_eq!(
+            server_args("mc.ejemplo.net", "1.21.1").unwrap(),
+            vec!["--quickPlayMultiplayer", "mc.ejemplo.net:25565"]
+        );
+        assert_eq!(
+            server_args("play.ejemplo.net:25566", "1.21.4").unwrap(),
+            vec!["--quickPlayMultiplayer", "play.ejemplo.net:25566"]
+        );
+        assert_eq!(
+            server_args("mc.ejemplo.net", "1.19.2").unwrap(),
+            vec!["--server", "mc.ejemplo.net", "--port", "25565"]
+        );
+        assert_eq!(
+            server_args("127.0.0.1:19132", "1.12.2").unwrap(),
+            vec!["--server", "127.0.0.1", "--port", "19132"]
+        );
+        assert!(server_args("", "1.21").is_err());
+        assert!(server_args("host con espacio", "1.21").is_err());
+        assert!(server_args("host:abc", "1.21").is_err());
+        assert_eq!(
+            server_args("[::1]:25565", "1.21").unwrap(),
+            vec!["--quickPlayMultiplayer", "[::1]:25565"]
+        );
+    }
 
     #[test]
     fn uuid_offline_conocido() {
