@@ -2,31 +2,15 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
+import Sidebar from "$lib/components/Sidebar.svelte";
+import Toast from "$lib/components/Toast.svelte";
 
-  // ───────────── Constantes de diseño ─────────────
-  const I = { home:'<path d="M3 11l9-8 9 8v10h-6v-6H9v6H3z"/>', profiles:'<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>', mods:'<path d="M12 2l9 5v10l-9 5-9-5V7z"/><path d="M12 12l9-5M12 12v10M12 12L3 7"/>', servers:'<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18"/>', settings:'<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2"/>' };
-  const ic = k => `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">${I[k]}</svg>`;
-  const TABS = [['home','Inicio'],['profiles','Perfiles'],['mods','Mods'],['servers','Servidores'],['settings','Ajustes']];
-  const G = ['linear-gradient(135deg,#8B5CF6,#C026D3)','linear-gradient(135deg,#22D3EE,#8B5CF6)','linear-gradient(135deg,#C026D3,#1E1B4B)','linear-gradient(135deg,#6366F1,#22D3EE)'];
-  const TRASH = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14M10 11v6M14 11v6"/></svg>';
-
-  // Mods recomendados (el slug es el de Modrinth; la instalación es real).
-  const M = [
-    ['Sodium','Motor de renderizado que sube los FPS sin cambiar el aspecto del juego.','Optimización','linear-gradient(135deg,#22D3EE,#8B5CF6)','sodium'],
-    ['Lithium','Optimiza la lógica del juego: menos lag en mundos y servidores grandes.','Optimización','linear-gradient(135deg,#8B5CF6,#C026D3)','lithium'],
-    ['Iris Shaders','Shaders compatibles con Sodium para darle otra cara a tu mundo.','Gráficos','linear-gradient(135deg,#C026D3,#F472B6)','iris'],
-    ['Mod Menu','Menú para ver y configurar todos tus mods desde el juego.','Utilidades','linear-gradient(135deg,#6366F1,#22D3EE)','modmenu'],
-    ['Fabric API','Biblioteca base que necesitan la mayoría de los mods de Fabric.','Utilidades','linear-gradient(135deg,#A78BFA,#1E1B4B)','fabric-api'],
-    ['Xaero’s Minimap','Minimapa en pantalla con marcadores para tus bases.','Utilidades','linear-gradient(135deg,#34D399,#22D3EE)','xaeros-minimap']
-  ];
-  const LOADERS = ['Vanilla','Fabric','Forge'];
-  const RAMS = [2,3,4,6,8,10,12,16,24,32];
-  // Etapas del lanzamiento: [desde %, hasta %] de la barra total.
-  const STG = { version:[0,5], loader:[0,5], java:[5,25], libraries:[25,60], assets:[60,95], starting:[95,99] };
-  const LBL = { version:'Preparando la versión…', loader:'Instalando el loader…', java:'Descargando Java…', libraries:'Descargando librerías…', assets:'Descargando recursos del juego…', starting:'Abriendo Minecraft…' };
+import { I, ic, TABS, G, TRASH, M, LOADERS, RAMS, STG, LBL, esc, norm, validName, normRam } from "$lib/utils.js";
 
   // ───────────── Estado ─────────────
   let P = [];
+let navHtml = '';
+let accHtml = '';
   let VERSIONS = [];
   let S = {
     tab:'home', p:0, sec:'mods', q:'', f:'Todos',
@@ -44,12 +28,8 @@
 
   // ───────────── Utilidades ─────────────
   const Q = s => document.querySelector(s);
-  const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-  const norm = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
-  const validName = n => /^\w{3,16}$/.test(n);
   const findFile = (kind, key) => S.files[kind].find(f => norm(f).includes(norm(key)));
   const refreshGrid = () => { const g = Q('#grid'); if (g) g.innerHTML = grid(); };
-  const normRam = r => { const s = String(r || '').trim().toUpperCase(); const n = parseInt(s) || 4; return s.endsWith('M') ? Math.max(1, Math.round(n/1024)) : n; };
 
   function toast(msg, bad){
     const t = Q('#toast'); if (!t) return;
@@ -264,9 +244,8 @@
   // ───────────── Render ─────────────
   function render(){
     document.body.classList.toggle('lite', S.t.lite);
-    Q('#acc').innerHTML = accCard();
-    Q('#acc').classList.toggle('on', S.tab=='account');
-    Q('#nav').innerHTML = TABS.map(t=>`<button class="${t[0]==S.tab?'on':''}" data-act="go" data-t="${t[0]}">${ic(t[0])}${t[1]}</button>`).join('');
+    accHtml = accCard();
+    navHtml = TABS.map(t=>`<button class="${t[0]==S.tab?'on':''}" data-act="go" data-t="${t[0]}">${ic(t[0])}${t[1]}</button>`).join('');
     let html = { home, profiles, mods, servers, settings, account }[S.tab]();
     if (S.np) html += npModal();
     if (S.msc) html += msModal();
@@ -595,11 +574,7 @@
 </svelte:head>
 
 <div id="wrap"><div id="app">
-  <aside>
-    <div class="logo"><svg width="34" height="34" viewBox="0 0 34 34" aria-hidden="true"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#C4B5FD"/><stop offset=".5" stop-color="#8B5CF6"/><stop offset="1" stop-color="#C026D3"/></linearGradient></defs><polygon points="17,2 30,12 24,32 10,32 4,12" fill="url(#g)"/><polygon points="17,2 30,12 17,18" fill="rgba(255,255,255,.35)"/></svg>Obsidia</div>
-    <nav id="nav"></nav>
-    <button class="acc gl" id="acc" data-act="go" data-t="account" aria-label="Abrir mi cuenta"></button>
-  </aside>
+  <Sidebar {navHtml} {accHtml} accountActive={S.tab=='account'} />
   <main id="view"></main>
 </div></div>
-<div id="toast" class="toast" role="status" aria-live="polite"></div>
+<Toast />
