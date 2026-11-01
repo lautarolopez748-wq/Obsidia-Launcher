@@ -67,7 +67,8 @@
   // Recorta la cara (8,8) y la capa del sombrero (40,8) de una skin de 64 px de ancho.
   function skinFace(i, size){
     const url = (i >= 0 && i < S.skins.length) ? S.skins[i] : null;
-    if (!url) return head(size);
+    // Solo data URLs PNG: evita inyectar CSS si localStorage quedó manipulado.
+    if (!url || !/^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(String(url))) return head(size);
     const bs = size * 8;
     const layer = x => `<div style="position:absolute;inset:0;background:url('${url}') -${x}px -${size}px/${bs}px auto no-repeat;image-rendering:pixelated"></div>`;
     return `<div style="position:relative;width:${size}px;height:${size}px;overflow:hidden;border-radius:8px;flex:none;background:#1a1a2e">${layer(size)}${layer(size*5)}</div>`;
