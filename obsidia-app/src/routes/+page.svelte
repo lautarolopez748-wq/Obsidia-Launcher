@@ -18,7 +18,7 @@ let accHtml = '';
     defRam:4, totalRam:16, t:{ lite:false },
     nick:'Jugador', ms:false, ml:false, msc:null,
     skins:[], sk:-1, skmodel:'classic',
-    pstate:[], ptextures:{},
+    pstate:[], ptextures:{}, filemap:{ mods:{}, shaders:{}, packs:{} },
     files:{ mods:[], shaders:[], packs:[] },
     results:{ mods:null, shaders:null, packs:null }, searching:false, seq:0, busy:{},
     sv:[], af:false, rf:false, es:null, ns:'', na:'',
@@ -53,6 +53,12 @@ let accHtml = '';
   }
   // Un archivo instalado puede llamarse distinto al slug: primero el mapa guardado en la
   // instalación y después una coincidencia por palabras del slug o del título.
+  const installedFile = (kind, slug) => {
+    const map = (S.filemap && S.filemap[kind]) ? S.filemap[kind] : {};
+    if (map && map[slug] && (S.files[kind] || []).includes(map[slug])) return map[slug];
+    return null;
+  };
+
   function findFile(kind, key, title){
     const files = S.files[kind] || [];
     const map = fileMap(kind);
@@ -158,11 +164,11 @@ let accHtml = '';
     if (kind==='shaders' && !findFile('mods','iris')) h += irisBanner(S.busy['iris']);
     if (kind==='mods' && !q){
       const list = M.filter(m => S.f=='Todos' || m[2]==S.f);
-      h += list.map(m => modCard(m, S.busy[m[4]], findFile('mods', m[4]))).join('') || '<div class="mu">No hay resultados.</div>';
+      h += list.map(m => modCard(m, S.busy[m[4]], installedFile('mods', m[4]) || findFile('mods', m[4], m[0]))).join('') || '<div class="mu">No hay resultados.</div>';
     } else if (!res){
       h += `<div class="mu">${S.searching?'Buscando en Modrinth…':'Cargando…'}</div>`;
     } else {
-      h += res.length ? res.map(r => resCard(kind, r, S.busy[r.slug], findFile(kind, r.slug))).join('') : '<div class="mu">No hay resultados en Modrinth.</div>';
+      h += res.length ? res.map(r => resCard(kind, r, S.busy[r.slug], installedFile(kind, r.slug) || findFile(kind, r.slug, r.title))).join('') : '<div class="mu">No hay resultados en Modrinth.</div>';
     }
     return h;
   }
@@ -175,9 +181,11 @@ let accHtml = '';
     return `<div class="gl" style="padding:18px 20px;display:flex;flex-direction:column;gap:10px"><div style="display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap"><div><b>Resource packs</b><div class="mu">El orden es la prioridad: el de arriba gana.</div></div><button class="sec" style="height:38px;padding:0 16px" data-act="pauto">Ordenar automático</button></div>${rows}</div>`;
   }
   function mods(){
+    try {
     const p = P[S.p];
     const ph = { mods:'Buscar en Modrinth…', shaders:'Buscar shaders…', packs:'Buscar resource packs…' }[S.sec];
     return `<div style="display:flex;justify-content:space-between;align-items:center"><h1>Mods</h1><div class="gl" style="padding:9px 16px;color:#C9C7DD;font-size:14px">Perfil: ${p?esc(p.n)+' · '+esc(p.loader||'Vanilla'):'—'}</div></div>${seg()}${S.sec==='packs'?packsPanel():''}${installedList(S.sec)}<input id="q" class="srch" aria-label="${ph}" placeholder="${ph}" value="${esc(S.q)}">${S.sec==='mods'&&!S.q.trim()?`<div class="chips">${['Todos','Optimización','Gráficos','Utilidades'].map(c=>`<button class="chip ${c==S.f?'on':''}" data-act="f" data-c="${c}">${c}</button>`).join('')}</div>`:''}<div class="g3" id="grid">${grid()}</div>`;
+  } catch(e) { return "<h1>MODS ERROR: " + esc(String(e)) + "</h1>"; }
   }
 
   async function refreshFiles(){
@@ -216,6 +224,7 @@ let accHtml = '';
 
   async function doInstall(kind, slug){
     if (S.busy[slug]) return;
+    const mySeq = ++S.seq;
     const p = P[S.p];
     if (kind==='mods'){
       if (!p){ toast('Creá un perfil primero.', true); return; }
@@ -223,13 +232,16 @@ let accHtml = '';
     }
     S.busy[slug] = 1; refreshGrid();
     try {
-      if (kind==='mods') await invoke('install_mod', { slug, mcVersion:p.version, loader:p.loader.toLowerCase(), instance:inst() });
-      else if (kind==='shaders') await invoke('install_shaderpack', { slug, mcVersion: (P[S.p]&&P[S.p].version)||null, instance:inst() });
-      else await invoke('install_resourcepack', { slug, mcVersion: (P[S.p]&&P[S.p].version)||null, instance:inst() });
+      if (mySeq !== S.seq) return;
+      let res = null;
+      if (kind==='mods') res = await invoke('install_mod', { slug, mcVersion:p.version, loader:p.loader.toLowerCase(), instance:inst() });
+      else if (kind==='shaders') res = await invoke('install_shaderpack', { slug, mcVersion: (P[S.p]&&P[S.p].version)||null, instance:inst() });
+      else res = await invoke('install_resourcepack', { slug, mcVersion: (P[S.p]&&P[S.p].version)||null, instance:inst() });
+      if (res) rememberFile(kind, slug, res);
       toast('Instalado correctamente.');
     } catch(e){ toast('No se pudo instalar: '+e, true); }
     delete S.busy[slug];
-    await refreshFiles(); refreshGrid();
+    await refreshFiles(); loadFileMap(); refreshGrid(); render();
   }
 
   // ───────────── Servidores ─────────────
@@ -421,9 +433,9 @@ let accHtml = '';
     else if (a=='inst'){ doInstall(d.kind, d.slug); }
     else if (a=='fdel'){
       const folder = { mods:'mods', shaders:'shaderpacks', packs:'resourcepacks' }[d.kind];
-      try { await invoke('delete_file_in', { folder, name:d.file, instance:inst() }); toast('Eliminado.'); }
+      try { await invoke('delete_file_in', { folder, name:d.file, instance:inst() }); forgetFile(d.kind, d.file); toast('Eliminado.'); }
       catch(err){ toast('No se pudo eliminar: '+err, true); }
-      await refreshFiles(); refreshGrid();
+      await refreshFiles(); loadFileMap(); refreshGrid(); render();
     }
     else if (a=='openmod'){
       const type = { mods:'mod', shaders:'shader', packs:'resourcepack' }[d.kind];
@@ -527,6 +539,7 @@ let accHtml = '';
       try { S.skins = JSON.parse(localStorage.getItem('obsidia.skins') || '[]').slice(0,4); S.sk = Math.min(+localStorage.getItem('obsidia.sk') || (S.skins.length?0:-1), S.skins.length-1); S.skmodel = localStorage.getItem('obsidia.skmodel')==='slim'?'slim':'classic'; } catch(e){}
       await loadProfiles();
       await loadServers();
+      loadFileMap();
       await refreshFiles();
     } catch(e){ console.error(e); }
     render();
