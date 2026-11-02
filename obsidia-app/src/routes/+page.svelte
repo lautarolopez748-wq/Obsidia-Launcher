@@ -18,11 +18,11 @@ let accHtml = '';
     defRam:4, totalRam:16, t:{ lite:false },
     nick:'Jugador', ms:false, ml:false, msc:null,
     skins:[], sk:-1, skmodel:'classic',
-    pstate:[],
+    pstate:[], ptextures:{},
     files:{ mods:[], shaders:[], packs:[] },
     results:{ mods:null, shaders:null, packs:null }, searching:false, seq:0, busy:{},
     sv:[], af:false, rf:false, es:null, ns:'', na:'',
-    np:false, npEdit:-1, npName:'', npVersion:'', npLoader:'Vanilla', npRam:4, npJava:'', npErr:'', npDel:false, npBusy:false, npFullscreen:false,
+    np:false, npEdit:-1, npName:'', npVersion:'', npLoader:'Vanilla', npRam:4, npJava:'', npErr:'', npDel:false, npBusy:false, npFullscreen:false, npBlock:'',
     javas:[]
   };
 
@@ -32,7 +32,49 @@ let accHtml = '';
   // Los perfiles viejos (sin id) siguen usando .minecraft.
   const inst = () => (P[S.p] && P[S.p].id) || null;
   const newId = () => 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-  const findFile = (kind, key) => S.files[kind].find(f => norm(f).includes(norm(key)));
+  // Categorías tal como las nombra Modrinth (facet `categories`).
+  const CAT = { 'Optimización':'optimization', 'Gráficos':'graphics', 'Utilidades':'utility' };
+  const mapKey = kind => 'obsidia.map.' + (inst() || 'global') + '.' + kind;
+  function fileMap(kind){
+    try { const m = JSON.parse(localStorage.getItem(mapKey(kind)) || '{}'); return m && typeof m === 'object' ? m : {}; }
+    catch(e){ return {}; }
+  }
+  function saveFileMap(kind, map){ try { localStorage.setItem(mapKey(kind), JSON.stringify(map)); } catch(e){} }
+  function rememberFile(kind, slug, file, icon){
+    if (!slug || !file) return;
+    const map = fileMap(kind);
+    map[slug] = { file, icon: icon || (map[slug] && map[slug].icon) || '' };
+    saveFileMap(kind, map);
+  }
+  function forgetFile(kind, file){
+    const map = fileMap(kind); let changed = false;
+    for (const k of Object.keys(map)) if (map[k] && map[k].file === file){ delete map[k]; changed = true; }
+    if (changed) saveFileMap(kind, map);
+  }
+  // Un archivo instalado puede llamarse distinto al slug: primero el mapa guardado en la
+  // instalación y después una coincidencia por palabras del slug o del título.
+  function findFile(kind, key, title){
+    const files = S.files[kind] || [];
+    const map = fileMap(kind);
+    if (map[key] && files.includes(map[key].file)) return map[key].file;
+    const nk = norm(key);
+    let hit = files.find(f => norm(f).includes(nk));
+    if (hit) return hit;
+    const parts = String(key).split(/[-_]/).map(norm).filter(Boolean);
+    if (parts.length > 1){ hit = files.find(f => parts.every(p => norm(f).includes(p))); if (hit) return hit; }
+    if (title){
+      const nt = norm(title);
+      if (nt){ hit = files.find(f => norm(f).includes(nt)); if (hit) return hit; }
+    }
+    return null;
+  }
+  function iconFor(kind, file){
+    const map = fileMap(kind);
+    for (const k of Object.keys(map)) if (map[k] && map[k].file === file && map[k].icon) return map[k].icon;
+    return '';
+  }
+  const blockFor = p => { try { return localStorage.getItem('obsidia.block.' + ((p && p.id) || 'global')) || 'grass'; } catch(e){ return 'grass'; } };
+  const setBlockFor = (id, b) => { try { localStorage.setItem('obsidia.block.' + (id || 'global'), b); } catch(e){} };
   const refreshGrid = () => { const g = Q('#grid'); if (g) g.innerHTML = grid(); };
 
   function toast(msg, bad){
@@ -50,7 +92,8 @@ let accHtml = '';
 
   // ───────────── Perfiles ─────────────
   function cards(){
-    return P.map((p,i)=>`<div class="pc gl ${i==S.p?'on':''}" role="button" tabindex="0" data-act="sel" data-i="${i}"><div class="th" style="background:${G[i%4]}"></div><div style="flex:1;min-width:0"><div style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(p.n)}</div><div class="mu">${i==S.p?'Activo · ':''}${esc(p.s)}</div></div><button class="mb" style="width:auto;height:32px;padding:0 12px;font-size:13px" data-act="ped" data-i="${i}">Editar</button></div>`).join('');
+    const BLOCKCOL = { stone:"#7F7F7F", dirt:"#866043", grass:"#5D9C3A", oak:"#A0703A" };
+  return P.map((p,i)=>`<div class="pc gl ${i==S.p?'on':''}" role="button" tabindex="0" data-act="sel" data-i="${i}">${p.block ? `<img src="/images/blocks/${p.block}.png" alt="" style="width:64px;height:64px;border-radius:12px;object-fit:cover;flex:none">` : `<div class="th" style="background:${G[i%4]}"></div>`}<div style="flex:1;min-width:0"><div style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(p.n)}</div><div class="mu">${i==S.p?'Activo · ':''}${esc(p.s)}</div></div><button class="mb" style="width:auto;height:32px;padding:0 12px;font-size:13px" data-act="ped" data-i="${i}">Editar</button></div>`).join('');
   }
   const newCard = `<button class="pc gl" style="border-style:dashed;justify-content:center;min-height:92px;color:var(--mu)" data-act="new">+ Nuevo perfil</button>`;
 
@@ -68,8 +111,9 @@ let accHtml = '';
         <div><label class="mu" for="np-ram">RAM asignada</label><select id="np-ram" class="srch" style="width:100%;margin-top:6px">${rams.map(r=>`<option value="${r}" ${r==S.npRam?'selected':''}>${r} GB</option>`).join('')}</select></div>
         <div><label class="mu" for="np-java">Java</label><select id="np-java" class="srch" style="width:100%;margin-top:6px"><option value="">Automático (recomendado)</option>${S.javas.map(j=>`<option value="${esc(j.path)}" ${j.path==S.npJava?'selected':''}>${esc(j.version||j.path)}</option>`).join('')}</select></div>
 <div style="display:flex;align-items:center;gap:10px"><input type="checkbox" id="np-fullscreen" ${S.npFullscreen?'checked':''}><label class="mu" for="np-fullscreen">Pantalla completa</label></div>
+      <div><label class="mu" for="np-block">Bloque representativo</label><select id="np-block" class="srch" style="width:100%;margin-top:6px"><option value="">Predeterminado</option><option value="Acacia_Log" ${S.npBlock=="Acacia_Log"?'selected':''}>Acacia Log</option><option value="Amethyst_Block" ${S.npBlock=="Amethyst_Block"?'selected':''}>Amethyst Block</option><option value="Ancient_Debris" ${S.npBlock=="Ancient_Debris"?'selected':''}>Ancient Debris</option><option value="Beacon" ${S.npBlock=="Beacon"?'selected':''}>Beacon</option><option value="Bedrock" ${S.npBlock=="Bedrock"?'selected':''}>Bedrock</option><option value="Black_Glazed_Terracotta" ${S.npBlock=="Black_Glazed_Terracotta"?'selected':''}>Black Glazed Terracotta</option><option value="Blue_Glazed_Terracotta" ${S.npBlock=="Blue_Glazed_Terracotta"?'selected':''}>Blue Glazed Terracotta</option><option value="Carved_Pumpkin" ${S.npBlock=="Carved_Pumpkin"?'selected':''}>Carved Pumpkin</option><option value="Cherry_Leaves" ${S.npBlock=="Cherry_Leaves"?'selected':''}>Cherry Leaves</option><option value="Cherry_Log" ${S.npBlock=="Cherry_Log"?'selected':''}>Cherry Log</option><option value="Chiseled_Polished_Blackstone" ${S.npBlock=="Chiseled_Polished_Blackstone"?'selected':''}>Chiseled Polished Blackstone</option><option value="Command_Block" ${S.npBlock=="Command_Block"?'selected':''}>Command Block</option><option value="Cracked_Deepslate_Bricks" ${S.npBlock=="Cracked_Deepslate_Bricks"?'selected':''}>Cracked Deepslate Bricks</option><option value="Crafting_Table" ${S.npBlock=="Crafting_Table"?'selected':''}>Crafting Table</option><option value="Deepslate_Diamond_Ore" ${S.npBlock=="Deepslate_Diamond_Ore"?'selected':''}>Deepslate Diamond Ore</option><option value="Deepslate_Emerald_Ore" ${S.npBlock=="Deepslate_Emerald_Ore"?'selected':''}>Deepslate Emerald Ore</option><option value="Deepslate_Gold_Ore" ${S.npBlock=="Deepslate_Gold_Ore"?'selected':''}>Deepslate Gold Ore</option><option value="Deepslate_Iron_Ore" ${S.npBlock=="Deepslate_Iron_Ore"?'selected':''}>Deepslate Iron Ore</option><option value="Diamond_Block" ${S.npBlock=="Diamond_Block"?'selected':''}>Diamond Block</option><option value="Diamond_Ore" ${S.npBlock=="Diamond_Ore"?'selected':''}>Diamond Ore</option><option value="Iron_Block" ${S.npBlock=="Iron_Block"?'selected':''}>Iron Block</option><option value="Iron_Ore" ${S.npBlock=="Iron_Ore"?'selected':''}>Iron Ore</option><option value="Oak_Log" ${S.npBlock=="Oak_Log"?'selected':''}>Oak Log</option><option value="Pale_Oak_Log" ${S.npBlock=="Pale_Oak_Log"?'selected':''}>Pale Oak Log</option><option value="White_Glazed_Terracotta" ${S.npBlock=="White_Glazed_Terracotta"?'selected':''}>White Glazed Terracotta</option></select></div>
       <div style="display:flex;gap:10px;justify-content:space-between;margin-top:6px">
-        <div>${S.npEdit>=0?`<button class="sec" style="height:44px;color:#F87171" data-act="npdel">${S.npDel?'¿Seguro? Tocá de nuevo':'Eliminar perfil'}</button>`:''}</div>
+        <div>${S.npEdit>=0?`<button class="sec" style="height:44px;color:#F87171;white-space:normal;padding:0 12px;font-size:13px;max-width:180px" data-act="npdel">${S.npDel?'\u00BFEst\u00E1s seguro? Toca de nuevo':'Eliminar perfil'}</button>`:''}</div>
         <div style="display:flex;gap:10px"><button class="sec" style="height:44px" data-act="npclose">Cancelar</button><button class="ib" style="margin:0;height:44px;padding:0 24px" data-act="npcreate" ${S.npBusy?'disabled':''}>${S.npEdit>=0?'Guardar':'Crear perfil'}</button></div>
       </div>
     </div></div>`;
@@ -105,7 +149,8 @@ let accHtml = '';
     const files = S.files[kind];
     if (!files.length) return '';
     const names = { mods:'Mods instalados', shaders:'Shaders instalados', packs:'Resource packs instalados' };
-    return `<div class="gl" style="grid-column:1/-1;padding:18px 20px;display:flex;flex-direction:column;gap:8px"><b>${names[kind]}</b>${files.map(f=>`<div style="display:flex;align-items:center;gap:12px;padding:6px 12px;border-radius:12px;background:rgba(255,255,255,.04)"><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(f)}</span>${trb(kind,f,34)}</div>`).join('')}</div>`;
+    const img = kind==='mods' ? 'linear-gradient(135deg,#8B5CF6,#22D3EE)' : kind==='shaders' ? 'linear-gradient(135deg,#FBBF24,#F472B6)' : 'repeating-linear-gradient(90deg,rgba(0,0,0,.14) 0 8px,transparent 8px 16px),linear-gradient(135deg,#34D399,#22D3EE)';
+    return `<div class="gl" style="grid-column:1/-1;padding:18px 20px;display:flex;flex-direction:column;gap:8px"><b>${names[kind]}</b>${files.map(f=>`<div style="display:flex;align-items:center;gap:12px;padding:6px 12px;border-radius:12px;background:rgba(255,255,255,.04)"><div class="mi" style="background:${img}"></div><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(f)}</span>${trb(kind,f,34)}</div>`).join('')}</div>`;
   }
   function grid(){
     const kind = S.sec, q = S.q.trim(), res = S.results[kind];
@@ -119,7 +164,7 @@ let accHtml = '';
     } else {
       h += res.length ? res.map(r => resCard(kind, r, S.busy[r.slug], findFile(kind, r.slug))).join('') : '<div class="mu">No hay resultados en Modrinth.</div>';
     }
-    return h + installedList(kind);
+    return h;
   }
   // Panel de orden de resource packs (lee y escribe options.txt).
   function packsPanel(){
@@ -132,7 +177,7 @@ let accHtml = '';
   function mods(){
     const p = P[S.p];
     const ph = { mods:'Buscar en Modrinth…', shaders:'Buscar shaders…', packs:'Buscar resource packs…' }[S.sec];
-    return `<div style="display:flex;justify-content:space-between;align-items:center"><h1>Mods</h1><div class="gl" style="padding:9px 16px;color:#C9C7DD;font-size:14px">Perfil: ${p?esc(p.n)+' · '+esc(p.loader||'Vanilla'):'—'}</div></div>${seg()}${S.sec==='packs'?packsPanel():''}<input id="q" class="srch" aria-label="${ph}" placeholder="${ph}" value="${esc(S.q)}">${S.sec==='mods'&&!S.q.trim()?`<div class="chips">${['Todos','Optimización','Gráficos','Utilidades'].map(c=>`<button class="chip ${c==S.f?'on':''}" data-act="f" data-c="${c}">${c}</button>`).join('')}</div>`:''}<div class="g3" id="grid">${grid()}</div>`;
+    return `<div style="display:flex;justify-content:space-between;align-items:center"><h1>Mods</h1><div class="gl" style="padding:9px 16px;color:#C9C7DD;font-size:14px">Perfil: ${p?esc(p.n)+' · '+esc(p.loader||'Vanilla'):'—'}</div></div>${seg()}${S.sec==='packs'?packsPanel():''}${installedList(S.sec)}<input id="q" class="srch" aria-label="${ph}" placeholder="${ph}" value="${esc(S.q)}">${S.sec==='mods'&&!S.q.trim()?`<div class="chips">${['Todos','Optimización','Gráficos','Utilidades'].map(c=>`<button class="chip ${c==S.f?'on':''}" data-act="f" data-c="${c}">${c}</button>`).join('')}</div>`:''}<div class="g3" id="grid">${grid()}</div>`;
   }
 
   async function refreshFiles(){
@@ -152,13 +197,18 @@ let accHtml = '';
     await refreshFiles(); refreshGrid();
   }
 
+  const CATMAP = { 'Optimización':'optimization', 'Gráficos':'decoration', 'Utilidades':'utility' };
   async function doSearch(){
     const kind = S.sec, q = S.q.trim(), my = ++S.seq;
-    if (kind==='mods' && !q){ S.results.mods = null; S.searching = false; refreshGrid(); return; }
+    const cat = (kind==='mods' && !q && S.f !== 'Todos') ? (CATMAP[S.f] || null) : null;
+    if (kind==='mods' && !q && !cat && S.f!=='Todos'){ S.results.mods = null; S.searching = false; refreshGrid(); return; }
     S.searching = true; S.results[kind] = null; refreshGrid();
     const cmd = { mods:'search_mods', shaders:'search_shaders', packs:'search_resourcepacks' }[kind];
     let res = [];
-    try { res = await invoke(cmd, { query:q }); } catch(e){ if (my===S.seq) toast('La búsqueda falló: '+e, true); }
+    const p = P[S.p];
+    const ver = (p && p.version) || null;
+    const lod = (kind==='mods' && p) ? (p.loader || null) : null;
+    try { res = await invoke(cmd, { query:q, category: cat, version: ver, loader: lod }); } catch(e){ if (my===S.seq) toast('La búsqueda falló: '+e, true); }
     if (my !== S.seq) return;
     S.results[kind] = Array.isArray(res) ? res : [];
     S.searching = false; refreshGrid();
@@ -207,7 +257,7 @@ let accHtml = '';
     const ok = validName(S.nick);
     const help = 'En modo offline la skin se aplica con un resource pack automático y solo la ves vos. Con cuenta Microsoft se usa tu skin oficial.';
     const model = (m,l) => `<button class="chip ${S.skmodel==m?'on':''}" data-act="skinmodel" data-m="${m}">${l}</button>`;
-    return `<h1>Mi cuenta</h1><div style="display:grid;grid-template-columns:1fr 1.3fr;gap:16px;align-items:start"><div class="gl" style="padding:26px;display:flex;flex-direction:column;align-items:center;gap:18px">${skinFace(S.sk,132,S.skins)}<div style="width:100%"><label class="mu" for="nick">Nombre de jugador</label><input id="nick" class="srch" style="width:100%;margin-top:6px" maxlength="16" autocomplete="off" value="${esc(S.nick)}" ${S.ms?'disabled':''}><div id="nm" style="margin-top:8px;font-size:13px;color:${ok?'#6EE7B7':'#FCD34D'}">${ok?'Nombre válido ✓':'Usá de 3 a 16 letras, números o guion bajo.'}</div></div></div><div style="display:flex;flex-direction:column;gap:16px"><div class="gl" style="padding:20px 22px;display:flex;flex-direction:column;gap:10px"><b>Tipo de cuenta</b><div style="color:${S.ms?'#6EE7B7':'#C9C7DD'}">${S.ms?'Cuenta Microsoft vinculada':'Estás jugando en modo offline'}</div><div class="mu">${S.ms?'Podés entrar a servidores premium y usar tu skin oficial.':'En modo offline no podés entrar a servidores que verifican la cuenta.'}</div>${S.ms?'<button class="sec" style="height:44px" data-act="mso">Cerrar sesión</button>':`<button class="ib" style="margin:0;height:44px" ${S.ml?'disabled':''} data-act="ms">${S.ml?'Esperando a Microsoft…':'Iniciar sesión con Microsoft'}</button>`}</div><div class="gl" style="padding:20px 22px;display:flex;flex-direction:column;gap:14px"><b>Skin</b><div class="mu">${help}</div><div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><span class="mu">Modelo:</span>${model('classic','Clásico')}${model('slim','Fino')}</div><div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px">${S.skins.map((u,i)=>`<button class="pc gl ${i==S.sk?'on':''}" style="flex-direction:column;padding:12px" data-act="skin" data-i="${i}">${skinFace(i,56,S.skins)}<span class="mu">Skin ${i+1}</span></button>`).join('')}${S.skins.length===0?`<div class="mu" style="grid-column:1/-1">No hay skins cargadas. Subí una para empezar (máx. 4).</div>`:''}</div><input type="file" id="skinfile" accept="image/png" style="display:none"><div style="display:flex;gap:10px;flex-wrap:wrap"><button class="ib" style="margin:0;height:44px;flex:1;min-width:180px" data-act="skinup" ${S.skins.length>=4?'disabled':''}>${S.skins.length>=4?'Límite de 4 skins alcanzado':'Subir skin (PNG)'}</button><button class="sec" style="height:44px" data-act="skindel">Quitar skin del juego</button></div></div></div></div>`;
+    return `<h1>Mi cuenta</h1><div style="display:grid;grid-template-columns:1fr 1.3fr;gap:16px;align-items:start"><div class="gl" style="padding:26px;display:flex;flex-direction:column;align-items:center;gap:18px">${skinFace(S.sk,132,S.skins)}<div style="width:100%"><label class="mu" for="nick">Nombre de jugador</label><input id="nick" class="srch" style="width:100%;margin-top:6px" maxlength="16" autocomplete="off" value="${esc(S.nick)}" ${S.ms?'disabled':''}><div id="nm" style="margin-top:8px;font-size:13px;color:${ok?'#6EE7B7':'#FCD34D'}">${ok?'Nombre válido ✓':'Usá de 3 a 16 letras, números o guion bajo.'}</div></div></div><div style="display:flex;flex-direction:column;gap:16px"><div class="gl" style="padding:20px 22px;display:flex;flex-direction:column;gap:10px"><b>Tipo de cuenta</b><div style="color:${S.ms?'#6EE7B7':'#C9C7DD'}">${S.ms?'Cuenta Microsoft vinculada':'Estás jugando en modo offline'}</div><div class="mu">${S.ms?'Podés entrar a servidores premium y usar tu skin oficial.':'En modo offline no podés entrar a servidores que verifican la cuenta.'}</div>${S.ms?'<button class="sec" style="height:44px" data-act="mso">Cerrar sesión</button>':`<button class="ib" style="margin:0;height:44px" ${S.ml?'disabled':''} data-act="ms">${S.ml?'Esperando a Microsoft…':'Iniciar sesión con Microsoft'}</button>`}</div><div class="gl" style="padding:20px 22px;display:flex;flex-direction:column;gap:14px"><b>Skin</b><div class="mu">${help}</div><div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><span class="mu">Modelo:</span>${model('classic','Clásico')}${model('slim','Fino')}</div><div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px">${S.skins.map((u,i)=>`<button class="pc gl ${i==S.sk?'on':''}" style="flex-direction:column;padding:12px" data-act="skin" data-i="${i}">${skinFace(i,56,S.skins)}<span class="mu">Skin ${i+1}</span></button>`).join('')}${S.skins.length===0?`<div class="mu" style="grid-column:1/-1">No hay skins cargadas. Subí una para empezar (máx. 4).</div>`:''}</div><input type="file" id="skinfile" accept="image/png" style="display:none"><div style="display:flex;gap:10px;flex-wrap:wrap"><button class="ib" style="margin:0;height:44px;flex:1;min-width:180px" data-act="skinup" ${S.skins.length>=4?'disabled':''}>${S.skins.length>=4?'Límite de 4 skins alcanzado':'Subir skin (PNG)'}</button><button class="sec" style="height:44px" data-act="skindel" aria-label="Quitar skin del juego">${TRASH}</button></div></div></div></div>`;
   }
   function saveSkins(){ try { localStorage.setItem('obsidia.skins', JSON.stringify(S.skins)); localStorage.setItem('obsidia.sk', String(S.sk)); localStorage.setItem('obsidia.skmodel', S.skmodel); } catch(e){} }
 
@@ -279,7 +329,7 @@ let accHtml = '';
       else if (S.skins[S.sk]) await applySkinToGame(true);
       const msg = await invoke('launch_version', { version:id, username:S.nick, ram:p.ram+'G', javaPath:p.java||null, server:server||null, fullscreen:!!p.fullscreen, instance:p.id||null });
       S.pg = 100; S.launchMsg = msg; render();
-      setTimeout(() => { S.pg = null; render(); }, 2500);
+      listen('minecraft-closed', () => { S.pg = null; S.launchMsg = ''; render(); }).catch(()=>{});
     } catch(e){
       S.pg = null; S.launchErr = String(e); render();
     } finally { if (un) un(); }
@@ -294,11 +344,18 @@ let accHtml = '';
     const list = await invoke('get_profiles').catch(e => { toast(String(e), true); return []; });
     P = (list||[]).map(p => {
       const loader = p.loader || 'Vanilla';
-      return { n:p.name, version:p.version, loader, ram:normRam(p.ram), java:p.java_path||'', username:p.username, fullscreen:!!p.fullscreen, id:p.id||'', s:loader+' · '+p.version };
+      return { n:p.name, version:p.version, loader, ram:normRam(p.ram), java:p.java_path||'', username:p.username, fullscreen:!!p.fullscreen, id:p.id||'', block:p.block||'', s:loader+' · '+p.version };
     });
     let i = P.findIndex(x => x.n === select);
     if (i < 0) { try { i = P.findIndex(x => x.n === localStorage.getItem('obsidia.sel')); } catch(e){ i = -1; } }
     S.p = i >= 0 ? i : 0;
+    S.ptextures = {};
+    await Promise.all(P.map(async (p, idx) => {
+      if (p.block) {
+        try { S.ptextures[idx] = await invoke('get_block_texture', { block:p.block, version:p.version }); }
+        catch(e) { S.ptextures[idx] = null; }
+      }
+    }));
   }
   function selectProfile(i){
     S.p = i;
@@ -306,24 +363,24 @@ let accHtml = '';
   }
   function openNew(){
     S.np = true; S.npEdit = -1; S.npName = ''; S.npVersion = VERSIONS[0] || '1.21.4'; S.npLoader = 'Vanilla';
-    S.npRam = Math.min(S.defRam, S.totalRam); S.npJava = ''; S.npErr = ''; S.npDel = false; S.npBusy = false; S.npFullscreen = false; render();
+    S.npRam = Math.min(S.defRam, S.totalRam); S.npJava = ''; S.npErr = ''; S.npDel = false; S.npBusy = false; S.npFullscreen = false; S.npBlock = ''; render();
   }
   function openEdit(i){
     const p = P[i]; if (!p) return;
     S.np = true; S.npEdit = i; S.npName = p.n; S.npVersion = p.version; S.npLoader = p.loader || 'Vanilla';
-    S.npRam = p.ram; S.npJava = p.java || ''; S.npErr = ''; S.npDel = false; S.npBusy = false; S.npFullscreen = !!p.fullscreen; render();
+    S.npRam = p.ram; S.npJava = p.java || ''; S.npErr = ''; S.npDel = false; S.npBusy = false; S.npFullscreen = !!p.fullscreen; S.npBlock = p.block || ''; render();
   }
   async function saveProfileFromModal(){
     const val = id => { const e = Q(id); return e ? e.value : ''; };
     const name = val('#np-name').trim() || ('Perfil '+(P.length+1));
     S.npName = name; S.npVersion = val('#np-version'); S.npLoader = val('#np-loader') || 'Vanilla';
-    S.npRam = +val('#np-ram') || 4; S.npJava = val('#np-java'); S.npFullscreen = !!(Q('#np-fullscreen') && Q('#np-fullscreen').checked);
+    S.npRam = +val('#np-ram') || 4; S.npJava = val('#np-java'); S.npFullscreen = !!(Q('#np-fullscreen') && Q('#np-fullscreen').checked); S.npBlock = val('#np-block');
     const old = S.npEdit >= 0 ? P[S.npEdit] : null;
     if (P.some((x,i) => x.n === name && i !== S.npEdit)){ S.npErr = 'Ya existe un perfil con ese nombre.'; render(); return; }
     S.npBusy = true;
     try {
       // Primero se guarda el nuevo y recién después se borra el viejo: si algo falla no se pierde el perfil.
-      await invoke('save_profile', { profile:{ name, version:S.npVersion, username:S.nick, ram:S.npRam+'G', java_path:S.npJava||null, loader:S.npLoader, fullscreen:S.npFullscreen, id:(old ? old.id : newId()) || null } });
+      await invoke('save_profile', { profile:{ name, version:S.npVersion, username:S.nick, ram:S.npRam+'G', java_path:S.npJava||null, loader:S.npLoader, fullscreen:S.npFullscreen, block:S.npBlock||null, id:(old ? old.id : newId()) || null } });
       if (old && old.n !== name) await invoke('delete_profile', { name:old.n });
       await loadProfiles(name);
       selectProfile(S.p);
@@ -354,7 +411,7 @@ let accHtml = '';
       catch(err){ S.npErr = String(err); }
       render();
     }
-    else if (a=='f'){ S.f = d.c; render(); }
+    else if (a=='f'){ S.f = d.c; render(); doSearch(); }
     else if (a=='tg'){ S.t[d.k] = !S.t[d.k]; persistSettings(); render(); }
     else if (a=='seg'){ S.sec = d.s; S.q = ''; render(); doSearch(); }
     else if (a=='ptg'){ const x = S.pstate[+d.i]; if (x){ x.enabled = !x.enabled; S.pstate = [...S.pstate.filter(p=>p.enabled), ...S.pstate.filter(p=>!p.enabled)]; savePacks(); render(); } }
@@ -395,7 +452,11 @@ let accHtml = '';
     else if (a=='skin'){ S.sk = +d.i; saveSkins(); render(); applySkinToGame(); }
     else if (a=='skinmodel'){ S.skmodel = d.m==='slim'?'slim':'classic'; saveSkins(); render(); applySkinToGame(); }
     else if (a=='skindel'){
-      try { await invoke('remove_offline_skin', { instance:inst() }); toast('Skin quitada del juego.'); }
+      try {
+        await invoke('remove_offline_skin', { instance:inst() });
+        if (S.sk >= 0 && S.sk < S.skins.length){ S.skins.splice(S.sk,1); S.sk = S.skins.length ? 0 : -1; saveSkins(); render(); }
+        toast('Skin quitada del juego.');
+      }
       catch(err){ toast('No se pudo quitar la skin: '+err, true); }
     }
     else if (a=='skinup'){ const fi = Q('#skinfile'); if (fi) fi.click(); }
@@ -472,12 +533,18 @@ let accHtml = '';
   }
 
   onMount(() => {
+    const blockCtx = e => e.preventDefault();
+    const blockReload = e => { if (e.key === 'F5' || ((e.ctrlKey || e.metaKey) && (e.key === 'r' || e.key === 'R' || e.key === 'f' || e.key === 'F'))) e.preventDefault(); };
+    document.addEventListener('contextmenu', blockCtx);
+    document.addEventListener('keydown', blockReload, true);
     document.addEventListener('click', onClick);
     document.addEventListener('change', onChange);
     document.addEventListener('input', onInput);
     document.addEventListener('keydown', onKey);
     init();
     return () => {
+      document.removeEventListener('contextmenu', blockCtx);
+      document.removeEventListener('keydown', blockReload, true);
       document.removeEventListener('click', onClick);
       document.removeEventListener('change', onChange);
       document.removeEventListener('input', onInput);

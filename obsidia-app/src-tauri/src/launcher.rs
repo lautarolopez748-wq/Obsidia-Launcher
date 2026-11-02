@@ -886,10 +886,14 @@ pub fn launch(
         }
     }
 
-    // Pantalla completa por perfil.
-    if fullscreen {
-        args.push("--fullscreen".to_string());
-    }
+    // Pantalla completa por perfil: sincronizar options.txt.
+    let options_path = game_dir.join("options.txt");
+    let mut lines: Vec<String> = if options_path.exists() { fs::read_to_string(&options_path).unwrap_or_default().lines().map(|l| l.to_string()).collect() } else { Vec::new() };
+    let mut found = false;
+    for l in &mut lines { if l.starts_with("fullscreen:") { *l = format!("fullscreen:{}", fullscreen); found = true; } }
+    if !found { lines.push(format!("fullscreen:{}", fullscreen)); }
+    let _ = fs::write(&options_path, lines.join("\n") + "\n");
+    if fullscreen { args.push("--fullscreen".to_string()); }
 
     // Entrar directo al servidor elegido (si lo hay).
     if let Some(server) = server.as_deref().filter(|s| !s.trim().is_empty()) {
@@ -904,19 +908,27 @@ pub fn launch(
     let log = fs::File::create(&log_path).map_err(|e| format!("{}: {e}", log_path.display()))?;
     let log_err = log.try_clone().map_err(|e| e.to_string())?;
 
-    let child = new_cmd(&java)
+    let mut child = new_cmd(&java)
         .args(&args)
         .current_dir(game_dir)
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err))
         .spawn()
         .map_err(|e| format!("No pude ejecutar Java ('{java}'): {e}"))?;
+    let pid = child.id();
+
+    let app2 = app.clone();
+    std::thread::spawn(move || {
+        let _ = child.wait();
+        let _ = app2.emit("minecraft-closed", ());
+    });
+
     progress(app, "starting", 1, 1);
 
     Ok(format!(
         "Minecraft {version} iniciado como {} (pid {}). Log: {}{warn}",
         player.name,
-        child.id(),
+        pid,
         log_path.display()
     ))
 }
