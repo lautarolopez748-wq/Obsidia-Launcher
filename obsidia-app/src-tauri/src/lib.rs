@@ -45,6 +45,9 @@ pub struct Profile {
     /// Los perfiles viejos no lo traen y siguen usando `.minecraft` tal cual.
     #[serde(default)]
     pub id: Option<String>,
+    /// Bloque elegido para representar el perfil en la UI (opcional).
+    #[serde(default)]
+    pub block: Option<String>,
 }
 
 /// Carpeta de juego de una instancia. Sin id (perfiles viejos) es `.minecraft`; con id es
