@@ -6,6 +6,7 @@ mod skin;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::fs;
+use base64::Engine;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -54,7 +55,7 @@ fn game_dir(instance: Option<&str>) -> Result<PathBuf, String> {
         None => Ok(minecraft_dir()),
         Some(id) => {
             if id.len() > 48 || !only_chars(id, &['-', '_']) {
-                return Err("Identificador de instancia inválido".to_string());
+                return Err("Identificador de instancia inv+�lido".to_string());
             }
             Ok(minecraft_dir().join("obsidia").join("instances").join(id))
         }
@@ -104,8 +105,8 @@ async fn list_versions() -> Result<Vec<String>, String> {
     Ok(ids)
 }
 
-/// Lee una lista JSON. Si el archivo no existe devuelve una lista vacía; si existe pero está
-/// dañado NO lo da por vacío (el siguiente guardado lo borraría): hace una copia `.bak` y
+/// Lee una lista JSON. Si el archivo no existe devuelve una lista vac+�a; si existe pero est+�
+/// da+�ado NO lo da por vac+�o (el siguiente guardado lo borrar+�a): hace una copia `.bak` y
 /// devuelve un error para que nadie lo pise.
 fn read_json_list<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>, String> {
     if !path.exists() {
@@ -116,14 +117,14 @@ fn read_json_list<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>,
         let backup = path.with_extension("json.bak");
         let _ = fs::copy(path, &backup);
         format!(
-            "{} está dañado ({e}). Guardé una copia en {} y no lo toqué.",
+            "{} est+� da+�ado ({e}). Guard+� una copia en {} y no lo toqu+�.",
             path.display(),
             backup.display()
         )
     })
 }
 
-/// Escribe un archivo de forma atómica: primero a `.tmp` y después se renombra encima.
+/// Escribe un archivo de forma at+�mica: primero a `.tmp` y despu+�s se renombra encima.
 fn write_atomic(path: &Path, data: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -164,8 +165,18 @@ fn save_profile(profile: Profile) -> Result<(), String> {
 fn delete_profile(name: String) -> Result<(), String> {
     let path = profiles_path();
     let mut profiles = read_json_list::<Profile>(&path)?;
+    let removed_id = profiles.iter().find(|p| p.name == name).and_then(|p| p.id.clone());
     profiles.retain(|p| p.name != name);
-    write_json_list(&path, &profiles)
+    write_json_list(&path, &profiles)?;
+    if let Some(id) = removed_id {
+        let still_used = profiles.iter().any(|p| p.id.as_deref() == Some(id.as_str()));
+        if !still_used {
+            if let Ok(d) = game_dir(Some(&id)) {
+                let _ = fs::remove_dir_all(d);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn java_version(path: &Path) -> String {
@@ -251,7 +262,7 @@ fn detect_javas() -> Result<Vec<JavaInfo>, String> {
     Ok(infos)
 }
 
-/// Abre el juego (descargando lo que falte). Si hay sesión de Microsoft iniciada se usa esa
+/// Abre el juego (descargando lo que falte). Si hay sesi+�n de Microsoft iniciada se usa esa
 /// cuenta; si no, se juega offline con `username`. El progreso llega por el evento
 /// `launch-progress` ({ stage, done, total }).
 // Cada parámetro es un campo del objeto que manda la interfaz con `invoke`; agruparlos acá
@@ -292,7 +303,7 @@ fn sha1_hex(bytes: &[u8]) -> String {
 }
 
 /// Descarga un instalador y comprueba su SHA1 contra el archivo `<url>.sha1` que publica el
-/// mismo Maven. Si ya está descargado y coincide no se vuelve a bajar; nunca se ejecuta un
+/// mismo Maven. Si ya est+� descargado y coincide no se vuelve a bajar; nunca se ejecuta un
 /// archivo cuyo hash no se pudo comprobar.
 fn download_verified(url: &str, dest: &Path) -> Result<(), String> {
     if let Some(parent) = dest.parent() {
@@ -312,7 +323,7 @@ fn download_verified(url: &str, dest: &Path) -> Result<(), String> {
         .map_err(|e| format!("No pude obtener el SHA1 de {url}: {e}"))?;
     let expected = sum.split_whitespace().next().unwrap_or("").to_lowercase();
     if expected.len() != 40 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(format!("El SHA1 publicado para {url} no es válido"));
+        return Err(format!("El SHA1 publicado para {url} no es v+�lido"));
     }
 
     if let Ok(existing) = fs::read(dest)
@@ -327,7 +338,7 @@ fn download_verified(url: &str, dest: &Path) -> Result<(), String> {
         .and_then(|r| r.bytes())
         .map_err(|e| format!("{url}: {e}"))?;
     if sha1_hex(&bytes) != expected {
-        return Err(format!("El instalador descargado de {url} no coincide con su SHA1: se descartó"));
+        return Err(format!("El instalador descargado de {url} no coincide con su SHA1: se descart+�"));
     }
 
     let mut tmp = dest.as_os_str().to_owned();
@@ -346,7 +357,7 @@ const FABRIC_INSTALLER_FALLBACK: (&str, &str) = (
     "https://maven.fabricmc.net/net/fabricmc/fabric-installer/1.1.2/fabric-installer-1.1.2.jar",
 );
 
-/// (versión, url) del instalador estable más nuevo de Fabric.
+/// (versi+�n, url) del instalador estable m+�s nuevo de Fabric.
 fn fabric_installer() -> (String, String) {
     let fallback = || (FABRIC_INSTALLER_FALLBACK.0.to_string(), FABRIC_INSTALLER_FALLBACK.1.to_string());
     let Ok(client) = reqwest::blocking::Client::builder()
@@ -368,7 +379,7 @@ fn fabric_installer() -> (String, String) {
         .and_then(|v| {
             let ver = v.get("version")?.as_str()?;
             let url = v.get("url")?.as_str()?;
-            // Solo desde el Maven oficial de Fabric y con un nombre de versión simple.
+            // Solo desde el Maven oficial de Fabric y con un nombre de versi+�n simple.
             let ok = url.starts_with("https://maven.fabricmc.net/")
                 && !ver.is_empty()
                 && ver.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
@@ -377,12 +388,12 @@ fn fabric_installer() -> (String, String) {
         .unwrap_or_else(fallback)
 }
 
-/// Versión de Minecraft que va a una URL y al nombre de un archivo: se valida antes de usarla.
+/// Versi+�n de Minecraft que va a una URL y al nombre de un archivo: se valida antes de usarla.
 fn check_mc_version(v: &str) -> Result<(), String> {
     if only_chars(v, &['.', '-', '_']) {
         Ok(())
     } else {
-        Err("Versión de Minecraft inválida".to_string())
+        Err("Versi+�n de Minecraft inv+�lida".to_string())
     }
 }
 
@@ -443,7 +454,7 @@ fn install_forge(mc_version: String) -> Result<String, String> {
         return Err(format!("forge promotions request failed: HTTP {}", resp.status()));
     }
     let promos: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
-    // Se prefiere la versión recomendada y, si no hay, la más nueva.
+    // Se prefiere la versi+�n recomendada y, si no hay, la m+�s nueva.
     let promo = |kind: &str| {
         promos
             .get("promos")
@@ -455,7 +466,7 @@ fn install_forge(mc_version: String) -> Result<String, String> {
         .or_else(|| promo("latest"))
         .ok_or_else(|| format!("no forge version for {mc_version}"))?;
     if !only_chars(&forge_ver, &['.', '-', '_']) {
-        return Err("Versión de Forge inválida".to_string());
+        return Err("Versi+�n de Forge inv+�lida".to_string());
     }
     let url = format!(
         "https://maven.minecraftforge.net/net/minecraftforge/forge/{mc_version}-{forge_ver}/forge-{mc_version}-{forge_ver}-installer.jar"
@@ -486,6 +497,8 @@ pub struct ModResult {
     pub title: String,
     pub description: String,
     pub downloads: u64,
+    #[serde(default)]
+    pub icon_url: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -560,10 +573,10 @@ fn list_resourcepacks(instance: Option<String>) -> Result<Vec<String>, String> {
 /// Estado de los resource packs: activos en orden de prioridad y el resto.
 #[tauri::command(async)]
 fn get_resourcepack_state(instance: Option<String>) -> Result<Vec<packs::PackState>, String> {
-    Ok(packs::get_state(&game_dir(instance.as_deref())?))
+    packs::get_state(&game_dir(instance.as_deref())?)
 }
 
-/// Guarda qué packs están activos y en qué orden (la lista llega ya priorizada).
+/// Guarda qu+� packs est+�n activos y en qu+� orden (la lista llega ya priorizada).
 #[tauri::command(async)]
 fn save_resourcepack_state(active: Vec<String>, instance: Option<String>) -> Result<(), String> {
     packs::save_state(&game_dir(instance.as_deref())?, active)
@@ -580,7 +593,7 @@ fn apply_offline_skin(
 ) -> Result<String, String> {
     if auth::has_session() {
         return Err(
-            "Tenés una cuenta Microsoft: el juego ya usa tu skin oficial y no se aplica el pack offline."
+            "Ten+�s una cuenta Microsoft: el juego ya usa tu skin oficial y no se aplica el pack offline."
                 .to_string(),
         );
     }
@@ -605,7 +618,7 @@ fn delete_file_in(folder: String, name: String, instance: Option<String>) -> Res
     let mut comps = Path::new(&name).components();
     match (comps.next(), comps.next()) {
         (Some(std::path::Component::Normal(_)), None) => {}
-        _ => return Err("Nombre de archivo inválido".to_string()),
+        _ => return Err("Nombre de archivo inv+�lido".to_string()),
     }
     let path = game_dir(instance.as_deref())?.join(folder).join(&name);
     if path.is_dir() {
@@ -641,11 +654,17 @@ fn http() -> Result<reqwest::Client, String> {
 }
 
 /// Busca proyectos en Modrinth (`project_type`: mod, shader o resourcepack).
-async fn search_modrinth(query: String, project_type: &str) -> Result<Vec<ModResult>, String> {
-    let facets = format!("[[\"project_type:{project_type}\"]]");
+async fn search_modrinth(query: String, project_type: &str, category: Option<&str>, version: Option<&str>, loader: Option<&str>) -> Result<Vec<ModResult>, String> {
+    let facets = {
+        let mut groups = vec![format!("[\"project_type:{}\"]", project_type)];
+        if let Some(cat) = category { groups.push(format!("[\"categories:{}\"]", cat)); }
+        if let Some(v) = version { groups.push(format!("[\"versions:{}\"]", v)); }
+        if let Some(l) = loader { groups.push(format!("[\"categories:{}\"]", l.to_lowercase())); }
+        format!("[{}]", groups.join(", "))
+    };
     let resp = http()?
         .get("https://api.modrinth.com/v2/search")
-        .query(&[("query", query.as_str()), ("facets", facets.as_str()), ("limit", "20")])
+        .query(&[("query", query.as_str()), ("facets", facets.as_str()), ("limit", "50"), ("index", "downloads")])
         .send()
         .await
         .map_err(|e| e.to_string())?;
@@ -659,6 +678,7 @@ async fn search_modrinth(query: String, project_type: &str) -> Result<Vec<ModRes
                 title: text(h, "title"),
                 description: text(h, "description"),
                 downloads: h.get("downloads").and_then(|d| d.as_u64()).unwrap_or(0),
+                icon_url: h.get("icon_url").and_then(|v| v.as_str()).map(|x| x.to_string()),
             });
         }
     }
@@ -666,22 +686,22 @@ async fn search_modrinth(query: String, project_type: &str) -> Result<Vec<ModRes
 }
 
 #[tauri::command]
-async fn search_mods(query: String) -> Result<Vec<ModResult>, String> {
-    search_modrinth(query, "mod").await
+async fn search_mods(query: String, category: Option<String>, version: Option<String>, loader: Option<String>) -> Result<Vec<ModResult>, String> {
+    search_modrinth(query, "mod", category.as_deref(), version.as_deref(), loader.as_deref()).await
 }
 
 #[tauri::command]
-async fn search_shaders(query: String) -> Result<Vec<ModResult>, String> {
-    search_modrinth(query, "shader").await
+async fn search_shaders(query: String, version: Option<String>) -> Result<Vec<ModResult>, String> {
+    search_modrinth(query, "shader", None, version.as_deref(), None).await
 }
 
 #[tauri::command]
-async fn search_resourcepacks(query: String) -> Result<Vec<ModResult>, String> {
-    search_modrinth(query, "resourcepack").await
+async fn search_resourcepacks(query: String, version: Option<String>) -> Result<Vec<ModResult>, String> {
+    search_modrinth(query, "resourcepack", None, version.as_deref(), None).await
 }
 
-/// Modrinth devuelve primero lo más nuevo, alphas y betas incluidas: se prefiere la
-/// primera versión estable y solo si no hay ninguna se usa la primera de la lista.
+/// Modrinth devuelve primero lo m+�s nuevo, alphas y betas incluidas: se prefiere la
+/// primera versi+�n estable y solo si no hay ninguna se usa la primera de la lista.
 fn pick_version(versions: &[serde_json::Value]) -> Option<&serde_json::Value> {
     versions
         .iter()
@@ -702,7 +722,7 @@ async fn install_mod(
 ) -> Result<String, String> {
     // Los tres valores van a una URL y a una ruta: se validan antes de usarlos.
     if !only_chars(&slug, &['-', '_']) || !only_chars(&mc_version, &['.', '-', '_']) {
-        return Err("Datos del mod inválidos".to_string());
+        return Err("Datos del mod inv+�lidos".to_string());
     }
     if !["fabric", "forge", "neoforge", "quilt"].contains(&loader.as_str()) {
         return Err("Loader no soportado".to_string());
@@ -718,8 +738,8 @@ async fn install_mod(
         .await
         .map_err(|e| e.to_string())?;
     let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    let versions = json.as_array().ok_or("Modrinth no devolvió versiones")?;
-    let v = pick_version(versions).ok_or("No hay una versión compatible de este mod")?;
+    let versions = json.as_array().ok_or("Modrinth no devolvi+� versiones")?;
+    let v = pick_version(versions).ok_or("No hay una versi+�n compatible de este mod")?;
     let files = v.get("files").and_then(|f| f.as_array()).ok_or("El mod no trae archivos")?;
     let file = files
         .iter()
@@ -746,7 +766,7 @@ async fn install_mod(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Verificación de integridad con el SHA1 que informa Modrinth.
+    // Verificaci+�n de integridad con el SHA1 que informa Modrinth.
     if let Some(expected) = file
         .get("hashes")
         .and_then(|h| h.get("sha1"))
@@ -755,7 +775,7 @@ async fn install_mod(
         let mut hasher = Sha1::new();
         hasher.update(&bytes);
         if !format!("{:x}", hasher.finalize()).eq_ignore_ascii_case(expected) {
-            return Err("El archivo descargado no coincide con su SHA1: se descartó".to_string());
+            return Err("El archivo descargado no coincide con su SHA1: se descart+�".to_string());
         }
     }
 
@@ -792,10 +812,10 @@ async fn download_project_file(
     instance: Option<&str>,
 ) -> Result<String, String> {
     if !only_chars(slug, &['-', '_']) {
-        return Err("Slug inválido".to_string());
+        return Err("Slug inv+�lido".to_string());
     }
     if !["shaderpacks", "resourcepacks"].contains(&folder) {
-        return Err("Carpeta inválida".to_string());
+        return Err("Carpeta inv+�lida".to_string());
     }
     let client = http()?;
     let mut req = client.get(format!("https://api.modrinth.com/v2/project/{slug}/version"));
@@ -804,8 +824,8 @@ async fn download_project_file(
     }
     let resp = req.send().await.map_err(|e| e.to_string())?;
     let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    let versions = json.as_array().ok_or("Modrinth no devolvió versiones")?;
-    let v = pick_version(versions).ok_or("No hay una versión compatible")?;
+    let versions = json.as_array().ok_or("Modrinth no devolvi+� versiones")?;
+    let v = pick_version(versions).ok_or("No hay una versi+�n compatible")?;
     let files = v.get("files").and_then(|f| f.as_array()).ok_or("El proyecto no trae archivos")?;
     let file = files
         .iter()
@@ -840,7 +860,7 @@ async fn download_project_file(
         let mut hasher = Sha1::new();
         hasher.update(&bytes);
         if !format!("{:x}", hasher.finalize()).eq_ignore_ascii_case(expected) {
-            return Err("El archivo descargado no coincide con su SHA1: se descartó".to_string());
+            return Err("El archivo descargado no coincide con su SHA1: se descart+�".to_string());
         }
     }
 
@@ -852,7 +872,30 @@ async fn download_project_file(
     Ok(filename.to_string())
 }
 
-#[tauri::command(async)]
+#[tauri::command]
+fn get_block_texture(block: String, version: Option<String>) -> Result<String, String> {
+    let texture_name = match block.as_str() {
+        "stone" => "stone",
+        "dirt" => "dirt",
+        "grass" => "grass_block_top",
+        "oak" => "oak_planks",
+        _ => return Err("Bloque no soportado".to_string()),
+    };
+    let ver = version.unwrap_or_default();
+    if ver.trim().is_empty() { return Err("Version no disponible".to_string()); }
+    let jar = minecraft_dir().join("versions").join(&ver).join(format!("{}.jar", ver));
+    if !jar.exists() { return Err("Version no instalada".to_string()); }
+    let file = fs::File::open(&jar).map_err(|e| e.to_string())?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+    let entry_name = format!("assets/minecraft/textures/block/{}.png", texture_name);
+    let mut entry = archive.by_name(&entry_name).map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    use std::io::Read;
+    entry.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    Ok(format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(&buf)))
+}
+
+#[tauri::command]
 fn get_total_ram() -> Result<u64, String> {
     #[cfg(windows)]
     {
@@ -862,7 +905,7 @@ fn get_total_ram() -> Result<u64, String> {
         {
             let text = String::from_utf8_lossy(&out.stdout);
             if let Ok(bytes) = text.trim().parse::<u64>() {
-                let gb = bytes / (1024 * 1024 * 1024);
+                let gb = (bytes + 512 * 1024 * 1024) / (1024 * 1024 * 1024);
                 return Ok(gb.max(2));
             }
         }
@@ -879,7 +922,7 @@ fn get_servers() -> Result<Vec<ServerEntry>, String> {
 fn save_server(name: String, address: String, version: Option<String>) -> Result<(), String> {
     let path = servers_path();
     let mut servers = read_json_list::<ServerEntry>(&path)?;
-    // Misma dirección = se actualiza la entrada en vez de duplicarla.
+    // Misma direcci+�n = se actualiza la entrada en vez de duplicarla.
     if let Some(existing) = servers.iter_mut().find(|s| s.address == address) {
         existing.name = name;
         existing.version = version;
@@ -910,9 +953,9 @@ fn ping_server(address: String) -> Result<String, String> {
     };
     let sock = with_port
         .to_socket_addrs()
-        .map_err(|e| format!("dirección inválida: {e}"))?
+        .map_err(|e| format!("direcci+�n inv+�lida: {e}"))?
         .next()
-        .ok_or("no se pudo resolver la dirección")?;
+        .ok_or("no se pudo resolver la direcci+�n")?;
     let start = Instant::now();
     match TcpStream::connect_timeout(&sock, Duration::from_secs(5)) {
         Ok(_) => Ok(format!("online ({} ms)", start.elapsed().as_millis())),
@@ -998,6 +1041,7 @@ pub fn run() {
             install_shaderpack,
             install_resourcepack,
             get_total_ram,
+            get_block_texture,
             get_servers,
             save_server,
             delete_server,
@@ -1013,6 +1057,9 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
