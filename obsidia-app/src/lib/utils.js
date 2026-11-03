@@ -45,9 +45,15 @@ export function modCard(m, busy, installedFile) {
 
 export function resCard(kind, r, busy, installedFile) {
   const inst = installedFile;
+  const bg = (src, grad) => src
+    ? `background-image:url(${esc(src)}),${grad};background-size:cover;background-position:center`
+    : `background:${grad}`;
+  const modGrad = 'linear-gradient(135deg,#8B5CF6,#22D3EE)';
+  const shaderGrad = 'linear-gradient(135deg,#FBBF24,#F472B6)';
+  const packGrad = 'repeating-linear-gradient(90deg,rgba(0,0,0,.14) 0 8px,transparent 8px 16px),linear-gradient(135deg,#34D399,#22D3EE)';
   const thumb = kind === 'mods'
-    ? `<div style="display:flex;align-items:center;gap:12px">${r.icon_url ? `<img src="${esc(r.icon_url)}" alt="" style="width:44px;height:44px;border-radius:12px;object-fit:cover">` : `<div class="mi" style="background:linear-gradient(135deg,#8B5CF6,#22D3EE)"></div>`}<b>${esc(r.title)}</b></div>`
-    : `<div style="height:88px;border-radius:12px;background:${kind === 'packs' ? 'repeating-linear-gradient(90deg,rgba(0,0,0,.14) 0 8px,transparent 8px 16px),linear-gradient(135deg,#34D399,#22D3EE)' : 'linear-gradient(135deg,#FBBF24,#F472B6)'}"></div><b>${esc(r.title)}</b>`;
+    ? `<div style="display:flex;align-items:center;gap:12px"><div class="mi" style="${bg(r.icon_url, modGrad)}"></div><b>${esc(r.title)}</b></div>`
+    : `<div style="position:relative;height:176px;border-radius:14px;overflow:hidden;${bg(r.icon_url, kind === 'packs' ? packGrad : shaderGrad)}"><div style="position:absolute;left:0;right:0;bottom:0;padding:14px;background:linear-gradient(transparent,rgba(10,8,20,.9))"><b style="font-size:17px;line-height:1.3">${esc(r.title)}</b></div></div>`;
   return `<div class="mc gl">${thumb}<div class="mu" style="line-height:1.5">${esc(r.description)}</div><div class="mu" style="font-size:12px">${(r.downloads || 0).toLocaleString('es-AR')} descargas</div><div style="display:flex;gap:10px;margin-top:auto"><button class="ib ${inst ? 'in' : ''}" style="flex:1;margin:0" ${inst || busy ? 'disabled' : ''} data-act="inst" data-kind="${kind}" data-slug="${esc(r.slug)}">${busy ? 'Instalando…' : inst ? 'Instalado ✓' : 'Instalar'}</button>${inst ? trb(kind, inst, 38) : ''}<button class="sec" style="height:38px;padding:0 14px" data-act="openmod" data-kind="${kind}" data-slug="${esc(r.slug)}">Ver</button></div></div>`;
 }
 

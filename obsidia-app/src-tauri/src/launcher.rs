@@ -10,8 +10,9 @@ use serde_json::Value;
 use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::thread;
@@ -25,6 +26,8 @@ const MANIFEST: &str = "https://piston-meta.mojang.com/mc/game/version_manifest_
 const ASSET_BASE: &str = "https://resources.download.minecraft.net";
 const LIB_BASE: &str = "https://libraries.minecraft.net";
 const DOWNLOAD_THREADS: usize = 8;
+/// Margen corto para detectar un Java que falla al arrancar antes de informar éxito.
+const STARTUP_GRACE: Duration = Duration::from_secs(2);
 const RUNTIME_ALL: &str =
     "https://launchermeta.mojang.com/v1/products/java-runtime/2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json";
 
@@ -81,6 +84,51 @@ struct Progress {
 /// Evento `launch-progress` → { stage, done, total }. Etapas: version, libraries, assets, starting.
 fn progress(app: &AppHandle, stage: &'static str, done: usize, total: usize) {
     let _ = app.emit("launch-progress", Progress { stage, done, total });
+}
+
+/// Evento `minecraft-closed` → resultado del proceso y final del log.
+#[derive(Serialize, Clone)]
+struct CloseInfo {
+    code: Option<i32>,
+    success: bool,
+    log: String,
+}
+
+/// Últimas líneas del log para mostrar un error útil sin volcar el archivo entero.
+fn log_tail(path: &Path) -> String {
+    const MAX_BYTES: u64 = 12_000;
+    const MAX_LINES: usize = 20;
+    let Ok(mut file) = fs::File::open(path) else { return String::new() };
+    let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let _ = file.seek(SeekFrom::Start(size.saturating_sub(MAX_BYTES)));
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return String::new();
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(MAX_LINES)..].join("\n")
+}
+
+fn close_info(status: ExitStatus, log_path: &Path) -> CloseInfo {
+    CloseInfo {
+        code: status.code(),
+        success: status.success(),
+        log: log_tail(log_path),
+    }
+}
+
+fn startup_error(status: ExitStatus, log_path: &Path) -> String {
+    let code = status
+        .code()
+        .map(|c| format!(" (código {c})"))
+        .unwrap_or_default();
+    let log = log_tail(log_path);
+    if log.is_empty() {
+        format!("Minecraft se cerró inesperadamente durante el arranque{code}. No hay salida en el log.")
+    } else {
+        format!("Minecraft se cerró inesperadamente durante el arranque{code}.\n\n{log}")
+    }
 }
 
 // ─────────────────────────────────── HTTP ────────────────────────────────────
@@ -424,7 +472,7 @@ fn norm_ram(r: Option<String>) -> String {
 // ───────────────────────────────── Java ──────────────────────────────────────
 
 /// Versión mayor de un Java ("1.8.0_402" → 8, "21.0.3" → 21).
-fn java_major(java: &str) -> Option<u32> {
+pub(crate) fn java_major(java: &str) -> Option<u32> {
     let out = new_cmd(java).arg("-version").output().ok()?;
     let text = format!(
         "{}{}",
@@ -463,6 +511,7 @@ fn ensure_runtime(
     mc: &Path,
     component: &str,
 ) -> Result<Option<String>, String> {
+    // Igual que el launcher oficial: runtime/<componente>/<plataforma>/<componente>/bin/java(.exe).
     let Some(platform) = runtime_platform() else { return Ok(None) };
     if component.is_empty() || !component.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_') {
         return Err(format!("Nombre de runtime inválido: {component}"));
@@ -520,6 +569,67 @@ fn ensure_runtime(
     } else {
         Err("El Java se descargó pero no encuentro java.exe".to_string())
     }
+}
+
+/// Comprueba que el Java elegido alcance la versión mayor que pide Minecraft.
+fn ensure_java_level(java: String, required: Option<u32>) -> Result<String, String> {
+    if let (Some(req), Some(have)) = (required, java_major(&java))
+        && have < req {
+            return Err(format!(
+                "Esta versión necesita Java {req} o superior y '{java}' es Java {have}. \
+                 Elegí otro Java en Ajustes."
+            ));
+        }
+    Ok(java)
+}
+
+/// Java para lanzar una versión: primero el runtime de Mojang que pide esa versión y, si no se
+/// puede preparar, un Java instalado compatible. Nunca devuelve el comando `"java"` a ciegas.
+fn prepare_java(
+    app: &AppHandle,
+    c: &reqwest::blocking::Client,
+    mc: &Path,
+    v: &Value,
+    fallback: impl FnOnce(Option<u32>) -> Option<String>,
+) -> Result<String, String> {
+    let required = v["javaVersion"]["majorVersion"].as_u64().map(|n| n as u32);
+    let component = v["javaVersion"]["component"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let runtime_error = match component {
+        Some(comp) => match ensure_runtime(app, c, mc, comp) {
+            Ok(Some(java)) => return ensure_java_level(java, required),
+            Ok(None) => "Mojang no ofrece un runtime para esta plataforma".to_string(),
+            Err(e) => e,
+        },
+        None => "La versión no indica qué runtime de Java usar".to_string(),
+    };
+
+    if let Some(java) = fallback(required) {
+        return ensure_java_level(java, required);
+    }
+    let need = required
+        .map(|n| format!("Java {n} o superior"))
+        .unwrap_or_else(|| "un Java compatible".to_string());
+    Err(format!(
+        "No pude preparar el Java de Minecraft: {runtime_error}. \
+         Tampoco encontré {need} instalado."
+    ))
+}
+
+/// Resuelve el Java de una versión sin abrir el juego. Lo usan los instaladores de Fabric y
+/// Forge para no depender de un Java del sistema.
+pub fn java_for_version(
+    app: &AppHandle,
+    mc: &Path,
+    version: &str,
+    fallback: impl FnOnce(Option<u32>) -> Option<String>,
+) -> Result<String, String> {
+    let c = client()?;
+    let (v, _) = load_version(&c, mc, version, 0)?;
+    prepare_java(app, &c, mc, &v, fallback)
 }
 
 // ───────────────────────────────── Natives ───────────────────────────────────
@@ -639,8 +749,8 @@ pub fn launch(
     version: &str,
     player: Player,
     opts: LaunchOptions,
-    // Se llama solo si hace falta: buscar Javas instalados lanza `java -version` en cada uno.
-    fallback_java: impl FnOnce() -> String,
+    // Se llama solo si falla el runtime de Mojang: buscar Javas instalados lanza `java -version`.
+    fallback_java: impl FnOnce(Option<u32>) -> Option<String>,
 ) -> Result<String, String> {
     let LaunchOptions { ram, java_path, server, fullscreen } = opts;
     let c = client()?;
@@ -651,31 +761,13 @@ pub fn launch(
     let (v, root_id) = load_version(&c, mc, version, 0)?;
     progress(app, "version", 1, 1);
 
-    // 2) Java: se comprueba antes de bajar nada, para fallar rápido.
-    // Prioridad: Java elegido por el usuario > Java que pide la versión (se descarga si falta) > respaldo.
-    let mut warn = String::new();
-    let java = match java_path.filter(|p| !p.trim().is_empty()) {
-        Some(j) => j,
-        None => match v["javaVersion"]["component"].as_str() {
-            Some(comp) => match ensure_runtime(app, &c, mc, comp) {
-                Ok(Some(j)) => j,
-                Ok(None) => fallback_java(),
-                Err(e) => {
-                    warn = format!(" (Aviso: no pude preparar el Java de Mojang: {e})");
-                    fallback_java()
-                }
-            },
-            None => fallback_java(),
-        },
-    };
+    // 2) Java: se comprueba antes de bajar librerías o assets, para fallar rápido.
+    // Prioridad: Java elegido por el usuario > runtime de Mojang de la versión > Java compatible.
     let required = v["javaVersion"]["majorVersion"].as_u64().map(|n| n as u32);
-    if let (Some(req), Some(have)) = (required, java_major(&java))
-        && have < req {
-            return Err(format!(
-                "Esta versión necesita Java {req} o superior y '{java}' es Java {have}. \
-                 Elegí otro Java en Ajustes."
-            ));
-        }
+    let java = match java_path.filter(|p| !p.trim().is_empty()) {
+        Some(j) => ensure_java_level(j, required)?,
+        None => prepare_java(app, &c, mc, &v, fallback_java)?,
+    };
 
     let libs_dir = mc.join("libraries");
     let natives_dir = mc.join("versions").join(version).join("natives");
@@ -917,16 +1009,39 @@ pub fn launch(
         .map_err(|e| format!("No pude ejecutar Java ('{java}'): {e}"))?;
     let pid = child.id();
 
+    // Un Java incompatible o un argumento inválido hace que el proceso muera enseguida.
+    // Se comprueba un momento antes de informar que Minecraft inició.
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Err(startup_error(status, &log_path)),
+            Ok(None) => {}
+            Err(e) => return Err(format!("No pude comprobar el proceso de Minecraft: {e}")),
+        }
+        if started.elapsed() >= STARTUP_GRACE {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
     let app2 = app.clone();
+    let log_path2 = log_path.clone();
     std::thread::spawn(move || {
-        let _ = child.wait();
-        let _ = app2.emit("minecraft-closed", ());
+        let info = match child.wait() {
+            Ok(status) => close_info(status, &log_path2),
+            Err(e) => CloseInfo {
+                code: None,
+                success: false,
+                log: format!("No pude esperar el proceso: {e}"),
+            },
+        };
+        let _ = app2.emit("minecraft-closed", info);
     });
 
     progress(app, "starting", 1, 1);
 
     Ok(format!(
-        "Minecraft {version} iniciado como {} (pid {}). Log: {}{warn}",
+        "Minecraft {version} iniciado como {} (pid {}). Log: {}",
         player.name,
         pid,
         log_path.display()
