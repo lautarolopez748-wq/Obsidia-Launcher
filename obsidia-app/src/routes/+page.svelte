@@ -22,19 +22,20 @@ let accHtml = '';
     files:{ mods:[], shaders:[], packs:[] },
     results:{ mods:null, shaders:null, packs:null }, searching:false, seq:0, searchSeq:0, installSeq:0, busy:{},
     sv:[], af:false, rf:false, es:null, ns:'', na:'',
-    np:false, npEdit:-1, npName:'', npVersion:'', npLoader:'Vanilla', npRam:4, npJava:'', npErr:'', npDel:false, npBusy:false, npFullscreen:false, npBlock:'',
+    np:false, npEdit:-1, npName:'', npVersion:'', npLoader:'Vanilla', npRam:4, npJava:'', npErr:'', npBusy:false, npFullscreen:false, npBlock:'',
     javas:[]
   };
 
   // ───────────── Utilidades ─────────────
   const Q = s => document.querySelector(s);
   // Instancia del perfil activo: cada perfil nuevo tiene su carpeta con mods, packs y mundos.
-  // Los perfiles viejos (sin id) siguen usando .minecraft.
-  const inst = () => (P[S.p] && P[S.p].id) || null;
+  // Los perfiles viejos (sin id) usan el token explícito "legacy" (.minecraft).
+  const inst = () => (P[S.p] && P[S.p].id) || 'legacy';
   const newId = () => 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
   // Categorías tal como las nombra Modrinth (facet `categories`).
   const CAT = { 'Optimización':'optimization', 'Gráficos':'graphics', 'Utilidades':'utility' };
-  const mapKey = kind => 'obsidia.map.' + (inst() || 'global') + '.' + kind;
+  // La clave vieja de localStorage se conserva para no perder los mapas ya guardados.
+  const mapKey = kind => 'obsidia.map.' + ((P[S.p] && P[S.p].id) || 'global') + '.' + kind;
   function fileMap(kind){
     try { const m = JSON.parse(localStorage.getItem(mapKey(kind)) || '{}'); return m && typeof m === 'object' ? m : {}; }
     catch(e){ return {}; }
@@ -137,29 +138,52 @@ let accHtml = '';
 
   // ───────────── Perfiles ─────────────
   function cards(){
-    const BLOCKCOL = { stone:"#7F7F7F", dirt:"#866043", grass:"#5D9C3A", oak:"#A0703A" };
-  return P.map((p,i)=>`<div class="pc gl ${i==S.p?'on':''}" role="button" tabindex="0" data-act="sel" data-i="${i}">${p.block ? `<img src="/images/blocks/${p.block}.png" alt="" style="width:64px;height:64px;border-radius:12px;object-fit:cover;flex:none">` : `<div class="th" style="background:${G[i%4]}"></div>`}<div style="flex:1;min-width:0"><div style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(p.n)}</div><div class="mu">${i==S.p?'Activo · ':''}${esc(p.s)}</div></div><button class="mb" style="width:auto;height:32px;padding:0 12px;font-size:13px" data-act="ped" data-i="${i}">Editar</button></div>`).join('');
+    return P.map((p,i)=>`<div class="pcard ${i==S.p?'on':''}" role="button" tabindex="0" data-act="sel" data-i="${i}"><div class="slot"><img src="/images/blocks/${p.block||'Crafting_Table'}.png" alt=""></div><div class="pinfo"><b>${esc(p.n)}</b><span class="${i==S.p?'on':''}">${i==S.p?'Activo · ':''}${esc(p.s)}</span></div><button class="edit" data-act="ped" data-i="${i}">Editar</button></div>`).join('');
   }
-  const newCard = `<button class="pc gl" style="border-style:dashed;justify-content:center;min-height:92px;color:var(--mu)" data-act="new">+ Nuevo perfil</button>`;
+  const newCard = `<button class="newcard" data-act="new"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>Nueva instancia</button>`;
 
   function npModal(){
-    const title = S.npEdit>=0 ? 'Editar perfil' : 'Nuevo perfil';
+    const title = S.npEdit>=0 ? 'Editar instancia' : 'Nueva instancia';
     const rams = RAMS.filter(r => r <= (S.totalRam||16));
     if (!rams.includes(S.npRam)) rams.push(S.npRam), rams.sort((a,b)=>a-b);
     const versions = VERSIONS.includes(S.npVersion) ? VERSIONS : [S.npVersion, ...VERSIONS];
-    return `<div class="md-back" data-act="npclose"><div class="md gl" style="width:min(520px,92vw);padding:24px;display:flex;flex-direction:column;gap:14px">
-      <div style="display:flex;justify-content:space-between;align-items:center"><h2 style="margin:0">${title}</h2><button class="mb" data-act="npclose" aria-label="Cerrar">✕</button></div>
-      <div><label class="mu" for="np-name">Nombre del perfil</label><input id="np-name" class="srch" style="width:100%;margin-top:6px" maxlength="24" autocomplete="off" value="${esc(S.npName)}"></div>
-      <div><label class="mu" for="np-version">Versión de Minecraft</label><select id="np-version" class="srch" style="width:100%;margin-top:6px">${versions.map(v=>`<option ${v==S.npVersion?'selected':''}>${esc(v)}</option>`).join('')}</select></div>
-      <div><label class="mu" for="np-loader">Loader</label><select id="np-loader" class="srch" style="width:100%;margin-top:6px">${LOADERS.map(l=>`<option ${l==S.npLoader?'selected':''}>${l}</option>`).join('')}</select><div class="mu" style="margin-top:6px">Fabric y Forge se instalan solos la primera vez que jugás.</div></div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
-        <div><label class="mu" for="np-ram">RAM asignada</label><select id="np-ram" class="srch" style="width:100%;margin-top:6px">${rams.map(r=>`<option value="${r}" ${r==S.npRam?'selected':''}>${r} GB</option>`).join('')}</select></div>
-        <div><label class="mu" for="np-java">Java</label><select id="np-java" class="srch" style="width:100%;margin-top:6px"><option value="">Automático (recomendado)</option>${S.javas.map(j=>`<option value="${esc(j.path)}" ${j.path==S.npJava?'selected':''}>${esc(j.version||j.path)}</option>`).join('')}</select></div>
-<div style="display:flex;align-items:center;gap:10px"><input type="checkbox" id="np-fullscreen" ${S.npFullscreen?'checked':''}><label class="mu" for="np-fullscreen">Pantalla completa</label></div>
-      <div><label class="mu" for="np-block">Bloque representativo</label><select id="np-block" class="srch" style="width:100%;margin-top:6px"><option value="">Predeterminado</option><option value="Acacia_Log" ${S.npBlock=="Acacia_Log"?'selected':''}>Acacia Log</option><option value="Amethyst_Block" ${S.npBlock=="Amethyst_Block"?'selected':''}>Amethyst Block</option><option value="Ancient_Debris" ${S.npBlock=="Ancient_Debris"?'selected':''}>Ancient Debris</option><option value="Beacon" ${S.npBlock=="Beacon"?'selected':''}>Beacon</option><option value="Bedrock" ${S.npBlock=="Bedrock"?'selected':''}>Bedrock</option><option value="Black_Glazed_Terracotta" ${S.npBlock=="Black_Glazed_Terracotta"?'selected':''}>Black Glazed Terracotta</option><option value="Blue_Glazed_Terracotta" ${S.npBlock=="Blue_Glazed_Terracotta"?'selected':''}>Blue Glazed Terracotta</option><option value="Carved_Pumpkin" ${S.npBlock=="Carved_Pumpkin"?'selected':''}>Carved Pumpkin</option><option value="Cherry_Leaves" ${S.npBlock=="Cherry_Leaves"?'selected':''}>Cherry Leaves</option><option value="Cherry_Log" ${S.npBlock=="Cherry_Log"?'selected':''}>Cherry Log</option><option value="Chiseled_Polished_Blackstone" ${S.npBlock=="Chiseled_Polished_Blackstone"?'selected':''}>Chiseled Polished Blackstone</option><option value="Command_Block" ${S.npBlock=="Command_Block"?'selected':''}>Command Block</option><option value="Cracked_Deepslate_Bricks" ${S.npBlock=="Cracked_Deepslate_Bricks"?'selected':''}>Cracked Deepslate Bricks</option><option value="Crafting_Table" ${S.npBlock=="Crafting_Table"?'selected':''}>Crafting Table</option><option value="Deepslate_Diamond_Ore" ${S.npBlock=="Deepslate_Diamond_Ore"?'selected':''}>Deepslate Diamond Ore</option><option value="Deepslate_Emerald_Ore" ${S.npBlock=="Deepslate_Emerald_Ore"?'selected':''}>Deepslate Emerald Ore</option><option value="Deepslate_Gold_Ore" ${S.npBlock=="Deepslate_Gold_Ore"?'selected':''}>Deepslate Gold Ore</option><option value="Deepslate_Iron_Ore" ${S.npBlock=="Deepslate_Iron_Ore"?'selected':''}>Deepslate Iron Ore</option><option value="Diamond_Block" ${S.npBlock=="Diamond_Block"?'selected':''}>Diamond Block</option><option value="Diamond_Ore" ${S.npBlock=="Diamond_Ore"?'selected':''}>Diamond Ore</option><option value="Iron_Block" ${S.npBlock=="Iron_Block"?'selected':''}>Iron Block</option><option value="Iron_Ore" ${S.npBlock=="Iron_Ore"?'selected':''}>Iron Ore</option><option value="Oak_Log" ${S.npBlock=="Oak_Log"?'selected':''}>Oak Log</option><option value="Pale_Oak_Log" ${S.npBlock=="Pale_Oak_Log"?'selected':''}>Pale Oak Log</option><option value="White_Glazed_Terracotta" ${S.npBlock=="White_Glazed_Terracotta"?'selected':''}>White Glazed Terracotta</option></select></div>
-      <div style="display:flex;gap:10px;justify-content:space-between;margin-top:6px">
-        <div>${S.npEdit>=0?`<button class="sec" style="height:44px;color:#F87171;white-space:normal;padding:0 12px;font-size:13px;max-width:180px" data-act="npdel">${S.npDel?'\u00BFEst\u00E1s seguro? Toca de nuevo':'Eliminar perfil'}</button>`:''}</div>
-        <div style="display:flex;gap:10px"><button class="sec" style="height:44px" data-act="npclose">Cancelar</button><button class="ib" style="margin:0;height:44px;padding:0 24px" data-act="npcreate" ${S.npBusy?'disabled':''}>${S.npEdit>=0?'Guardar':'Crear perfil'}</button></div>
+    const editing = S.npEdit>=0;
+    const lockIco = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 018 0v3"/></svg>';
+    const chevIco = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 9l6 6 6-6"/></svg>';
+    const infoIco = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5v.5"/></svg>';
+    const blockOpts = `<option value="">Predeterminado</option><option value="Acacia_Log" ${S.npBlock=="Acacia_Log"?'selected':''}>Acacia Log</option><option value="Amethyst_Block" ${S.npBlock=="Amethyst_Block"?'selected':''}>Amethyst Block</option><option value="Ancient_Debris" ${S.npBlock=="Ancient_Debris"?'selected':''}>Ancient Debris</option><option value="Beacon" ${S.npBlock=="Beacon"?'selected':''}>Beacon</option><option value="Bedrock" ${S.npBlock=="Bedrock"?'selected':''}>Bedrock</option><option value="Black_Glazed_Terracotta" ${S.npBlock=="Black_Glazed_Terracotta"?'selected':''}>Black Glazed Terracotta</option><option value="Blue_Glazed_Terracotta" ${S.npBlock=="Blue_Glazed_Terracotta"?'selected':''}>Blue Glazed Terracotta</option><option value="Carved_Pumpkin" ${S.npBlock=="Carved_Pumpkin"?'selected':''}>Carved Pumpkin</option><option value="Cherry_Leaves" ${S.npBlock=="Cherry_Leaves"?'selected':''}>Cherry Leaves</option><option value="Cherry_Log" ${S.npBlock=="Cherry_Log"?'selected':''}>Cherry Log</option><option value="Chiseled_Polished_Blackstone" ${S.npBlock=="Chiseled_Polished_Blackstone"?'selected':''}>Chiseled Polished Blackstone</option><option value="Command_Block" ${S.npBlock=="Command_Block"?'selected':''}>Command Block</option><option value="Cracked_Deepslate_Bricks" ${S.npBlock=="Cracked_Deepslate_Bricks"?'selected':''}>Cracked Deepslate Bricks</option><option value="Crafting_Table" ${S.npBlock=="Crafting_Table"?'selected':''}>Crafting Table</option><option value="Deepslate_Diamond_Ore" ${S.npBlock=="Deepslate_Diamond_Ore"?'selected':''}>Deepslate Diamond Ore</option><option value="Deepslate_Emerald_Ore" ${S.npBlock=="Deepslate_Emerald_Ore"?'selected':''}>Deepslate Emerald Ore</option><option value="Deepslate_Gold_Ore" ${S.npBlock=="Deepslate_Gold_Ore"?'selected':''}>Deepslate Gold Ore</option><option value="Deepslate_Iron_Ore" ${S.npBlock=="Deepslate_Iron_Ore"?'selected':''}>Deepslate Iron Ore</option><option value="Diamond_Block" ${S.npBlock=="Diamond_Block"?'selected':''}>Diamond Block</option><option value="Diamond_Ore" ${S.npBlock=="Diamond_Ore"?'selected':''}>Diamond Ore</option><option value="Iron_Block" ${S.npBlock=="Iron_Block"?'selected':''}>Iron Block</option><option value="Iron_Ore" ${S.npBlock=="Iron_Ore"?'selected':''}>Iron Ore</option><option value="Oak_Log" ${S.npBlock=="Oak_Log"?'selected':''}>Oak Log</option><option value="Pale_Oak_Log" ${S.npBlock=="Pale_Oak_Log"?'selected':''}>Pale Oak Log</option><option value="White_Glazed_Terracotta" ${S.npBlock=="White_Glazed_Terracotta"?'selected':''}>White Glazed Terracotta</option>`;
+    return `<div class="md-back" data-act="npclose"><div class="np-modal">
+      <div class="np-head">
+        <div>
+          <h2>${title}</h2>
+          <div class="np-sub">${editing?`${esc(S.npName)} · ${esc(S.npLoader)} ${esc(S.npVersion)}`:'Elegí versión, loader y recursos'}</div>
+        </div>
+        <button class="np-x" data-act="npclose" aria-label="Cerrar">✕</button>
+      </div>
+      <div class="np-body">
+        <div class="np-field"><label for="np-name">Nombre de la instancia</label><input id="np-name" class="np-in" maxlength="24" autocomplete="off" value="${esc(S.npName)}"></div>
+        <div class="np-grid2">
+          <div class="np-field"><label for="np-version">Versión de Minecraft</label><div class="np-selwrap"><select id="np-version" class="np-in" ${editing?'disabled':''}>${versions.map(v=>`<option ${v==S.npVersion?'selected':''}>${esc(v)}</option>`).join('')}</select><span class="np-ico">${editing?lockIco:chevIco}</span></div></div>
+          <div class="np-field"><label for="np-loader">Loader</label><div class="np-selwrap"><select id="np-loader" class="np-in" ${editing?'disabled':''}>${LOADERS.map(l=>`<option ${l==S.npLoader?'selected':''}>${l}</option>`).join('')}</select><span class="np-ico">${editing?lockIco:chevIco}</span></div></div>
+        </div>
+        <div class="np-note">${infoIco}<span>${editing?'La versión y el loader quedan fijos al crear la instancia. Para cambiarlos, creá una nueva.':'Fabric y Forge se instalan solos la primera vez que jugás.'}</span></div>
+        <div class="np-grid2">
+          <div class="np-field"><label for="np-ram">RAM asignada</label><div class="np-selwrap"><select id="np-ram" class="np-in">${rams.map(r=>`<option value="${r}" ${r==S.npRam?'selected':''}>${r} GB</option>`).join('')}</select><span class="np-ico">${chevIco}</span></div></div>
+          <div class="np-field"><label for="np-java">Java</label><div class="np-selwrap"><select id="np-java" class="np-in"><option value="">Automático</option>${S.javas.map(j=>`<option value="${esc(j.path)}" ${j.path==S.npJava?'selected':''}>${esc(j.version||j.path)}</option>`).join('')}</select><span class="np-ico">${chevIco}</span></div></div>
+        </div>
+        <label class="np-toggle">
+          <span><span class="np-t">Pantalla completa</span><span class="np-d">Abre el juego sin bordes al iniciar.</span></span>
+          <input type="checkbox" id="np-fullscreen" ${S.npFullscreen?'checked':''}>
+          <span class="np-switch"></span>
+        </label>
+        <div class="np-field"><label for="np-block">Bloque representativo</label><div class="np-selwrap"><select id="np-block" class="np-in">${blockOpts}</select><span class="np-ico">${chevIco}</span></div></div>
+      </div>
+      <div class="np-foot">
+        ${S.npErr?`<div class="np-err">${esc(S.npErr)}</div>`:''}
+        <div class="np-foot-row">
+          ${editing?`<button class="np-danger" data-act="npdel" title="Eliminar instancia" aria-label="Eliminar instancia">${TRASH}</button>`:'<span></span>'}
+          <div class="np-actions"><button class="sec" data-act="npclose">Cancelar</button><button class="ib" data-act="npcreate" ${S.npBusy?'disabled':''}>${editing?'Guardar':'Crear instancia'}</button></div>
+        </div>
       </div>
     </div></div>`;
   }
@@ -180,14 +204,61 @@ let accHtml = '';
   function home(){
     const p = P[S.p];
     const g = S.pg;
-    const btn = g===null ? 'JUGAR' : g<100 ? 'Preparando… '+g+' %' : 'EN JUEGO';
-    return `<section class="hero"><div class="shard" aria-hidden="true"></div><div class="mu" style="color:#C4B5FD;font-weight:600;letter-spacing:2px;font-size:12px">PERFIL ACTIVO</div><h1 style="font-size:42px;line-height:1.1">${p?esc(p.n):'Sin perfil'}</h1><div style="color:#C9C7DD">${p?esc(p.s)+' · '+p.ram+' GB de RAM':'Creá un perfil para empezar a jugar.'}</div><div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:6px"><button class="play" data-act="play" ${g!==null?'disabled':''}>${p?btn:'Crear perfil'}</button>${p?`<button class="sec" data-act="ped" data-i="${S.p}">Configurar</button>`:''}</div></section>
-    ${g!==null?`<div class="gl" style="padding:14px 18px"><div style="display:flex;justify-content:space-between;font-size:13px;color:#C9C7DD"><span>${LBL[S.stage]||''}</span><span>${g} %</span></div><div class="bar" style="margin-top:10px"><i style="width:${g}%"></i></div></div>`:''}
-    ${S.launchErr?`<div class="gl" style="padding:14px 18px;border-color:rgba(248,113,113,.5)"><b style="color:#F87171">No se pudo abrir el juego</b><div class="mu" style="margin-top:6px;white-space:pre-wrap;word-break:break-word">${esc(S.launchErr)}</div></div>`:''}
-    ${S.launchMsg?`<div class="gl" style="padding:14px 18px;border-color:rgba(52,211,153,.4)"><div class="mu" style="color:#6EE7B7;word-break:break-word">${esc(S.launchMsg)}</div></div>`:''}
-    <h2>Tus perfiles</h2><div class="g3">${cards()}${newCard}</div>`;
+    const btn = g===null ? 'Jugar' : g<100 ? 'Preparando… '+g+' %' : 'En juego';
+    const java = p ? (p.java ? ((S.javas.find(j => j.path===p.java)||{}).version || 'Java personalizado') : 'Java automático') : '';
+    const meta = p
+      ? `<b>${esc(p.loader||'Vanilla')}</b><span class="sep">·</span>${esc(p.version)}<span class="sep">·</span>${p.ram} GB de RAM<span class="sep">·</span>${esc(java)}`
+      : 'Creá una instancia para empezar a jugar.';
+    const latest = VERSIONS[0] || (p && p.version) || '—';
+    const modsN = (S.files.mods||[]).length;
+    const instN = P.length;
+    return `<div class="home">
+    <header class="topbar">
+      <div><div class="hello">Biblioteca</div><h1>Inicio</h1></div>
+      <div class="top-right"><span class="pill"><i></i>Todo listo</span></div>
+    </header>
+
+    <section class="hero">
+      <div class="hero-in">
+        <span class="eyebrow">${p?'Instancia activa':'Sin instancia activa'}</span>
+        <h2>${p?esc(p.n):'Sin instancia'}</h2>
+        <div class="meta">${meta}</div>
+        <div class="actions">
+          <button class="btn-primary" data-act="play" ${g!==null?'disabled':''}>${g===null?'<span class="play-ico"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7Z"/></svg></span>':''}${p?btn:'Crear instancia'}</button>
+          ${p?`<button class="btn-ghost" data-act="ped" data-i="${S.p}">Configurar</button>`:''}
+        </div>
+      </div>
+      <div class="hint"><i></i>${g===null?'Listo para jugar':esc(LBL[S.stage]||'Preparando…')}</div>
+    </section>
+
+    ${g!==null?`<div class="gl launch"><div style="display:flex;justify-content:space-between;font-size:13px;color:#C9C7DD"><span>${LBL[S.stage]||''}</span><span>${g} %</span></div><div class="bar" style="margin-top:10px"><i style="width:${g}%"></i></div></div>`:''}
+    ${S.launchErr?`<div class="gl launch" style="border-color:rgba(248,113,113,.5)"><b style="color:#F87171">No se pudo abrir el juego</b><div class="mu" style="margin-top:6px;white-space:pre-wrap;word-break:break-word">${esc(S.launchErr)}</div></div>`:''}
+    ${S.launchMsg?`<div class="gl launch" style="border-color:rgba(52,211,153,.4)"><div class="mu" style="color:#6EE7B7;word-break:break-word">${esc(S.launchMsg)}</div></div>`:''}
+
+    <div class="grid">
+      <section>
+        <div class="head"><h3>Tus instancias</h3><span>${instN} ${instN===1?'instancia':'instancias'}</span></div>
+        <div class="cards">${cards()}${newCard}</div>
+      </section>
+      <aside class="panel">
+        <div class="head"><h3>Novedades</h3><button class="link" data-act="go" data-t="mods">Ver mods</button></div>
+        <ul class="rows">
+          <li><div class="nthumb cy"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M4 19h16"/></svg></div><div class="t"><b>Minecraft ${esc(latest)} disponible</b><span>Se descarga al iniciar el juego.</span></div></li>
+          <li><div class="nthumb vi"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 3 20.5 7.5v9L12 21l-8.5-4.5v-9Z"/><path d="m3.5 7.5 8.5 4.5 8.5-4.5"/></svg></div><div class="t"><b>${modsN} ${modsN===1?'mod instalado':'mods instalados'}</b><span>${modsN?'Gestioná las actualizaciones desde Mods.':'Todavía no instalaste mods en esta instancia.'}</span></div></li>
+          <li><div class="nthumb li"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.6 2.4 3.9 5.3 3.9 8.5s-1.3 6.1-3.9 8.5c-2.6-2.4-3.9-5.3-3.9-8.5s1.3-6.1 3.9-8.5Z"/></svg></div><div class="t"><b>Mundos compartidos</b><span>Todas las instancias comparten la carpeta de mundos.</span></div></li>
+        </ul>
+      </aside>
+    </div>
+
+    <div class="strip">
+      <div class="stat"><div class="ico"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 3 20.5 7.5v9L12 21l-8.5-4.5v-9Z"/><path d="m3.5 7.5 8.5 4.5 8.5-4.5"/></svg></div><div><b>${modsN} mods</b><small>instalados en esta instancia</small></div></div>
+      <div class="stat"><div class="ico cy"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.6 2.4 3.9 5.3 3.9 8.5s-1.3 6.1-3.9 8.5c-2.6-2.4-3.9-5.3-3.9-8.5s1.3-6.1 3.9-8.5Z"/></svg></div><div><b>Mundos</b><small>carpeta compartida</small></div></div>
+      <div class="stat"><div class="ico pe"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg></div><div><b>— h</b><small>total de hs jugadas</small></div></div>
+      <div class="right">${instN} ${instN===1?'instancia':'instancias'} en tu biblioteca</div>
+    </div>
+  </div>`;
   }
-  function profiles(){ return `<h1>Perfiles</h1><div class="mu">Elegí con cuál jugar o creá uno nuevo.</div><div class="g3">${cards()}${newCard}</div>`; }
+  function profiles(){ return `<div class="home"><h1>Instancias</h1><div class="mu" style="margin:6px 0 18px">Elegí con cuál jugar o creá una nueva.</div><div class="cards">${cards()}${newCard}</div></div>`; }
 
   // ───────────── Mods / shaders / resource packs ─────────────
   function installedList(kind){
@@ -224,7 +295,7 @@ let accHtml = '';
     try {
     const p = P[S.p];
     const ph = { mods:'Buscar en Modrinth…', shaders:'Buscar shaders…', packs:'Buscar resource packs…' }[S.sec];
-    return `<div style="display:flex;justify-content:space-between;align-items:center"><h1>Mods</h1><div class="gl" style="padding:9px 16px;color:#C9C7DD;font-size:14px">Perfil: ${p?esc(p.n)+' · '+esc(p.loader||'Vanilla'):'—'}</div></div>${seg()}${S.sec==='packs'?packsPanel():''}${installedList(S.sec)}<input id="q" class="srch" aria-label="${ph}" placeholder="${ph}" value="${esc(S.q)}">${S.sec==='mods'&&!S.q.trim()?`<div class="chips">${['Todos','Optimización','Gráficos','Utilidades'].map(c=>`<button class="chip ${c==S.f?'on':''}" data-act="f" data-c="${c}">${c}</button>`).join('')}</div>`:''}<div class="g3" id="grid">${grid()}</div>`;
+    return `<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap"><h1>Mods</h1><div class="gl" style="padding:9px 16px;color:#C9C7DD;font-size:14px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%">Instancia: ${p?esc(p.n)+' · '+esc(p.loader||'Vanilla'):'—'}</div></div>${seg()}${S.sec==='packs'?packsPanel():''}${installedList(S.sec)}<input id="q" class="srch" aria-label="${ph}" placeholder="${ph}" value="${esc(S.q)}">${S.sec==='mods'&&!S.q.trim()?`<div class="chips">${['Todos','Optimización','Gráficos','Utilidades'].map(c=>`<button class="chip ${c==S.f?'on':''}" data-act="f" data-c="${c}">${c}</button>`).join('')}</div>`:''}<div class="g3" id="grid">${grid()}</div>`;
   } catch(e) { return "<h1>MODS ERROR: " + esc(String(e)) + "</h1>"; }
   }
 
@@ -268,17 +339,15 @@ let accHtml = '';
     if (S.busy[slug]) return;
     const mySeq = ++S.installSeq;
     const p = P[S.p];
-    if (kind==='mods'){
-      if (!p){ toast('Creá un perfil primero.', true); return; }
-      if ((p.loader||'Vanilla')==='Vanilla'){ toast('Este perfil es Vanilla: creá un perfil Fabric o Forge para usar mods.', true); return; }
-    }
+    if (!p){ toast('Creá una instancia primero.', true); return; }
+    if (kind==='mods' && (p.loader||'Vanilla')==='Vanilla'){ toast('Esta instancia es Vanilla: creá una instancia Fabric o Forge para usar mods.', true); return; }
     S.busy[slug] = 1; refreshGrid();
     try {
       if (mySeq !== S.installSeq) return;
       let res = null;
       if (kind==='mods') res = await invoke('install_mod', { slug, mcVersion:p.version, loader:p.loader.toLowerCase(), instance:inst() });
-      else if (kind==='shaders') res = await invoke('install_shaderpack', { slug, mcVersion: (P[S.p]&&P[S.p].version)||null, instance:inst() });
-      else res = await invoke('install_resourcepack', { slug, mcVersion: (P[S.p]&&P[S.p].version)||null, instance:inst() });
+      else if (kind==='shaders') res = await invoke('install_shaderpack', { slug, mcVersion:p.version, instance:inst() });
+      else res = await invoke('install_resourcepack', { slug, mcVersion:p.version, instance:inst() });
       const result = (S.results && S.results[kind]) ? S.results[kind].find(r => r.slug === slug) : null;
       if (res) rememberFile(kind, slug, res, result && result.icon_url);
       toast('Instalado correctamente.');
@@ -290,7 +359,7 @@ let accHtml = '';
   // ───────────── Servidores ─────────────
   function servers(){
     const pc = x => x<60?'#34D399':x<120?'#FBBF24':'#F87171';
-    return `<div style="display:flex;justify-content:space-between;align-items:center;gap:16px"><h1>Servidores</h1><div style="display:flex;gap:10px"><button class="sec" style="height:44px" data-act="sref">${S.rf?'Actualizando…':'Actualizar'}</button><button class="ib" style="margin:0;padding:0 22px;height:44px" data-act="sadd">+ Añadir servidor</button></div></div>
+    return `<div style="display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap"><h1>Servidores</h1><div style="display:flex;gap:10px;flex-wrap:wrap"><button class="sec" style="height:44px" data-act="sref">${S.rf?'Actualizando…':'Actualizar'}</button><button class="ib" style="margin:0;padding:0 22px;height:44px" data-act="sadd">+ Añadir servidor</button></div></div>
     ${S.af?`<div class="gl" style="padding:18px 20px;display:flex;gap:12px;align-items:center;flex-wrap:wrap"><input id="sn" class="srch" style="flex:1;min-width:180px" aria-label="Nombre del servidor" placeholder="Nombre del servidor" value="${esc(S.ns)}"><input id="sa" class="srch" style="flex:1;min-width:220px" aria-label="Dirección del servidor" placeholder="Dirección (ej. mi.servidor.net)" value="${esc(S.na)}"><button class="ib" style="margin:0;padding:0 24px;height:48px" data-act="ssave">${S.es!==null?'Guardar cambios':'Guardar'}</button><button class="sec" style="height:48px" data-act="scancel">Cancelar</button></div>`:''}
     ${S.sv.length?'':'<div class="mu">Todavía no agregaste servidores.</div>'}
     <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:16px">${S.sv.map((s,i)=>`<div class="gl" style="padding:18px;display:flex;flex-direction:column;gap:14px"><div style="display:flex;align-items:center;gap:14px"><div class="th" style="width:52px;height:52px;background:${G[i%4]}"></div><div style="flex:1;min-width:0"><b>${esc(s.n)}</b><div class="mu" style="overflow:hidden;text-overflow:ellipsis">${esc(s.a)}</div></div><span class="pf" style="color:${s.on===null?'#C9C7DD':s.on?'#34D399':'#F87171'}">${s.on===null?'Comprobando…':s.on?'En línea':'Sin conexión'}</span></div>${s.on?`<div style="display:flex;gap:10px"><span class="pf" style="color:${pc(s.pg)}">${s.pg} ms</span></div>`:''}<div style="display:flex;gap:10px"><button class="ib" style="flex:1;margin:0" data-act="join" data-i="${i}">Unirse</button><button class="sec" style="height:38px;padding:0 14px" data-act="sedit" data-i="${i}">Editar</button><button class="mb" style="width:auto;height:38px;padding:0 14px;font-size:14px" aria-label="Quitar ${esc(s.n)}" data-act="sdel" data-i="${i}">Quitar</button></div></div>`).join('')}</div>`;
@@ -318,7 +387,7 @@ let accHtml = '';
 
   // ───────────── Ajustes ─────────────
   function settings(){
-    return `<h1>Ajustes</h1><div class="row gl"><div><div style="font-weight:600">Memoria RAM por defecto</div><div class="mu">Se usa al crear perfiles nuevos. Cada perfil guarda la suya.</div></div><div style="display:flex;align-items:center;gap:14px"><input type="range" id="ram" min="2" max="${Math.max(2,S.totalRam)}" value="${S.defRam}" aria-label="Memoria RAM"><b id="ramv" style="width:60px">${S.defRam} GB</b></div></div><div class="row gl"><div><div style="font-weight:600">Java</div><div class="mu">Automático: Obsidia descarga el Java que pide cada versión. Para usar otro, editá el perfil.</div></div></div>${sw('lite','Modo ligero','Sin animaciones, ideal para PCs modestas')}`;
+    return `<h1>Ajustes</h1><div class="row gl"><div><div style="font-weight:600">Memoria RAM por defecto</div><div class="mu">Se usa al crear instancias nuevas. Cada instancia guarda la suya.</div></div><div style="display:flex;align-items:center;gap:14px"><input type="range" id="ram" min="2" max="${Math.max(2,S.totalRam)}" value="${S.defRam}" aria-label="Memoria RAM"><b id="ramv" style="width:60px">${S.defRam} GB</b></div></div><div class="row gl"><div><div style="font-weight:600">Java</div><div class="mu">Automático: Obsidia descarga el Java que pide cada versión. Para usar otro, editá la instancia.</div></div></div>${sw('lite','Modo ligero','Sin animaciones, ideal para PCs modestas')}`;
   }
 
   // ───────────── Render ─────────────
@@ -382,7 +451,7 @@ let accHtml = '';
       // Volver a aplicar la skin elegida: si cambió el pack activo, igual queda puesta.
       if (S.ms) invoke('remove_offline_skin', { instance:inst() }).catch(()=>{});
       else if (S.skins[S.sk]) await applySkinToGame(true);
-      const msg = await invoke('launch_version', { version:id, username:S.nick, ram:p.ram+'G', javaPath:p.java||null, server:server||null, fullscreen:!!p.fullscreen, instance:p.id||null });
+      const msg = await invoke('launch_version', { version:id, username:S.nick, ram:p.ram+'G', javaPath:p.java||null, server:server||null, fullscreen:!!p.fullscreen, instance:inst() });
       S.pg = 100; S.launchMsg = msg; render();
       listen('minecraft-closed', () => { S.pg = null; S.launchMsg = ''; render(); }).catch(()=>{});
     } catch(e){
@@ -418,25 +487,27 @@ let accHtml = '';
   }
   function openNew(){
     S.np = true; S.npEdit = -1; S.npName = ''; S.npVersion = VERSIONS[0] || '1.21.4'; S.npLoader = 'Vanilla';
-    S.npRam = Math.min(S.defRam, S.totalRam); S.npJava = ''; S.npErr = ''; S.npDel = false; S.npBusy = false; S.npFullscreen = false; S.npBlock = ''; render();
+    S.npRam = Math.min(S.defRam, S.totalRam); S.npJava = ''; S.npErr = ''; S.npBusy = false; S.npFullscreen = false; S.npBlock = ''; render();
   }
   function openEdit(i){
     const p = P[i]; if (!p) return;
     S.np = true; S.npEdit = i; S.npName = p.n; S.npVersion = p.version; S.npLoader = p.loader || 'Vanilla';
-    S.npRam = p.ram; S.npJava = p.java || ''; S.npErr = ''; S.npDel = false; S.npBusy = false; S.npFullscreen = !!p.fullscreen; S.npBlock = p.block || ''; render();
+    S.npRam = p.ram; S.npJava = p.java || ''; S.npErr = ''; S.npBusy = false; S.npFullscreen = !!p.fullscreen; S.npBlock = p.block || ''; render();
   }
   async function saveProfileFromModal(){
     const val = id => { const e = Q(id); return e ? e.value : ''; };
-    const name = val('#np-name').trim() || ('Perfil '+(P.length+1));
+    const name = val('#np-name').trim() || ('Instancia '+(P.length+1));
     S.npName = name; S.npVersion = val('#np-version'); S.npLoader = val('#np-loader') || 'Vanilla';
     S.npRam = +val('#np-ram') || 4; S.npJava = val('#np-java'); S.npFullscreen = !!(Q('#np-fullscreen') && Q('#np-fullscreen').checked); S.npBlock = val('#np-block');
     const old = S.npEdit >= 0 ? P[S.npEdit] : null;
-    if (P.some((x,i) => x.n === name && i !== S.npEdit)){ S.npErr = 'Ya existe un perfil con ese nombre.'; render(); return; }
+    if (P.some((x,i) => x.n === name && i !== S.npEdit)){ S.npErr = 'Ya existe una instancia con ese nombre.'; render(); return; }
     S.npBusy = true;
     try {
-      // Primero se guarda el nuevo y recién después se borra el viejo: si algo falla no se pierde el perfil.
-      await invoke('save_profile', { profile:{ name, version:S.npVersion, username:S.nick, ram:S.npRam+'G', java_path:S.npJava||null, loader:S.npLoader, fullscreen:S.npFullscreen, block:S.npBlock||null, id:(old ? old.id : newId()) || null } });
-      if (old && old.n !== name) await invoke('delete_profile', { name:old.n });
+      if (old && old.id) {
+        await invoke('update_instance', { id: old.id, profile:{ name, version:S.npVersion, username:S.nick, ram:S.npRam+'G', java_path:S.npJava||null, loader:S.npLoader, fullscreen:S.npFullscreen, block:S.npBlock||null, id: old.id } });
+      } else {
+        await invoke('create_instance', { profile:{ name, version:S.npVersion, username:S.nick, ram:S.npRam+'G', java_path:S.npJava||null, loader:S.npLoader, fullscreen:S.npFullscreen, block:S.npBlock||null, id: (old ? old.id : newId()) || null } });
+      }
       await loadProfiles(name);
       selectProfile(S.p);
       S.np = false; S.npEdit = -1; S.npErr = '';
@@ -453,16 +524,20 @@ let accHtml = '';
     if (!b) return;
     const a = b.dataset.act, d = b.dataset;
     if (a=='go'){ S.tab = d.t; render(); if (d.t==='servers') pingAll(); if (d.t==='mods'){ refreshFiles().then(()=>{ if (S.tab==='mods') doSearch(); }); } }
-    else if (a=='sel'){ selectProfile(+d.i); render(); refreshFiles(); }
+    else if (a=='sel'){ selectProfile(+d.i); render(); refreshFiles().then(()=>{ if (S.tab==='home'||S.tab==='profiles') render(); }); }
     else if (a=='play'){ play(); }
     else if (a=='new'){ openNew(); }
     else if (a=='ped'){ openEdit(+d.i); }
     else if (a=='npclose'){ if (e.target !== b) return; S.np = false; S.npEdit = -1; render(); }
     else if (a=='npcreate'){ saveProfileFromModal(); }
     else if (a=='npdel'){
-      if (!S.npDel){ S.npDel = true; render(); return; }
       const p = P[S.npEdit];
-      try { if (p) await invoke('delete_profile', { name:p.name || p.n }); await loadProfiles(); S.p = 0; S.np = false; S.npEdit = -1; }
+      S.npErr = '';
+      try {
+        if (p && p.id) await invoke('delete_instance', { id:p.id });
+        else if (p) await invoke('delete_profile', { name:p.name || p.n });
+        await loadProfiles(); S.p = 0; S.np = false; S.npEdit = -1;
+      }
       catch(err){ S.npErr = String(err); }
       render();
     }
@@ -547,7 +622,7 @@ let accHtml = '';
     if (id=='q'){ S.q = e.target.value; clearTimeout(S.dt); S.dt = setTimeout(doSearch, 350); }
     else if (id=='ram'){ S.defRam = +e.target.value; const rv = Q('#ramv'); if (rv) rv.textContent = S.defRam+' GB'; clearTimeout(S.pt); S.pt = setTimeout(persistSettings, 400); }
     else if (id=='nick'){
-      S.nick = e.target.value; const acc = Q('#acc'); if (acc) acc.innerHTML = accCard();
+      S.nick = e.target.value; const acc = Q('#acc'); if (acc) acc.innerHTML = accCard(S.sk, S.nick, S.ms, S.skins);
       const ok = validName(S.nick); const nm = Q('#nm');
       if (nm){ nm.textContent = ok ? 'Nombre válido ✓' : 'Usá de 3 a 16 letras, números o guion bajo.'; nm.style.color = ok ? '#6EE7B7' : '#FCD34D'; }
       if (ok){ clearTimeout(S.pt); S.pt = setTimeout(persistSettings, 400); }
@@ -581,6 +656,10 @@ let accHtml = '';
       if (msProfile){ S.ms = true; S.nick = msProfile.name || S.nick; }
       try { S.skins = JSON.parse(localStorage.getItem('obsidia.skins') || '[]').slice(0,4); S.sk = Math.min(+localStorage.getItem('obsidia.sk') || (S.skins.length?0:-1), S.skins.length-1); S.skmodel = localStorage.getItem('obsidia.skmodel')==='slim'?'slim':'classic'; } catch(e){}
       await loadProfiles();
+      try {
+        const preserved = await invoke('get_migration_preserved_saves').catch(()=>[]);
+        if (preserved && preserved.length) toast('Se encontraron mundos antiguos conservados en su ubicacion original.');
+      } catch(e){}
       await loadServers();
       loadFileMap();
       await refreshFiles();
@@ -611,32 +690,104 @@ let accHtml = '';
 
 <svelte:head>
   <style>
-    :root{--bg:#0A0A12;--tx:#EDEBF7;--mu:#A9A7C0;--gl:rgba(255,255,255,.05);--bd:rgba(255,255,255,.09);--v:#8B5CF6;--c:#22D3EE;color-scheme:dark;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+    :root{--bg:#0B0A10;--tx:#F2F0F7;--mu:#A09CB2;--gl:rgba(255,255,255,.05);--bd:rgba(255,255,255,.09);--v:#8B5CF6;--c:#7DD3FC;color-scheme:dark;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
     html{height:100%;scroll-padding-top:env(safe-area-inset-top,0px)}
     *{box-sizing:border-box}
-    body{margin:0;height:100%;color:var(--tx);font:15px Inter,system-ui,sans-serif;background:radial-gradient(900px 500px at 75% -10%,rgba(139,92,246,.28),transparent 60%),radial-gradient(700px 400px at 100% 100%,rgba(192,38,211,.16),transparent 60%),var(--bg)}
+    body{margin:0;height:100%;color:var(--tx);font:14.5px/1.6 Inter,"Segoe UI",system-ui,sans-serif;background:radial-gradient(900px 620px at 8% -10%,rgba(139,92,246,.10),transparent 60%),radial-gradient(820px 560px at 100% 0%,rgba(125,211,252,.07),transparent 60%),var(--bg)}
     button,input,select{font:inherit;color:inherit}button{cursor:pointer}
-    #wrap{height:100%;overflow:auto}
-    #app{display:flex;min-width:900px;min-height:100%}
-    aside{width:232px;flex:none;padding:28px 18px;display:flex;flex-direction:column;gap:28px;border-right:1px solid var(--bd);background:rgba(255,255,255,.02)}
-    .logo{display:flex;align-items:center;gap:12px;padding:0 8px;font:700 22px Sora,sans-serif}
-    nav{display:flex;flex-direction:column;gap:6px}
-    nav button{display:flex;align-items:center;gap:12px;height:44px;padding:0 14px;border:0;border-radius:12px;background:transparent;color:var(--mu);transition:background .2s,color .2s;text-align:left}
-    nav button:hover{background:rgba(255,255,255,.05);color:var(--tx)}
-    nav button.on{color:#fff;background:rgba(139,92,246,.18);box-shadow:inset 0 0 0 1px rgba(139,92,246,.5)}
-    .acc{margin-top:auto;display:flex;align-items:center;gap:12px;padding:12px;border-radius:16px}
-    .acc{text-align:left;width:100%;transition:border-color .2s,background .2s}.acc:hover{background:rgba(255,255,255,.08)}.acc.on{border-color:rgba(139,92,246,.7)}
+    #wrap{height:100%;overflow-y:auto;overflow-x:hidden}
+    #app{display:flex;min-width:0;width:100%;min-height:100%}
+    aside{width:236px;flex:none;padding:28px 18px 22px;display:flex;flex-direction:column;gap:28px;border-right:1px solid rgba(255,255,255,.045);background:transparent}
+    .logo{display:flex;align-items:center;gap:11px;padding:0 10px;font:600 19px/1 Sora,Inter,system-ui,sans-serif;letter-spacing:.2px}
+    nav{display:flex;flex-direction:column;gap:2px}
+    nav button{display:flex;align-items:center;gap:12px;height:42px;padding:0 12px;border:0;border-radius:11px;background:transparent;color:#A9A5B8;font-size:13.5px;transition:background .15s,color .15s;text-align:left}
+    nav button svg{flex:none;opacity:.75}
+    nav button:hover{background:rgba(255,255,255,.04);color:var(--tx)}
+    nav button.on{color:#fff;background:linear-gradient(90deg,rgba(167,139,250,.16),rgba(167,139,250,.05))}
+    nav button.on svg{opacity:1;color:#C4B5FD}
+    .acc{margin-top:auto;display:flex;align-items:center;gap:11px;padding:11px;border-radius:14px;text-align:left;width:100%;border:1px solid rgba(255,255,255,.055);background:rgba(255,255,255,.022);transition:border-color .2s,background .2s}
+    .acc:hover{background:rgba(255,255,255,.05);border-color:rgba(255,255,255,.10)}.acc.on{border-color:rgba(167,139,250,.45);background:rgba(167,139,250,.08)}
+    .acc .who{min-width:0;flex:1}
+    .acc .who b{display:block;font-size:12.5px;line-height:1.2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .acc .who span{display:block;font-size:11px;color:var(--mu);margin-top:3px}
+    .acc .status{width:7px;height:7px;border-radius:50%;background:#86EFAC;margin-left:auto;flex:none;box-shadow:0 0 0 3px rgba(134,239,172,.12)}
     .mu{color:var(--mu);font-size:13px}
-    main{flex:1;min-width:0;padding:28px 36px;display:flex;flex-direction:column;gap:22px}
-    h1{margin:0;font:700 30px Sora,sans-serif}h2{margin:0;font:600 18px Sora,sans-serif}
+    main{flex:1;min-width:0;padding:32px 40px 22px;display:flex;flex-direction:column;gap:22px}
+    h1{margin:0;font:600 26px/1.2 Sora,Inter,system-ui,sans-serif;letter-spacing:-.2px}h2{margin:0;font:600 18px Sora,sans-serif}
     .gl{background:var(--gl);border:1px solid var(--bd);border-radius:18px}
-    .hero{position:relative;overflow:hidden;min-height:300px;padding:40px;border-radius:24px;display:flex;flex-direction:column;justify-content:flex-end;gap:16px;border:1px solid rgba(255,255,255,.1);background:linear-gradient(135deg,rgba(139,92,246,.45),rgba(192,38,211,.22) 55%,rgba(10,10,18,.2)),#12101F}
-    .shard{position:absolute;right:70px;top:24px;width:270px;height:310px;clip-path:polygon(50% 0,100% 30%,80% 100%,20% 100%,0 30%);background:linear-gradient(160deg,rgba(255,255,255,.28),rgba(139,92,246,.4) 40%,rgba(10,10,18,.7));animation:fl 6s ease-in-out infinite}
-    .lite .shard{animation:none}
-    @keyframes fl{50%{transform:translateY(-10px)}}
-    .hero>*{position:relative}.hero .shard{position:absolute}
-    .play{height:56px;min-width:190px;padding:0 40px;border:0;border-radius:16px;font:700 18px Sora,sans-serif;letter-spacing:1px;color:#06121A;background:linear-gradient(90deg,#67E8F9,#22D3EE);box-shadow:0 8px 32px rgba(34,211,238,.35);transition:transform .15s}
-    .play:hover{transform:translateY(-2px)}.play:disabled{opacity:.85;cursor:default;transform:none}
+
+    /* ── Inicio ── */
+    .home{display:flex;flex-direction:column;width:100%;gap:0;flex:1;min-height:0}
+    .topbar{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:24px;flex-wrap:wrap}
+    .hello{font-size:10.5px;font-weight:600;letter-spacing:.14em;text-transform:uppercase;color:#8B869E;margin-bottom:5px}
+    .top-right{display:flex;align-items:center;gap:8px;padding-top:4px}
+    .pill{display:inline-flex;align-items:center;gap:7px;height:32px;padding:0 12px;border-radius:999px;border:1px solid rgba(134,239,172,.18);background:rgba(134,239,172,.06);color:#BBF7D0;font-size:11.5px}
+    .pill i{width:6px;height:6px;border-radius:50%;background:#86EFAC}
+    .hero{position:relative;overflow:hidden;height:352px;border-radius:26px;border:1px solid rgba(255,255,255,.075);background:#141020 url('/images/hero.png') center 42%/cover no-repeat;box-shadow:0 24px 70px rgba(0,0,0,.42)}
+    .hero::before{content:"";position:absolute;inset:0;z-index:1;pointer-events:none;background:linear-gradient(90deg,rgba(11,9,16,.90) 0%,rgba(11,9,16,.68) 32%,rgba(11,9,16,.24) 58%,rgba(11,9,16,.04) 100%),linear-gradient(0deg,rgba(9,8,13,.42),transparent 48%)}
+    .hero-in{position:relative;z-index:2;height:100%;display:flex;flex-direction:column;justify-content:center;gap:13px;padding:0 44px;max-width:78%}
+    .eyebrow{font-size:10.5px;font-weight:600;letter-spacing:.16em;color:#DCD2F5;text-transform:uppercase;text-shadow:0 1px 6px rgba(0,0,0,.5)}
+    .hero h2{margin:0;font:600 42px/1.05 Sora,Inter,system-ui,sans-serif;letter-spacing:-.6px;text-shadow:0 2px 14px rgba(0,0,0,.45);overflow-wrap:anywhere}
+    .meta{font-size:13px;color:#DAD4E8;text-shadow:0 1px 6px rgba(0,0,0,.5)}
+    .meta b{color:#F5F2FB;font-weight:500}
+    .meta .sep{margin:0 8px;color:#B4AEC4}
+    .actions{display:flex;align-items:center;gap:10px;margin-top:8px;flex-wrap:wrap}
+    .btn-primary{display:inline-flex;align-items:center;gap:10px;height:54px;padding:0 30px 0 11px;border:0;border-radius:999px;cursor:pointer;font:600 15px/1 Inter,system-ui,sans-serif;letter-spacing:.1px;color:#14101F;background:linear-gradient(135deg,#F0ABFC 0%,#C4B5FD 46%,#7DD3FC 100%);box-shadow:0 10px 32px rgba(167,139,250,.32),inset 0 1px 0 rgba(255,255,255,.45);transition:transform .14s,box-shadow .16s,filter .16s}
+    .btn-primary:hover{filter:brightness(1.05);box-shadow:0 14px 38px rgba(167,139,250,.42);transform:translateY(-2px)}
+    .btn-primary:active{transform:translateY(0)}
+    .btn-primary:disabled{cursor:default;opacity:.85;transform:none;filter:none}
+    .btn-primary .play-ico{width:32px;height:32px;flex:none;display:grid;place-items:center;border-radius:50%;background:rgba(20,16,31,.14);color:#171326}
+    .btn-ghost{height:50px;padding:0 22px;cursor:pointer;border:1px solid rgba(255,255,255,.13);border-radius:14px;background:rgba(255,255,255,.045);color:#DDD9EA;font:500 14px/1 Inter,system-ui,sans-serif;transition:.15s}
+    .btn-ghost:hover{background:rgba(255,255,255,.08);border-color:rgba(255,255,255,.2)}
+    .hint{position:absolute;right:26px;bottom:22px;z-index:2;display:inline-flex;align-items:center;gap:8px;padding:8px 13px;border-radius:999px;border:1px solid rgba(255,255,255,.10);background:rgba(12,10,18,.42);backdrop-filter:blur(8px);font-size:11.5px;color:#C9C4DA;max-width:calc(100% - 52px);overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+    .hint i{width:6px;height:6px;border-radius:50%;background:#7DD3FC;flex:none}
+    .home .launch{margin-top:18px;padding:14px 18px}
+    .grid{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:22px;margin:24px 0 22px 0}
+    .head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:12px;flex-wrap:wrap}
+    .head h3{margin:0;font:600 15.5px/1.2 Sora,Inter,system-ui,sans-serif;letter-spacing:-.1px}
+    .head span{font-size:11.5px;color:var(--mu)}
+    .link{border:0;background:transparent;color:#9C93B8;font-size:12px;padding:0;cursor:pointer}
+    .link:hover{color:#C4B5FD}
+    .cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+    .pcard{position:relative;display:flex;align-items:center;gap:13px;padding:13px;min-height:92px;border:1px solid rgba(255,255,255,.07);border-radius:16px;background:linear-gradient(180deg,rgba(255,255,255,.035),rgba(255,255,255,.012));cursor:pointer;transition:.16s}
+    .pcard:hover{background:rgba(255,255,255,.05);border-color:rgba(255,255,255,.12);transform:translateY(-1px)}
+    .pcard.on{border-color:rgba(167,139,250,.45);background:linear-gradient(180deg,rgba(167,139,250,.14),rgba(167,139,250,.04));box-shadow:0 10px 30px rgba(139,92,246,.10)}
+    .pcard.on::before{content:"";position:absolute;left:-1px;top:16px;bottom:16px;width:3px;border-radius:0 3px 3px 0;background:linear-gradient(180deg,#7DD3FC,#A78BFA)}
+    .slot{width:64px;height:64px;flex:none;display:grid;place-items:center}
+    .slot img{width:60px;height:60px;object-fit:contain;display:block;filter:drop-shadow(0 6px 8px rgba(0,0,0,.40))}
+    .pinfo{min-width:0;flex:1}
+    .pinfo b{display:block;font-size:14px;font-weight:600;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .pinfo span{display:block;margin-top:4px;font-size:11.5px;color:var(--mu);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .pinfo span.on{color:#C4B5FD}
+    .edit{flex:none;height:28px;padding:0 11px;border-radius:8px;border:1px solid rgba(255,255,255,.10);background:rgba(255,255,255,.04);color:#C9C7DD;font:500 11.5px Inter,system-ui,sans-serif;cursor:pointer;transition:.15s}
+    .edit:hover{background:rgba(255,255,255,.09);border-color:rgba(255,255,255,.18)}
+    .newcard{display:flex;align-items:center;justify-content:center;gap:8px;min-height:92px;border-radius:16px;border:1px dashed rgba(255,255,255,.13);background:rgba(255,255,255,.012);color:#9C97AC;font:500 12.5px Inter,system-ui,sans-serif;cursor:pointer;transition:.16s}
+    .newcard:hover{color:#D5D0E3;border-color:rgba(167,139,250,.4);background:rgba(167,139,250,.05)}
+    .panel{border:1px solid rgba(255,255,255,.07);border-radius:16px;background:linear-gradient(180deg,rgba(255,255,255,.03),rgba(255,255,255,.01));padding:14px;height:100%;width:600px;justify-self:end}
+    .panel .head{margin:0 2px 6px}
+    .rows{list-style:none;margin:0;padding:0}
+    .rows li{display:flex;align-items:flex-start;gap:11px;padding:11px 2px;border-top:1px solid rgba(255,255,255,.05)}
+    .rows li:first-child{border-top:0}
+    .nthumb{width:36px;height:36px;flex:none;border-radius:10px;display:grid;place-items:center;border:1px solid rgba(255,255,255,.07)}
+    .nthumb.cy{background:linear-gradient(140deg,#164B57,#0E2026);color:#9BE8F6}
+    .nthumb.vi{background:linear-gradient(140deg,#3B2A63,#1C1530);color:#C4B5FD}
+    .nthumb.li{background:linear-gradient(140deg,#3C4A1D,#1B2110);color:#D9F99D}
+    .rows .t{min-width:0;flex:1}
+    .rows .t b{display:block;font-size:12.5px;font-weight:500;line-height:1.4}
+    .rows .t span{display:block;margin-top:2px;font-size:11px;color:var(--mu)}
+    .strip{display:flex;align-items:center;gap:0;flex-wrap:wrap;margin-top:auto;border:1px solid rgba(255,255,255,.07);border-radius:16px;background:linear-gradient(180deg,rgba(255,255,255,.028),rgba(255,255,255,.012));overflow:hidden}
+    .stat{display:flex;align-items:center;gap:11px;padding:14px 20px;border-left:1px solid rgba(255,255,255,.05)}
+    .stat:first-child{border-left:0}
+    .stat .ico{width:34px;height:34px;flex:none;display:grid;place-items:center;border-radius:10px;background:rgba(167,139,250,.11);color:#C4B5FD;border:1px solid rgba(167,139,250,.16)}
+    .stat .ico.cy{background:rgba(125,211,252,.10);color:#BAE6FD;border-color:rgba(125,211,252,.16)}
+    .stat .ico.pe{background:rgba(253,186,116,.09);color:#FED7AA;border-color:rgba(253,186,116,.16)}
+    .stat b{display:block;font-size:14px;font-weight:600;line-height:1.2}
+    .stat small{display:block;font-size:11px;color:var(--mu);margin-top:1px}
+    .strip .right{margin-left:auto;padding:0 20px;font-size:11.5px;color:#837E93}
+    @media (max-width:1380px){.grid{grid-template-columns:1fr}}
+    @media (max-width:1100px){.cards{grid-template-columns:repeat(2,minmax(0,1fr))}}
+    @media (max-width:940px){main{padding:26px 22px 30px}.hero-in{padding:0 30px}.strip .right{margin-left:0;padding:12px 20px}}
+
     .sec{height:56px;padding:0 26px;border-radius:16px;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.14)}
     .g3{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:16px}
     .pc{display:flex;align-items:center;gap:14px;padding:14px;text-align:left;cursor:pointer;transition:border-color .2s,background .2s}
@@ -655,7 +806,7 @@ let accHtml = '';
     .ib{height:38px;margin-top:auto;border:0;border-radius:10px;font-weight:600;color:#fff;background:#7C3AED;transition:background .2s}
     .ib.in{color:#C9C7DD;background:rgba(255,255,255,.08)}
     .ib:disabled{cursor:default;opacity:.8}
-    .row{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:20px 22px}
+    .row{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:20px 22px;flex-wrap:wrap}
     .sw{width:50px;height:28px;border-radius:14px;border:0;background:rgba(255,255,255,.14);position:relative;transition:background .2s;flex:none}
     .sw::after{content:"";position:absolute;top:3px;left:3px;width:22px;height:22px;border-radius:50%;background:#fff;transition:left .2s}
     .sw[aria-checked=true]{background:#7C3AED}.sw[aria-checked=true]::after{left:25px}
@@ -674,7 +825,45 @@ let accHtml = '';
     .md.gl{background:#14122A;border-color:rgba(255,255,255,.14);box-shadow:0 24px 80px rgba(0,0,0,.6)}
     .toast{position:fixed;right:24px;bottom:24px;max-width:420px;padding:12px 16px;border-radius:14px;background:#14122A;border:1px solid rgba(52,211,153,.5);color:#EDEBF7;font-size:14px;opacity:0;transform:translateY(8px);pointer-events:none;transition:opacity .2s,transform .2s;z-index:60}
     .toast.show{opacity:1;transform:none}.toast.bad{border-color:rgba(248,113,113,.6)}
-  </style>
+  
+    /* ── Modal de perfil ── */
+    .np-modal{width:min(600px,94vw);max-height:88vh;display:flex;flex-direction:column;overflow:hidden;border:1px solid rgba(255,255,255,.14);border-radius:22px;background:linear-gradient(180deg,#17152F 0%,#131126 100%);box-shadow:0 28px 90px rgba(0,0,0,.62)}
+    .np-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:26px 32px 0;flex-wrap:wrap}
+    .np-head h2{margin:0;font:700 22px/1.25 Sora,Inter,system-ui,sans-serif;letter-spacing:.2px}
+    .np-sub{margin-top:6px;font-size:12.5px;color:var(--mu)}
+    .np-x{width:36px;height:36px;flex:none;display:grid;place-items:center;border:1px solid var(--bd);border-radius:11px;background:rgba(255,255,255,.05);color:var(--mu);font-size:14px;line-height:1;transition:background .15s,color .15s,border-color .15s}
+    .np-x:hover{background:rgba(255,255,255,.10);color:var(--tx);border-color:rgba(255,255,255,.18)}
+    .np-body{padding:24px 32px 8px;display:flex;flex-direction:column;gap:22px;overflow:auto}
+    .np-field{display:flex;flex-direction:column;gap:8px;min-width:0}
+    .np-field>label{font-size:11.5px;font-weight:600;letter-spacing:.09em;text-transform:uppercase;color:#B9B7CE}
+    .np-in{width:100%;height:48px;padding:0 16px;border:1px solid rgba(255,255,255,.12);border-radius:12px;background:rgba(255,255,255,.045);color:var(--tx);font:inherit;font-size:14.5px;outline:none;transition:border-color .15s,box-shadow .15s,background .15s}
+    .np-in:focus{border-color:rgba(34,211,238,.55);box-shadow:0 0 0 3px rgba(34,211,238,.12)}
+    .np-selwrap{position:relative;min-width:0}
+    .np-selwrap select{appearance:none;-webkit-appearance:none;padding-right:44px;cursor:pointer}
+    .np-selwrap select:disabled{cursor:not-allowed;color:#B4B2C8;background:rgba(255,255,255,.025);border-style:dashed;border-color:rgba(255,255,255,.10)}
+    .np-selwrap .np-ico{position:absolute;right:15px;top:50%;transform:translateY(-50%);display:flex;color:#8E8CA6;pointer-events:none}
+    .np-grid2{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+    .np-note{display:flex;align-items:flex-start;gap:10px;padding:12px 14px;border:1px solid rgba(139,92,246,.22);border-radius:12px;background:rgba(139,92,246,.075);font-size:12.5px;line-height:1.55;color:#BEBBD6}
+    .np-note svg{flex:none;margin-top:2px;color:#A78BFA}
+    .np-toggle{position:relative;display:flex;align-items:center;justify-content:space-between;gap:18px;padding:14px 16px;border:1px solid rgba(255,255,255,.10);border-radius:12px;background:rgba(255,255,255,.028);cursor:pointer}
+    .np-t{display:block;font-size:14px;font-weight:600}
+    .np-d{display:block;margin-top:2px;font-size:12px;color:var(--mu)}
+    .np-toggle input{position:absolute;opacity:0;width:0;height:0}
+    .np-switch{position:relative;width:46px;height:26px;flex:none;border-radius:999px;background:rgba(255,255,255,.10);border:1px solid rgba(255,255,255,.12);transition:background .15s,border-color .15s}
+    .np-switch::after{content:"";position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#C9C7DD;transition:transform .18s,background .18s}
+    .np-toggle input:checked+.np-switch{background:linear-gradient(90deg,rgba(34,211,238,.85),rgba(139,92,246,.9));border-color:transparent}
+    .np-toggle input:checked+.np-switch::after{transform:translateX(20px);background:#fff}
+    .np-toggle input:focus-visible+.np-switch{outline:2px solid var(--c);outline-offset:2px}
+    .np-foot{margin-top:18px;padding:18px 32px;border-top:1px solid rgba(255,255,255,.09);background:rgba(0,0,0,.18);display:flex;flex-direction:column;gap:12px}
+    .np-err{font-size:12.5px;color:#F87171}
+    .np-foot-row{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
+    .np-actions{display:flex;gap:10px;margin-left:auto}
+    .np-danger{width:42px;height:42px;display:grid;place-items:center;border:1px solid rgba(248,113,113,.28);border-radius:12px;background:rgba(248,113,113,.07);color:#F87171;cursor:pointer;transition:background .15s,border-color .15s}
+    .np-danger:hover{background:rgba(248,113,113,.14);border-color:rgba(248,113,113,.45)}
+    .np-foot .sec{height:42px;border-radius:12px}
+    .np-foot .ib{height:42px;margin:0;padding:0 24px;border-radius:12px}
+    @media (max-width:560px){.np-grid2{grid-template-columns:1fr}.np-head{padding:22px 22px 0}.np-body{padding:20px 22px 6px}.np-foot{padding:16px 22px}}
+</style>
 </svelte:head>
 
 <div id="wrap"><div id="app">
