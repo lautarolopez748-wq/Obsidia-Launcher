@@ -37,9 +37,10 @@ pub fn list_names(mc: &Path) -> Vec<String> {
         for e in entries.flatten() {
             let p = e.path();
             if (p.is_file() || p.is_dir())
-                && let Some(n) = e.file_name().to_str() {
-                    names.push(n.to_string());
-                }
+                && let Some(n) = e.file_name().to_str()
+            {
+                names.push(n.to_string());
+            }
         }
     }
     names.sort();
@@ -61,14 +62,22 @@ pub fn merge_state(names: Vec<String>, options_order: &[String]) -> Vec<PackStat
     let available: HashSet<&str> = names.iter().map(String::as_str).collect();
     let mut out: Vec<PackState> = Vec::new();
     for entry in options_order.iter().rev() {
-        let Some(name) = entry.strip_prefix(PREFIX) else { continue };
+        let Some(name) = entry.strip_prefix(PREFIX) else {
+            continue;
+        };
         if available.contains(name) && !out.iter().any(|p| p.name == name) {
-            out.push(PackState { name: name.to_string(), enabled: true });
+            out.push(PackState {
+                name: name.to_string(),
+                enabled: true,
+            });
         }
     }
     for name in &names {
         if !out.iter().any(|p| &p.name == name) {
-            out.push(PackState { name: name.clone(), enabled: false });
+            out.push(PackState {
+                name: name.clone(),
+                enabled: false,
+            });
         }
     }
     out
@@ -187,9 +196,18 @@ mod tests {
         assert_eq!(
             st,
             vec![
-                PackState { name: "b.zip".into(), enabled: true },
-                PackState { name: "c".into(), enabled: true },
-                PackState { name: "a.zip".into(), enabled: false },
+                PackState {
+                    name: "b.zip".into(),
+                    enabled: true
+                },
+                PackState {
+                    name: "c".into(),
+                    enabled: true
+                },
+                PackState {
+                    name: "a.zip".into(),
+                    enabled: false
+                },
             ]
         );
     }
@@ -199,7 +217,13 @@ mod tests {
         let names = vec!["a.zip".to_string()];
         let active = vec!["file/a.zip".to_string(), "file/fantasma.zip".to_string()];
         let st = merge_state(names, &active);
-        assert_eq!(st, vec![PackState { name: "a.zip".into(), enabled: true }]);
+        assert_eq!(
+            st,
+            vec![PackState {
+                name: "a.zip".into(),
+                enabled: true
+            }]
+        );
     }
 
     #[test]
@@ -264,8 +288,20 @@ mod tests {
             "fov:0.5\nresourcePacks:[\"vanilla\",\"file/B.zip\",\"fabric\",\"file/A.zip\",\"file/Ghost.zip\"]\n"
         );
         let st = get_state(&mc).unwrap();
-        assert_eq!(st[0], PackState { name: "A.zip".into(), enabled: true });
-        assert_eq!(st[1], PackState { name: "B.zip".into(), enabled: true });
+        assert_eq!(
+            st[0],
+            PackState {
+                name: "A.zip".into(),
+                enabled: true
+            }
+        );
+        assert_eq!(
+            st[1],
+            PackState {
+                name: "B.zip".into(),
+                enabled: true
+            }
+        );
 
         let _ = fs::remove_dir_all(&mc);
     }
@@ -299,7 +335,10 @@ mod tests {
         fs::write(mc.join("options.txt"), original).unwrap();
 
         assert!(save_state(&mc, vec!["A.zip".into()]).is_err());
-        assert_eq!(fs::read_to_string(mc.join("options.txt")).unwrap(), original);
+        assert_eq!(
+            fs::read_to_string(mc.join("options.txt")).unwrap(),
+            original
+        );
         assert!(!mc.join("options.txt.tmp").exists());
 
         let _ = fs::remove_dir_all(&mc);
@@ -354,7 +393,10 @@ mod tests {
         let st = get_state(&mc).unwrap();
         assert_eq!(
             st,
-            vec![PackState { name: "A.zip".into(), enabled: true }]
+            vec![PackState {
+                name: "A.zip".into(),
+                enabled: true
+            }]
         );
         assert!(mc.join("options.txt").exists());
         assert!(!mc.join("options.txt.bak").exists());
@@ -444,13 +486,15 @@ mod tests {
             &["file/b.zip".to_string(), "file/a.zip".to_string()],
         )
         .unwrap();
-        assert_eq!(out, "fov:0.5\nresourcePacks:[\"file/b.zip\",\"file/a.zip\"]\n");
+        assert_eq!(
+            out,
+            "fov:0.5\nresourcePacks:[\"file/b.zip\",\"file/a.zip\"]\n"
+        );
     }
 
     #[test]
     fn crea_renglon_si_falta() {
-        let out =
-            skin::set_pack_entries("", KEY, &["file/a.zip".to_string()]).unwrap();
+        let out = skin::set_pack_entries("", KEY, &["file/a.zip".to_string()]).unwrap();
         assert_eq!(out, "resourcePacks:[\"file/a.zip\"]");
     }
 }
