@@ -21,7 +21,9 @@ const RESOURCE_PACKS_KEY: &str = "resourcePacks:";
 /// Clave de los packs marcados como incompatibles (Minecraft los ignora).
 const INCOMPATIBLE_KEY: &str = "incompatibleResourcePacks:";
 /// Texturas por defecto del jugador (1.19.4+ usa nueve skins base).
-const PLAYER_SKINS: [&str; 9] = ["steve", "alex", "ari", "efe", "kai", "makena", "noor", "sunny", "zuri"];
+const PLAYER_SKINS: [&str; 9] = [
+    "steve", "alex", "ari", "efe", "kai", "makena", "noor", "sunny", "zuri",
+];
 /// La skin no puede pesar más que esto (bytes ya decodificados).
 const MAX_SKIN_BYTES: usize = 1024 * 1024;
 
@@ -149,8 +151,7 @@ fn archive_backup(backup: &Path) -> Result<PathBuf, String> {
         if candidate.exists() {
             continue;
         }
-        fs::rename(backup, &candidate)
-            .map_err(|e| format!("{}: {e}", backup.display()))?;
+        fs::rename(backup, &candidate).map_err(|e| format!("{}: {e}", backup.display()))?;
         return Ok(candidate);
     }
     Err(format!(
@@ -205,7 +206,11 @@ pub fn parse_pack_list(line: &str) -> Result<Vec<String>, String> {
 /// salto final si el archivo no lo tenía. Si la clave está duplicada reescribe la
 /// última, que es la que Minecraft usa.
 pub fn set_pack_entries(options: &str, key: &str, packs: &[String]) -> Result<String, String> {
-    let eol = if options.contains("\r\n") { "\r\n" } else { "\n" };
+    let eol = if options.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
     let trailing = options.ends_with('\n');
     let mut lines: Vec<String> = if options.is_empty() {
         Vec::new()
@@ -289,12 +294,12 @@ pub fn write_options(path: &Path, data: &str) -> Result<(), String> {
     let backup = with_suffix(path, ".bak");
 
     {
-        let mut file =
-            fs::File::create(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        let mut file = fs::File::create(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
         file.write_all(data.as_bytes())
             .map_err(|e| format!("{}: {e}", tmp.display()))?;
         // El temporal tiene que estar completo antes de tocar el original.
-        file.sync_all().map_err(|e| format!("{}: {e}", tmp.display()))?;
+        file.sync_all()
+            .map_err(|e| format!("{}: {e}", tmp.display()))?;
     }
 
     let had_original = path.exists();
@@ -359,25 +364,55 @@ fn write_pack(mc: &Path, png: &[u8], version: Option<&str>) -> Result<(), String
     }
 
     if tmp.exists() {
-        fs::remove_dir_all(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        if tmp.is_dir() {
+            crate::paths::safe_remove_dir_all(&tmp)?;
+        } else {
+            return Err(format!("{} existe y no es una carpeta", tmp.display()));
+        }
     }
     fs::create_dir_all(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
 
     write_file(&tmp.join("pack.mcmeta"), pack_meta_json(version).as_bytes())?;
     write_file(&tmp.join("pack.png"), png)?;
 
-    let entity = tmp.join("assets").join("minecraft").join("textures").join("entity");
+    let entity = tmp
+        .join("assets")
+        .join("minecraft")
+        .join("textures")
+        .join("entity");
     for name in PLAYER_SKINS {
-        write_file(&entity.join("player").join("wide").join(format!("{name}.png")), png)?;
-        write_file(&entity.join("player").join("slim").join(format!("{name}.png")), png)?;
+        write_file(
+            &entity
+                .join("player")
+                .join("wide")
+                .join(format!("{name}.png")),
+            png,
+        )?;
+        write_file(
+            &entity
+                .join("player")
+                .join("slim")
+                .join(format!("{name}.png")),
+            png,
+        )?;
     }
     // Versiones viejas (< 1.19.4) solo conocen estas dos.
     write_file(&entity.join("steve.png"), png)?;
     write_file(&entity.join("alex.png"), png)?;
 
     let had_old = target.exists();
+    if had_old && crate::paths::is_reparse_point(&target) {
+        return Err(format!(
+            "{} no puede ser un junction ni un symlink",
+            target.display()
+        ));
+    }
     if backup.exists() {
-        let _ = fs::remove_dir_all(&backup);
+        if backup.is_dir() {
+            let _ = crate::paths::safe_remove_dir_all(&backup);
+        } else {
+            let _ = fs::remove_file(&backup);
+        }
     }
     if had_old {
         fs::rename(&target, &backup).map_err(|e| {
@@ -411,6 +446,14 @@ pub fn apply_skin(mc: &Path, png: &[u8], model: &str, version: Option<&str>) -> 
     let current = read_options(&options_path)?;
     let next = edit_resource_packs(&current, true)?;
 
+    let packs = mc.join("resourcepacks");
+    if crate::paths::is_reparse_point(&packs) {
+        return Err(format!(
+            "{} no puede ser un junction ni un symlink",
+            packs.display()
+        ));
+    }
+
     write_pack(mc, png, version)?;
 
     if next != current {
@@ -432,10 +475,26 @@ pub fn remove_skin(mc: &Path) -> Result<(), String> {
     }
 
     let packs = mc.join("resourcepacks");
+    if crate::paths::is_reparse_point(&packs) {
+        return Err(format!(
+            "{} no puede ser un junction ni un symlink",
+            packs.display()
+        ));
+    }
     for name in [PACK_NAME, "ObsidiaSkin.tmp", "ObsidiaSkin.old"] {
         let path = packs.join(name);
         if path.exists() {
-            fs::remove_dir_all(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            if crate::paths::is_reparse_point(&path) {
+                return Err(format!(
+                    "{} no puede ser un junction ni un symlink",
+                    path.display()
+                ));
+            }
+            if path.is_dir() {
+                crate::paths::safe_remove_dir_all(&path)?;
+            } else {
+                fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            }
         }
     }
     Ok(())
@@ -523,9 +582,12 @@ mod tests {
     #[test]
     fn packs_con_otros_al_final() {
         // La última entrada de options.txt es la de mayor prioridad.
-        let options = "resourcePacks:[\"file/MiPack.zip\",\"vanilla\"]\nincompatibleResourcePacks:[]\n";
+        let options =
+            "resourcePacks:[\"file/MiPack.zip\",\"vanilla\"]\nincompatibleResourcePacks:[]\n";
         let out = edit_resource_packs(options, true).unwrap();
-        assert!(out.contains("resourcePacks:[\"file/MiPack.zip\",\"vanilla\",\"file/ObsidiaSkin\"]"));
+        assert!(
+            out.contains("resourcePacks:[\"file/MiPack.zip\",\"vanilla\",\"file/ObsidiaSkin\"]")
+        );
         assert!(out.contains("incompatibleResourcePacks:[]"));
     }
 
@@ -539,9 +601,13 @@ mod tests {
 
     #[test]
     fn packs_quitar() {
-        let options = "resourcePacks:[\"vanilla\",\"file/ObsidiaSkin\"]\nincompatibleResourcePacks:[]\n";
+        let options =
+            "resourcePacks:[\"vanilla\",\"file/ObsidiaSkin\"]\nincompatibleResourcePacks:[]\n";
         let out = edit_resource_packs(options, false).unwrap();
-        assert_eq!(out, "resourcePacks:[\"vanilla\"]\nincompatibleResourcePacks:[]\n");
+        assert_eq!(
+            out,
+            "resourcePacks:[\"vanilla\"]\nincompatibleResourcePacks:[]\n"
+        );
     }
 
     #[test]
@@ -605,7 +671,10 @@ mod tests {
         write_options(&path, "nuevo\n").unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "nuevo\n");
-        assert_eq!(fs::read_to_string(mc.join("options.txt.bak")).unwrap(), "viejo\n");
+        assert_eq!(
+            fs::read_to_string(mc.join("options.txt.bak")).unwrap(),
+            "viejo\n"
+        );
         assert!(!mc.join("options.txt.tmp").exists());
         let _ = fs::remove_dir_all(&mc);
     }
@@ -655,8 +724,14 @@ mod tests {
         let backup = mc.join("options.txt.bak");
         fs::write(&backup, "fov:0.5\nkey_key.jump:space\n").unwrap();
 
-        assert_eq!(read_options(&path).unwrap(), "fov:0.5\nkey_key.jump:space\n");
-        assert_eq!(read_options(&path).unwrap(), "fov:0.5\nkey_key.jump:space\n");
+        assert_eq!(
+            read_options(&path).unwrap(),
+            "fov:0.5\nkey_key.jump:space\n"
+        );
+        assert_eq!(
+            read_options(&path).unwrap(),
+            "fov:0.5\nkey_key.jump:space\n"
+        );
         assert!(!backup.exists());
 
         let _ = fs::remove_dir_all(&mc);
@@ -798,8 +873,14 @@ mod tests {
         );
         let pack = mc.join("resourcepacks").join(PACK_NAME);
         assert!(pack.join("pack.mcmeta").is_file());
-        assert!(pack.join("assets/minecraft/textures/entity/player/wide/steve.png").is_file());
-        assert!(pack.join("assets/minecraft/textures/entity/player/slim/alex.png").is_file());
+        assert!(
+            pack.join("assets/minecraft/textures/entity/player/wide/steve.png")
+                .is_file()
+        );
+        assert!(
+            pack.join("assets/minecraft/textures/entity/player/slim/alex.png")
+                .is_file()
+        );
         assert!(!mc.join("resourcepacks").join("ObsidiaSkin.tmp").exists());
 
         let _ = fs::remove_dir_all(&mc);
@@ -826,7 +907,10 @@ mod tests {
         fs::write(mc.join("options.txt"), original).unwrap();
 
         assert!(apply_skin(&mc, &png(64, 64), "classic", None).is_err());
-        assert_eq!(fs::read_to_string(mc.join("options.txt")).unwrap(), original);
+        assert_eq!(
+            fs::read_to_string(mc.join("options.txt")).unwrap(),
+            original
+        );
         assert!(!mc.join("resourcepacks").join(PACK_NAME).exists());
 
         let _ = fs::remove_dir_all(&mc);
