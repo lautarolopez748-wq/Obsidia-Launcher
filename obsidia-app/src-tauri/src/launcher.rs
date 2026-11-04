@@ -13,8 +13,8 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
@@ -28,8 +28,7 @@ const LIB_BASE: &str = "https://libraries.minecraft.net";
 const DOWNLOAD_THREADS: usize = 8;
 /// Margen corto para detectar un Java que falla al arrancar antes de informar éxito.
 const STARTUP_GRACE: Duration = Duration::from_secs(2);
-const RUNTIME_ALL: &str =
-    "https://launchermeta.mojang.com/v1/products/java-runtime/2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json";
+const RUNTIME_ALL: &str = "https://launchermeta.mojang.com/v1/products/java-runtime/2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json";
 
 const CP_SEP: &str = if cfg!(windows) { ";" } else { ":" };
 
@@ -59,7 +58,14 @@ pub fn offline_uuid(name: &str) -> String {
     h[6] = (h[6] & 0x0f) | 0x30;
     h[8] = (h[8] & 0x3f) | 0x80;
     let hex: String = h.iter().map(|b| format!("{b:02x}")).collect();
-    format!("{}-{}-{}-{}-{}", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32])
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 pub fn offline_player(name: &str) -> Result<Player, String> {
@@ -98,7 +104,9 @@ struct CloseInfo {
 fn log_tail(path: &Path) -> String {
     const MAX_BYTES: u64 = 12_000;
     const MAX_LINES: usize = 20;
-    let Ok(mut file) = fs::File::open(path) else { return String::new() };
+    let Ok(mut file) = fs::File::open(path) else {
+        return String::new();
+    };
     let size = file.metadata().map(|m| m.len()).unwrap_or(0);
     let _ = file.seek(SeekFrom::Start(size.saturating_sub(MAX_BYTES)));
     let mut bytes = Vec::new();
@@ -125,7 +133,9 @@ fn startup_error(status: ExitStatus, log_path: &Path) -> String {
         .unwrap_or_default();
     let log = log_tail(log_path);
     if log.is_empty() {
-        format!("Minecraft se cerró inesperadamente durante el arranque{code}. No hay salida en el log.")
+        format!(
+            "Minecraft se cerró inesperadamente durante el arranque{code}. No hay salida en el log."
+        )
     } else {
         format!("Minecraft se cerró inesperadamente durante el arranque{code}.\n\n{log}")
     }
@@ -156,7 +166,9 @@ struct Job {
 }
 
 fn is_up_to_date(job: &Job) -> bool {
-    let Ok(meta) = fs::metadata(&job.dest) else { return false };
+    let Ok(meta) = fs::metadata(&job.dest) else {
+        return false;
+    };
     if meta.len() == 0 {
         return false;
     }
@@ -195,10 +207,11 @@ fn download(c: &reqwest::blocking::Client, job: &Job) -> Result<(), String> {
         match res {
             Ok(bytes) => {
                 if let Some(expected) = &job.sha1
-                    && !sha1_hex(&bytes).eq_ignore_ascii_case(expected) {
-                        last = format!("SHA1 incorrecto al descargar {}", job.url);
-                        continue;
-                    }
+                    && !sha1_hex(&bytes).eq_ignore_ascii_case(expected)
+                {
+                    last = format!("SHA1 incorrecto al descargar {}", job.url);
+                    continue;
+                }
                 // Se escribe a un .part y se renombra: nunca queda un archivo a medias.
                 let mut tmp = job.dest.clone().into_os_string();
                 tmp.push(".part");
@@ -209,7 +222,8 @@ fn download(c: &reqwest::blocking::Client, job: &Job) -> Result<(), String> {
                 let backup = job.dest.with_extension("old");
                 if job.dest.exists() {
                     let _ = fs::remove_file(&backup);
-                    fs::rename(&job.dest, &backup).map_err(|e| format!("{}: {e}", job.dest.display()))?;
+                    fs::rename(&job.dest, &backup)
+                        .map_err(|e| format!("{}: {e}", job.dest.display()))?;
                 }
                 if let Err(e) = fs::rename(&tmp, &job.dest) {
                     // Restaurar el original si el reemplazo falla.
@@ -237,7 +251,11 @@ fn get_json(c: &reqwest::blocking::Client, url: &str) -> Result<Value, String> {
 }
 
 /// Descarga en paralelo. Llama a `on_progress(hechos, total)` a medida que avanza.
-fn download_all<F>(c: &reqwest::blocking::Client, jobs: Vec<Job>, on_progress: F) -> Result<(), String>
+fn download_all<F>(
+    c: &reqwest::blocking::Client,
+    jobs: Vec<Job>,
+    on_progress: F,
+) -> Result<(), String>
 where
     F: Fn(usize, usize) + Sync,
 {
@@ -252,15 +270,17 @@ where
 
     thread::scope(|s| {
         for _ in 0..workers {
-            s.spawn(|| loop {
-                let next = queue.lock().unwrap().next();
-                let Some(job) = next else { break };
-                if let Err(e) = download(c, &job) {
-                    errors.lock().unwrap().push(e);
-                }
-                let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                if n.is_multiple_of(25) || n == total {
-                    on_progress(n, total);
+            s.spawn(|| {
+                loop {
+                    let next = queue.lock().unwrap().next();
+                    let Some(job) = next else { break };
+                    if let Err(e) = download(c, &job) {
+                        errors.lock().unwrap().push(e);
+                    }
+                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n.is_multiple_of(25) || n == total {
+                        on_progress(n, total);
+                    }
                 }
             });
         }
@@ -270,7 +290,11 @@ where
     if errs.is_empty() {
         Ok(())
     } else {
-        Err(format!("Fallaron {} descargas. La primera: {}", errs.len(), errs[0]))
+        Err(format!(
+            "Fallaron {} descargas. La primera: {}",
+            errs.len(),
+            errs[0]
+        ))
     }
 }
 
@@ -299,7 +323,9 @@ fn arch_name() -> &'static str {
 /// Sin reglas = permitido. Con reglas gana la última que aplique.
 /// No activamos ninguna "feature" (demo, resolución propia, quick play…).
 fn rules_allow(rules: Option<&Value>) -> bool {
-    let Some(arr) = rules.and_then(|r| r.as_array()) else { return true };
+    let Some(arr) = rules.and_then(|r| r.as_array()) else {
+        return true;
+    };
     if arr.is_empty() {
         return true;
     }
@@ -307,18 +333,21 @@ fn rules_allow(rules: Option<&Value>) -> bool {
     for r in arr {
         if let Some(os) = r.get("os") {
             if let Some(n) = os.get("name").and_then(Value::as_str)
-                && n != os_name() {
-                    continue;
-                }
-            if let Some(a) = os.get("arch").and_then(Value::as_str)
-                && a != arch_name() {
-                    continue;
-                }
-        }
-        if let Some(f) = r.get("features").and_then(Value::as_object)
-            && f.values().any(|v| v.as_bool() == Some(true)) {
+                && n != os_name()
+            {
                 continue;
             }
+            if let Some(a) = os.get("arch").and_then(Value::as_str)
+                && a != arch_name()
+            {
+                continue;
+            }
+        }
+        if let Some(f) = r.get("features").and_then(Value::as_object)
+            && f.values().any(|v| v.as_bool() == Some(true))
+        {
+            continue;
+        }
         allowed = r.get("action").and_then(Value::as_str) != Some("disallow");
     }
     allowed
@@ -354,15 +383,29 @@ fn merge_parent(child: &mut Value, parent: &Value) {
 
     // Argumentos: primero los del padre, después los del hijo.
     for key in ["game", "jvm"] {
-        let mut list = parent["arguments"][key].as_array().cloned().unwrap_or_default();
-        list.extend(child["arguments"][key].as_array().cloned().unwrap_or_default());
+        let mut list = parent["arguments"][key]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        list.extend(
+            child["arguments"][key]
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
+        );
         if !list.is_empty() {
             child["arguments"][key] = Value::Array(list);
         }
     }
 
     // Lo demás se hereda solo si el hijo no lo define.
-    for key in ["assetIndex", "assets", "downloads", "javaVersion", "minecraftArguments"] {
+    for key in [
+        "assetIndex",
+        "assets",
+        "downloads",
+        "javaVersion",
+        "minecraftArguments",
+    ] {
         if child[key].is_null() && !parent[key].is_null() {
             child[key] = parent[key].clone();
         }
@@ -387,7 +430,9 @@ fn load_version(
             .as_array()
             .and_then(|a| a.iter().find(|v| v["id"].as_str() == Some(id)))
             .ok_or_else(|| format!("La versión '{id}' no existe en el manifiesto de Mojang"))?;
-        let url = entry["url"].as_str().ok_or("El manifiesto no trae la URL de la versión")?;
+        let url = entry["url"]
+            .as_str()
+            .ok_or("El manifiesto no trae la URL de la versión")?;
         download(
             c,
             &Job {
@@ -418,11 +463,7 @@ fn expand(arg: &str, vars: &HashMap<&'static str, String>) -> Option<String> {
         s = s.replace(&format!("${{{k}}}"), v);
     }
     // Si quedó un ${...} sin resolver, el argumento se descarta.
-    if s.contains("${") {
-        None
-    } else {
-        Some(s)
-    }
+    if s.contains("${") { None } else { Some(s) }
 }
 
 fn collect_args(list: &Value, vars: &HashMap<&'static str, String>, out: &mut Vec<String>) {
@@ -512,8 +553,14 @@ fn ensure_runtime(
     component: &str,
 ) -> Result<Option<String>, String> {
     // Igual que el launcher oficial: runtime/<componente>/<plataforma>/<componente>/bin/java(.exe).
-    let Some(platform) = runtime_platform() else { return Ok(None) };
-    if component.is_empty() || !component.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_') {
+    let Some(platform) = runtime_platform() else {
+        return Ok(None);
+    };
+    if component.is_empty()
+        || !component
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
         return Err(format!("Nombre de runtime inválido: {component}"));
     }
     let base = mc.join("runtime").join(component).join(platform);
@@ -540,7 +587,11 @@ fn ensure_runtime(
     if let Some(files) = manifest["files"].as_object() {
         for (rel, f) in files {
             // Rutas del servidor: se rechazan las absolutas o con "..".
-            if rel.is_empty() || rel.contains('\\') || rel.contains(':') || rel.split('/').any(|p| p.is_empty() || p == "..") {
+            if rel.is_empty()
+                || rel.contains('\\')
+                || rel.contains(':')
+                || rel.split('/').any(|p| p.is_empty() || p == "..")
+            {
                 continue;
             }
             match f["type"].as_str() {
@@ -549,7 +600,9 @@ fn ensure_runtime(
                 }
                 Some("file") => {
                     let raw = &f["downloads"]["raw"];
-                    let Some(u) = raw["url"].as_str() else { continue };
+                    let Some(u) = raw["url"].as_str() else {
+                        continue;
+                    };
                     jobs.push(Job {
                         url: u.to_string(),
                         dest: root.join(rel),
@@ -574,12 +627,13 @@ fn ensure_runtime(
 /// Comprueba que el Java elegido alcance la versión mayor que pide Minecraft.
 fn ensure_java_level(java: String, required: Option<u32>) -> Result<String, String> {
     if let (Some(req), Some(have)) = (required, java_major(&java))
-        && have < req {
-            return Err(format!(
-                "Esta versión necesita Java {req} o superior y '{java}' es Java {have}. \
+        && have < req
+    {
+        return Err(format!(
+            "Esta versión necesita Java {req} o superior y '{java}' es Java {have}. \
                  Elegí otro Java en Ajustes."
-            ));
-        }
+        ));
+    }
     Ok(java)
 }
 
@@ -636,22 +690,30 @@ pub fn java_for_version(
 
 fn extract_natives(jar: &Path, dest: &Path) -> Result<(), String> {
     let f = fs::File::open(jar).map_err(|e| format!("{}: {e}", jar.display()))?;
-    let mut zip = zip::ZipArchive::new(f).map_err(|e| format!("{} no es un jar válido: {e}", jar.display()))?;
+    let mut zip = zip::ZipArchive::new(f)
+        .map_err(|e| format!("{} no es un jar válido: {e}", jar.display()))?;
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
         let name = entry.name().to_string();
         let lower = name.to_lowercase();
-        let is_native = lower.ends_with(".dll") || lower.ends_with(".so") || lower.ends_with(".dylib");
+        let is_native =
+            lower.ends_with(".dll") || lower.ends_with(".so") || lower.ends_with(".dylib");
         if entry.is_dir() || name.starts_with("META-INF") || !is_native {
             continue;
         }
         // Solo el nombre del archivo: evita rutas con ".." dentro del zip.
-        let Some(file_name) = Path::new(&name).file_name() else { continue };
+        let Some(file_name) = Path::new(&name).file_name() else {
+            continue;
+        };
         let target = dest.join(file_name);
-        if fs::metadata(&target).map(|m| m.len() == entry.size()).unwrap_or(false) {
+        if fs::metadata(&target)
+            .map(|m| m.len() == entry.size())
+            .unwrap_or(false)
+        {
             continue; // ya está extraída
         }
-        let mut out = fs::File::create(&target).map_err(|e| format!("{}: {e}", target.display()))?;
+        let mut out =
+            fs::File::create(&target).map_err(|e| format!("{}: {e}", target.display()))?;
         std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -689,7 +751,9 @@ fn split_server(server: &str) -> Result<(String, u16), String> {
     {
         return Err(format!("Dirección de servidor inválida: {server}"));
     }
-    let port: u16 = port.parse().map_err(|_| format!("Puerto inválido: {port}"))?;
+    let port: u16 = port
+        .parse()
+        .map_err(|_| format!("Puerto inválido: {port}"))?;
     if port == 0 {
         return Err("Puerto inválido: 0".to_string());
     }
@@ -702,7 +766,10 @@ fn supports_quick_play(version: &str) -> bool {
     let Some(major) = parts.next().and_then(|p| p.parse::<u32>().ok()) else {
         return true; // snapshot o versión rara: asumimos moderna
     };
-    let minor = parts.next().and_then(|p| p.parse::<u32>().ok()).unwrap_or(0);
+    let minor = parts
+        .next()
+        .and_then(|p| p.parse::<u32>().ok())
+        .unwrap_or(0);
     (major, minor) >= (1, 20)
 }
 
@@ -752,7 +819,12 @@ pub fn launch(
     // Se llama solo si falla el runtime de Mojang: buscar Javas instalados lanza `java -version`.
     fallback_java: impl FnOnce(Option<u32>) -> Option<String>,
 ) -> Result<String, String> {
-    let LaunchOptions { ram, java_path, server, fullscreen } = opts;
+    let LaunchOptions {
+        ram,
+        java_path,
+        server,
+        fullscreen,
+    } = opts;
     let c = client()?;
     fs::create_dir_all(game_dir).map_err(|e| format!("{}: {e}", game_dir.display()))?;
 
@@ -796,31 +868,36 @@ pub fn launch(
         if classifier_in_name.ends_with("-x86") && arch_name() != "x86" {
             continue;
         }
-        let base = lib["url"].as_str().unwrap_or(LIB_BASE).trim_end_matches('/').to_string();
+        let base = lib["url"]
+            .as_str()
+            .unwrap_or(LIB_BASE)
+            .trim_end_matches('/')
+            .to_string();
 
         // Natives "viejas": un clasificador aparte que se extrae (no va al classpath).
         if let Some(map) = lib["natives"].as_object()
-            && let Some(cl) = map.get(os_name()).and_then(Value::as_str) {
-                let cl = cl.replace("${arch}", if arch_name() == "x86" { "32" } else { "64" });
-                let art = &lib["downloads"]["classifiers"][cl.as_str()];
-                let rel = art["path"]
-                    .as_str()
-                    .map(String::from)
-                    .unwrap_or_else(|| maven_path(&format!("{name}:{cl}")));
-                let dest = libs_dir.join(&rel);
-                if !native_jars.contains(&dest) {
-                    jobs.push(Job {
-                        url: art["url"]
-                            .as_str()
-                            .map(String::from)
-                            .unwrap_or_else(|| format!("{base}/{rel}")),
-                        dest: dest.clone(),
-                        sha1: art["sha1"].as_str().map(String::from),
-                        size: art["size"].as_u64(),
-                    });
-                    native_jars.push(dest);
-                }
+            && let Some(cl) = map.get(os_name()).and_then(Value::as_str)
+        {
+            let cl = cl.replace("${arch}", if arch_name() == "x86" { "32" } else { "64" });
+            let art = &lib["downloads"]["classifiers"][cl.as_str()];
+            let rel = art["path"]
+                .as_str()
+                .map(String::from)
+                .unwrap_or_else(|| maven_path(&format!("{name}:{cl}")));
+            let dest = libs_dir.join(&rel);
+            if !native_jars.contains(&dest) {
+                jobs.push(Job {
+                    url: art["url"]
+                        .as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| format!("{base}/{rel}")),
+                    dest: dest.clone(),
+                    sha1: art["sha1"].as_str().map(String::from),
+                    size: art["size"].as_u64(),
+                });
+                native_jars.push(dest);
             }
+        }
 
         // Jar principal.
         let art = &lib["downloads"]["artifact"];
@@ -857,7 +934,10 @@ pub fn launch(
     }
 
     // Jar del cliente (el de la versión raíz).
-    let client_jar = mc.join("versions").join(&root_id).join(format!("{root_id}.jar"));
+    let client_jar = mc
+        .join("versions")
+        .join(&root_id)
+        .join(format!("{root_id}.jar"));
     let dl_client = &v["downloads"]["client"];
     if let Some(url) = dl_client["url"].as_str() {
         jobs.push(Job {
@@ -880,7 +960,12 @@ pub fn launch(
         return Err(format!(
             "Faltan {} archivos y no se pueden descargar (¿Forge/Fabric sin instalar?):\n  {}",
             missing.len(),
-            missing.iter().take(8).cloned().collect::<Vec<_>>().join("\n  ")
+            missing
+                .iter()
+                .take(8)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n  ")
         ));
     }
 
@@ -908,7 +993,9 @@ pub fn launch(
     let mut hashes: HashSet<String> = HashSet::new();
     if let Some(objs) = idx["objects"].as_object() {
         for o in objs.values() {
-            let Some(h) = o["hash"].as_str() else { continue };
+            let Some(h) = o["hash"].as_str() else {
+                continue;
+            };
             if h.len() < 2 || !hashes.insert(h.to_string()) {
                 continue;
             }
@@ -934,7 +1021,11 @@ pub fn launch(
     fn s(p: &Path) -> String {
         p.to_string_lossy().to_string()
     }
-    let cp_string = classpath.iter().map(|p| s(p.as_path())).collect::<Vec<_>>().join(CP_SEP);
+    let cp_string = classpath
+        .iter()
+        .map(|p| s(p.as_path()))
+        .collect::<Vec<_>>()
+        .join(CP_SEP);
 
     let mut vars: HashMap<&'static str, String> = HashMap::new();
     vars.insert("auth_player_name", player.name.clone());
@@ -946,10 +1037,16 @@ pub fn launch(
     vars.insert("clientid", String::new());
     vars.insert("auth_xuid", String::new());
     vars.insert("version_name", version.to_string());
-    vars.insert("version_type", v["type"].as_str().unwrap_or("release").to_string());
+    vars.insert(
+        "version_type",
+        v["type"].as_str().unwrap_or("release").to_string(),
+    );
     vars.insert("game_directory", s(game_dir));
     vars.insert("assets_root", s(&assets_root));
-    vars.insert("game_assets", s(&assets_root.join("virtual").join("legacy")));
+    vars.insert(
+        "game_assets",
+        s(&assets_root.join("virtual").join("legacy")),
+    );
     vars.insert("assets_index_name", asset_id);
     vars.insert("natives_directory", s(&natives_dir));
     vars.insert("library_directory", s(&libs_dir));
@@ -959,7 +1056,11 @@ pub fn launch(
     vars.insert("classpath", cp_string.clone());
 
     let mut args: Vec<String> = vec![format!("-Xmx{}", norm_ram(ram))];
-    if v["arguments"]["jvm"].as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+    if v["arguments"]["jvm"]
+        .as_array()
+        .map(|a| !a.is_empty())
+        .unwrap_or(false)
+    {
         collect_args(&v["arguments"]["jvm"], &vars, &mut args);
     } else {
         // Versiones viejas (≤1.12) no traen argumentos de JVM.
@@ -967,7 +1068,12 @@ pub fn launch(
         args.push("-cp".into());
         args.push(cp_string);
     }
-    args.push(v["mainClass"].as_str().ok_or("La versión no tiene mainClass")?.to_string());
+    args.push(
+        v["mainClass"]
+            .as_str()
+            .ok_or("La versión no tiene mainClass")?
+            .to_string(),
+    );
     if v["arguments"]["game"].is_array() {
         collect_args(&v["arguments"]["game"], &vars, &mut args);
     } else if let Some(legacy) = v["minecraftArguments"].as_str() {
@@ -980,12 +1086,29 @@ pub fn launch(
 
     // Pantalla completa por perfil: sincronizar options.txt.
     let options_path = game_dir.join("options.txt");
-    let mut lines: Vec<String> = if options_path.exists() { fs::read_to_string(&options_path).unwrap_or_default().lines().map(|l| l.to_string()).collect() } else { Vec::new() };
+    let mut lines: Vec<String> = if options_path.exists() {
+        fs::read_to_string(&options_path)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| l.to_string())
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut found = false;
-    for l in &mut lines { if l.starts_with("fullscreen:") { *l = format!("fullscreen:{}", fullscreen); found = true; } }
-    if !found { lines.push(format!("fullscreen:{}", fullscreen)); }
+    for l in &mut lines {
+        if l.starts_with("fullscreen:") {
+            *l = format!("fullscreen:{}", fullscreen);
+            found = true;
+        }
+    }
+    if !found {
+        lines.push(format!("fullscreen:{}", fullscreen));
+    }
     let _ = fs::write(&options_path, lines.join("\n") + "\n");
-    if fullscreen { args.push("--fullscreen".to_string()); }
+    if fullscreen {
+        args.push("--fullscreen".to_string());
+    }
 
     // Entrar directo al servidor elegido (si lo hay).
     if let Some(server) = server.as_deref().filter(|s| !s.trim().is_empty()) {
@@ -1084,7 +1207,10 @@ mod tests {
 
     #[test]
     fn uuid_offline_conocido() {
-        assert_eq!(offline_uuid("Notch"), "b50ad385-829d-3141-a216-7e7d7539ba7f");
+        assert_eq!(
+            offline_uuid("Notch"),
+            "b50ad385-829d-3141-a216-7e7d7539ba7f"
+        );
     }
 
     #[test]
@@ -1113,11 +1239,21 @@ mod tests {
 
     #[test]
     fn reglas() {
-        let otro = if os_name() == "windows" { "osx" } else { "windows" };
+        let otro = if os_name() == "windows" {
+            "osx"
+        } else {
+            "windows"
+        };
         assert!(rules_allow(None));
-        assert!(rules_allow(Some(&json!([{"action":"allow","os":{"name":os_name()}}]))));
-        assert!(!rules_allow(Some(&json!([{"action":"allow","os":{"name":otro}}]))));
-        assert!(!rules_allow(Some(&json!([{"action":"allow","features":{"is_demo_user":true}}]))));
+        assert!(rules_allow(Some(
+            &json!([{"action":"allow","os":{"name":os_name()}}])
+        )));
+        assert!(!rules_allow(Some(
+            &json!([{"action":"allow","os":{"name":otro}}])
+        )));
+        assert!(!rules_allow(Some(
+            &json!([{"action":"allow","features":{"is_demo_user":true}}])
+        )));
         assert!(rules_allow(Some(&json!([
             {"action":"allow"},
             {"action":"disallow","os":{"name":otro}}

@@ -71,14 +71,16 @@ fn mc_dir() -> PathBuf {
 
 pub fn client_id() -> String {
     if let Ok(v) = std::env::var("OBSIDIA_MS_CLIENT_ID")
-        && !v.trim().is_empty() {
-            return v.trim().to_string();
-        }
+        && !v.trim().is_empty()
+    {
+        return v.trim().to_string();
+    }
     let path = mc_dir().join("obsidia").join("ms_client_id.txt");
     if let Ok(v) = fs::read_to_string(&path)
-        && !v.trim().is_empty() {
-            return v.trim().to_string();
-        }
+        && !v.trim().is_empty()
+    {
+        return v.trim().to_string();
+    }
     DEFAULT_CLIENT_ID.to_string()
 }
 
@@ -167,14 +169,25 @@ pub async fn request_device_code() -> Result<DeviceCode, String> {
         ));
     }
     Ok(DeviceCode {
-        device_code: json.get("device_code").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        user_code: json.get("user_code").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        device_code: json
+            .get("device_code")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        user_code: json
+            .get("user_code")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
         verification_uri: json
             .get("verification_uri")
             .and_then(|v| v.as_str())
             .unwrap_or("https://microsoft.com/link")
             .to_string(),
-        expires_in: json.get("expires_in").and_then(|v| v.as_u64()).unwrap_or(900),
+        expires_in: json
+            .get("expires_in")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(900),
         interval: json.get("interval").and_then(|v| v.as_u64()).unwrap_or(5),
     })
 }
@@ -290,7 +303,10 @@ async fn xbox_to_minecraft(ms_access: &str) -> Result<(String, u64), String> {
         .and_then(|v| v.as_str())
         .ok_or("Minecraft no devolvió access_token")?
         .to_string();
-    let expires_in = mc.get("expires_in").and_then(|v| v.as_u64()).unwrap_or(86_400);
+    let expires_in = mc
+        .get("expires_in")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(86_400);
     Ok((access, expires_in))
 }
 
@@ -306,8 +322,16 @@ async fn minecraft_profile(mc_access: &str) -> Result<MsProfile, String> {
     }
     let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
     Ok(MsProfile {
-        name: json.get("name").and_then(|v| v.as_str()).unwrap_or("Player").to_string(),
-        uuid: json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        name: json
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Player")
+            .to_string(),
+        uuid: json
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
     })
 }
 
@@ -326,7 +350,10 @@ pub async fn wait_for_login(device_code: &str) -> Result<MsProfile, String> {
             return Err("Login cancelado".to_string());
         }
         match token_request(&[
-            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code".to_string()),
+            (
+                "grant_type",
+                "urn:ietf:params:oauth:grant-type:device_code".to_string(),
+            ),
             ("client_id", client_id()),
             ("device_code", device_code.to_string()),
         ])
@@ -374,8 +401,8 @@ pub async fn wait_for_login(device_code: &str) -> Result<MsProfile, String> {
 
 /// Renueva el access token de Minecraft con el refresh token guardado.
 async fn refresh_session() -> Result<MsProfile, String> {
-    let refresh = read_refresh()?
-        .ok_or("No hay sesión de Microsoft guardada. Iniciá sesión de nuevo.")?;
+    let refresh =
+        read_refresh()?.ok_or("No hay sesión de Microsoft guardada. Iniciá sesión de nuevo.")?;
     let tokens = token_request(&[
         ("grant_type", "refresh_token".to_string()),
         ("client_id", client_id()),
@@ -410,9 +437,14 @@ async fn refresh_session() -> Result<MsProfile, String> {
 /// Perfil guardado, renovando el token si está vencido. `None` = modo offline.
 pub async fn current_profile() -> Result<Option<MsProfile>, String> {
     cleanup_legacy();
-    let Some(stored) = read_stored()? else { return Ok(None) };
+    let Some(stored) = read_stored()? else {
+        return Ok(None);
+    };
     if stored.expires_at > now() && read_refresh()?.is_some() {
-        return Ok(Some(MsProfile { name: stored.name, uuid: stored.uuid }));
+        return Ok(Some(MsProfile {
+            name: stored.name,
+            uuid: stored.uuid,
+        }));
     }
     match refresh_session().await {
         Ok(p) => Ok(Some(p)),
@@ -453,7 +485,10 @@ mod tests {
 
     #[test]
     fn perfil_se_serializa_sin_tokens() {
-        let p = MsProfile { name: "Lauti".into(), uuid: "abc".into() };
+        let p = MsProfile {
+            name: "Lauti".into(),
+            uuid: "abc".into(),
+        };
         let json = serde_json::to_string(&p).unwrap();
         assert_eq!(json, "{\"name\":\"Lauti\",\"uuid\":\"abc\"}");
         assert!(!json.contains("token"));
