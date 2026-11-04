@@ -9,17 +9,12 @@
 
 use base64::Engine;
 use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use crate::options;
 
 /// Nombre de la carpeta dentro de `resourcepacks`.
 const PACK_NAME: &str = "ObsidiaSkin";
-/// Entrada tal como la escribe Minecraft en `options.txt`.
-const PACK_ENTRY: &str = "file/ObsidiaSkin";
-/// Clave de los packs activos.
-const RESOURCE_PACKS_KEY: &str = "resourcePacks:";
-/// Clave de los packs marcados como incompatibles (Minecraft los ignora).
-const INCOMPATIBLE_KEY: &str = "incompatibleResourcePacks:";
 /// Texturas por defecto del jugador (1.19.4+ usa nueve skins base).
 const PLAYER_SKINS: [&str; 9] = [
     "steve", "alex", "ari", "efe", "kai", "makena", "noor", "sunny", "zuri",
@@ -118,221 +113,7 @@ pub fn pack_meta_json(version: Option<&str>) -> String {
     )
 }
 
-// ───────────────────────────── options.txt ─────────────────────────────────────
-
-/// Repara los restos de una escritura interrumpida de `options.txt`.
-///
-/// La aplicación nunca borra `options.txt`: si falta y existe un `.bak`, ese respaldo
-/// es el último contenido bueno y se restaura. Si existen los dos, el `.bak` es de una
-/// ejecución anterior y se archiva con un nombre único: nunca se pisa ni se borra.
-pub fn recover_orphan_backup(path: &Path) -> Result<(), String> {
-    let backup = with_suffix(path, ".bak");
-    if !backup.exists() {
-        return Ok(());
-    }
-    if path.exists() {
-        archive_backup(&backup)?;
-        return Ok(());
-    }
-    fs::rename(&backup, path).map_err(|e| {
-        format!(
-            "{}: {e}. Conservé el respaldo en {}",
-            path.display(),
-            backup.display()
-        )
-    })
-}
-
-/// Mueve un respaldo a `*.bak.N`, con el primer número libre. Nunca sobrescribe una
-/// copia anterior.
-fn archive_backup(backup: &Path) -> Result<PathBuf, String> {
-    for n in 1..=u32::MAX {
-        let candidate = with_suffix(backup, &format!(".{n}"));
-        if candidate.exists() {
-            continue;
-        }
-        fs::rename(backup, &candidate).map_err(|e| format!("{}: {e}", backup.display()))?;
-        return Ok(candidate);
-    }
-    Err(format!(
-        "{}: no encontré un nombre libre para archivarlo",
-        backup.display()
-    ))
-}
-
-/// Lee `options.txt` como texto.
-///
-/// Antes de leer recupera o archiva un `.bak` huérfano. Un archivo inexistente (sin
-/// respaldo) devuelve texto vacío: primera ejecución. Cualquier otro error (permisos,
-/// es un directorio, bytes que no son UTF-8) se propaga: el llamador NO debe
-/// sobrescribir el archivo en ese caso.
-pub fn read_options(path: &Path) -> Result<String, String> {
-    recover_orphan_backup(path)?;
-    match fs::read(path) {
-        Ok(bytes) => String::from_utf8(bytes)
-            .map_err(|_| format!("{}: no es texto UTF-8 válido", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(e) => Err(format!("{}: {e}", path.display())),
-    }
-}
-
-/// Último renglón que empieza con `key`. Si hay claves duplicadas, Minecraft se queda
-/// con la última, así que es la única que hay que leer y reescribir.
-pub fn find_pack_line<'a>(options: &'a str, key: &str) -> Option<&'a str> {
-    options
-        .split('\n')
-        .map(|l| l.trim_end_matches('\r'))
-        .rfind(|l| l.starts_with(key))
-}
-
-/// Extrae la lista de un renglón `clave:["a","b"]`.
-///
-/// Si el renglón existe pero el JSON no es válido devuelve error: nunca se toma como
-/// lista vacía, porque el siguiente guardado borraría los packs del jugador.
-pub fn parse_pack_list(line: &str) -> Result<Vec<String>, String> {
-    let (Some(start), Some(end)) = (line.find('['), line.rfind(']')) else {
-        return Err(format!("{line:?}: no tiene una lista de resource packs"));
-    };
-    if start >= end {
-        return Err(format!("{line:?}: no tiene una lista de resource packs"));
-    }
-    serde_json::from_str::<Vec<String>>(&line[start..=end])
-        .map_err(|e| format!("{line:?}: lista de resource packs inválida ({e})"))
-}
-
-/// Escribe el renglón `clave:[...]` con la lista exacta dada. Crea el renglón si falta.
-///
-/// Conserva el formato original: el mismo salto de línea (CRLF o LF) y la ausencia de
-/// salto final si el archivo no lo tenía. Si la clave está duplicada reescribe la
-/// última, que es la que Minecraft usa.
-pub fn set_pack_entries(options: &str, key: &str, packs: &[String]) -> Result<String, String> {
-    let eol = if options.contains("\r\n") {
-        "\r\n"
-    } else {
-        "\n"
-    };
-    let trailing = options.ends_with('\n');
-    let mut lines: Vec<String> = if options.is_empty() {
-        Vec::new()
-    } else {
-        options
-            .split('\n')
-            .map(|l| l.trim_end_matches('\r').to_string())
-            .collect()
-    };
-    if trailing {
-        lines.pop();
-    }
-    let new_line = format!(
-        "{key}{}",
-        serde_json::to_string(packs).map_err(|e| e.to_string())?
-    );
-    match lines.iter().rposition(|l| l.starts_with(key)) {
-        Some(i) => lines[i] = new_line,
-        None => lines.push(new_line),
-    }
-    let mut out = lines.join(eol);
-    if trailing {
-        out.push_str(eol);
-    }
-    Ok(out)
-}
-
-/// Reescribe un renglón `clave:[...]`: agrega la entrada al final (prioridad más alta)
-/// o la quita. No toca las demás líneas ni sus saltos de línea. Si el renglón no existe
-/// y hay que agregar, se crea al final.
-pub fn edit_pack_list(
-    options: &str,
-    key: &str,
-    entry: &str,
-    enabled: bool,
-) -> Result<String, String> {
-    let line = find_pack_line(options, key);
-    // Quitar algo de un renglón que no existe no debe crear el renglón.
-    if line.is_none() && !enabled {
-        return Ok(options.to_string());
-    }
-    let mut packs = match line {
-        Some(l) => parse_pack_list(l)?,
-        None => Vec::new(),
-    };
-    let before = packs.clone();
-    packs.retain(|p| p != entry);
-    if enabled {
-        packs.push(entry.to_string());
-    }
-    if packs == before {
-        return Ok(options.to_string());
-    }
-    set_pack_entries(options, key, &packs)
-}
-
-/// Activa/desactiva el pack y lo saca de `incompatibleResourcePacks`
-/// (Minecraft ignora un pack que figura como incompatible).
-pub fn edit_resource_packs(options: &str, enabled: bool) -> Result<String, String> {
-    let out = edit_pack_list(options, RESOURCE_PACKS_KEY, PACK_ENTRY, enabled)?;
-    edit_pack_list(&out, INCOMPATIBLE_KEY, PACK_ENTRY, false)
-}
-
-/// Escribe `options.txt` con un temporal en el mismo directorio y un respaldo `.bak`.
-///
-/// NO es atómico: son varios pasos (recuperar o archivar un `.bak` previo, crear y
-/// sincronizar el temporal, mover el original a `.bak`, mover el temporal a su lugar).
-/// Si el reemplazo falla se intenta restaurar el original; si la restauración también
-/// falla, el `.bak` se conserva para recuperarlo a mano.
-///
-/// Al terminar bien, el `.bak` queda con la versión anterior de `options.txt`. No se
-/// borra: una lectura o escritura posterior lo archiva como `*.bak.N` sin pisar copias
-/// anteriores.
-pub fn write_options(path: &Path, data: &str) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-    }
-    recover_orphan_backup(path)?;
-
-    let tmp = with_suffix(path, ".tmp");
-    let backup = with_suffix(path, ".bak");
-
-    {
-        let mut file = fs::File::create(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
-        file.write_all(data.as_bytes())
-            .map_err(|e| format!("{}: {e}", tmp.display()))?;
-        // El temporal tiene que estar completo antes de tocar el original.
-        file.sync_all()
-            .map_err(|e| format!("{}: {e}", tmp.display()))?;
-    }
-
-    let had_original = path.exists();
-    if had_original {
-        // La recuperación anterior dejó libre el nombre `.bak`.
-        if let Err(e) = fs::rename(path, &backup) {
-            let _ = fs::remove_file(&tmp);
-            return Err(format!("{}: {e}", path.display()));
-        }
-    }
-
-    if let Err(e) = fs::rename(&tmp, path) {
-        if had_original && backup.exists() && fs::rename(&backup, path).is_err() {
-            return Err(format!(
-                "{}: {e}. No pude restaurar el original; quedó el respaldo en {}",
-                path.display(),
-                backup.display()
-            ));
-        }
-        let _ = fs::remove_file(&tmp);
-        return Err(format!("{}: {e}", path.display()));
-    }
-
-    Ok(())
-}
-
-fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut s = path.as_os_str().to_os_string();
-    s.push(suffix);
-    PathBuf::from(s)
-}
-
-// ─────────────────────────────── Aplicar / quitar ──────────────────────────────
+// ───────────────────────────── Aplicar / quitar ──────────────────────────────
 
 fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
@@ -443,8 +224,8 @@ pub fn apply_skin(mc: &Path, png: &[u8], model: &str, version: Option<&str>) -> 
     normalize_model(model)?;
 
     let options_path = mc.join("options.txt");
-    let current = read_options(&options_path)?;
-    let next = edit_resource_packs(&current, true)?;
+    let current = options::read_options(&options_path)?;
+    let next = options::edit_resource_packs(&current, true)?;
 
     let packs = mc.join("resourcepacks");
     if crate::paths::is_reparse_point(&packs) {
@@ -457,7 +238,7 @@ pub fn apply_skin(mc: &Path, png: &[u8], model: &str, version: Option<&str>) -> 
     write_pack(mc, png, version)?;
 
     if next != current {
-        write_options(&options_path, &next)?;
+        options::write_options(&options_path, &next)?;
     }
     Ok(())
 }
@@ -468,10 +249,10 @@ pub fn apply_skin(mc: &Path, png: &[u8], model: &str, version: Option<&str>) -> 
 /// no se puede borrar, como mucho queda una carpeta sin usar.
 pub fn remove_skin(mc: &Path) -> Result<(), String> {
     let options_path = mc.join("options.txt");
-    let current = read_options(&options_path)?;
-    let next = edit_resource_packs(&current, false)?;
+    let current = options::read_options(&options_path)?;
+    let next = options::edit_resource_packs(&current, false)?;
     if next != current {
-        write_options(&options_path, &next)?;
+        options::write_options(&options_path, &next)?;
     }
 
     let packs = mc.join("resourcepacks");
@@ -505,6 +286,8 @@ pub fn remove_skin(mc: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::options::*;
+    use std::path::PathBuf;
 
     /// PNG sintético: solo firma + IHDR, suficiente para validar dimensiones.
     fn png(width: u32, height: u32) -> Vec<u8> {

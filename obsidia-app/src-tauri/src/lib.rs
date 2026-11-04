@@ -1,6 +1,7 @@
 mod auth;
 mod instances;
 mod launcher;
+mod options;
 mod packs;
 mod paths;
 mod skin;
@@ -668,6 +669,7 @@ fn detect_javas_in(paths: &Paths) -> Vec<JavaInfo> {
 async fn launch_version(
     app: tauri::AppHandle,
     paths: tauri::State<'_, Paths>,
+    running: tauri::State<'_, launcher::RunningInstances>,
     version: String,
     username: String,
     ram: Option<String>,
@@ -676,6 +678,16 @@ async fn launch_version(
     fullscreen: Option<bool>,
     instance: String,
 ) -> Result<String, String> {
+    // Clave de bloqueo: legacy comparte .minecraft, usar clave estable diferenciada.
+    let lock_key = if instance.eq_ignore_ascii_case("legacy") {
+        "legacy:.minecraft".to_string()
+    } else {
+        instance.clone()
+    };
+    if !running.reserve(&lock_key) {
+        return Err(format!("La instancia {} ya está en ejecución", instance));
+    }
+
     let paths = paths.inner().clone();
     let gd = paths.instance_dir(&instance)?;
     if let Ok(InstanceRef::Instance(_)) = InstanceRef::parse(&instance) {
@@ -692,19 +704,145 @@ async fn launch_version(
         server,
         fullscreen: fullscreen.unwrap_or(false),
     };
-    tauri::async_runtime::spawn_blocking(move || {
+    let app_for_spawn = app.clone();
+    let lock_key_spawn = lock_key.clone();
+    let lock_key_cleanup = lock_key.clone();
+    let lock_key_close = lock_key.clone();
+
+    let result = tauri::async_runtime::spawn_blocking(move || {
         launcher::launch(&app, &mc, &gd, &version, player, opts, |required| {
             fallback_java(&paths, required)
-        })
+        }, Some(instance.clone()), {
+            let app_for_close = app_for_spawn.clone();
+            let lock_for_close = lock_key_close;
+            Some(Box::new(move |pid: u32| {
+                if let Some(state) = app_for_close.try_state::<launcher::RunningInstances>() {
+                    state.release_if_matches(&lock_for_close, pid);
+                }
+            }))
+        }, Some(Box::new(move |pid: u32| {
+            if let Some(state) = app_for_spawn.try_state::<launcher::RunningInstances>() {
+                state.set_pid(&lock_key_spawn, pid);
+            }
+        })))
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // Si falló, quitar de running.
+    if result.is_err() {
+        running.release(&lock_key_cleanup);
+    }
+
+    result
+}
+
+#[tauri::command]
+async fn launch_instance(
+    app: tauri::AppHandle,
+    paths: tauri::State<'_, Paths>,
+    running: tauri::State<'_, launcher::RunningInstances>,
+    id: String,
+    server: Option<String>,
+    username: Option<String>,
+) -> Result<String, String> {
+    // Verificar que no haya un lanzamiento simultáneo de la misma instancia.
+    if !running.reserve(&id) {
+        return Err(format!("La instancia {} ya está en ejecución", id));
+    }
+
+    let result = launch_instance_inner(app.clone(), paths.clone(), id.clone(), server, username).await;
+
+    // Si falló, quitar de running.
+    if result.is_err() {
+        running.release(&id);
+    }
+
+    result
+}
+
+async fn launch_instance_inner(
+    app: tauri::AppHandle,
+    paths: tauri::State<'_, Paths>,
+    id: String,
+    server: Option<String>,
+    username_override: Option<String>,
+) -> Result<String, String> {
+    let paths = paths.inner().clone();
+    let instance_dir = paths.instance_dir(&id)?;
+    if let Ok(InstanceRef::Instance(_)) = InstanceRef::parse(&id) {
+        paths.ensure_saves_link(&instance_dir)?;
+    }
+
+    // Leer el perfil y resolver versión, RAM, Java y fullscreen del backend.
+    let profiles = read_json_list::<Profile>(&paths.profiles_file())?;
+    let profile = profiles
+        .iter()
+        .find(|p| p.id.as_deref() == Some(&id))
+        .ok_or_else(|| format!("No existe la instancia {}", id))?
+        .clone();
+
+    let version = profile.version.clone();
+    let ram = Some(profile.ram.clone());
+    let java_path = profile.java_path.clone();
+    let fullscreen = profile.fullscreen;
+    // Username vigente: si hay cuenta Microsoft, se usa el perfil MS (no se sobrescribe).
+    // Si no, el nick actual del frontend prevalece sobre el username guardado del perfil.
+    let username = match username_override {
+        Some(u) if !u.trim().is_empty() => u.trim().to_string(),
+        _ => {
+            if profile.username.is_empty() {
+                "Jugador".to_string()
+            } else {
+                profile.username.clone()
+            }
+        }
+    };
+
+    let player = match auth::player().await? {
+        Some(p) => p,
+        None => launcher::offline_player(&username)?,
+    };
+
+    let mc = paths.minecraft.clone();
+    let gd = instance_dir.clone();
+    let id_for_close = id.clone();
+    let app_for_close = app.clone();
+    let app_for_spawn = app.clone();
+    let on_spawn_id = id.clone();
+
+    let on_close: Box<dyn FnOnce(u32) + Send + 'static> = Box::new(move |pid: u32| {
+        if let Some(state) = app_for_close.try_state::<launcher::RunningInstances>() {
+            // Liberar solo si el PID coincide (o si la reserva era 0).
+            let _ = state.release_if_matches(&id_for_close, pid);
+        }
+    });
+
+    tauri::async_runtime::spawn_blocking(move || {
+        launcher::launch(
+            &app,
+            &mc,
+            &gd,
+            &version,
+            player,
+            launcher::LaunchOptions {
+                ram,
+                java_path,
+                server,
+                fullscreen,
+            },
+            |required| fallback_java(&paths, required),
+            Some(id.clone()),
+            Some(on_close),
+            Some(Box::new(move |pid: u32| {
+                if let Some(state) = app_for_spawn.try_state::<launcher::RunningInstances>() {
+                    state.set_pid(&on_spawn_id, pid);
+                }
+            })),
+        )
     })
     .await
     .map_err(|e| e.to_string())?
-}
-
-fn sha1_hex(bytes: &[u8]) -> String {
-    let mut h = Sha1::new();
-    h.update(bytes);
-    format!("{:x}", h.finalize())
 }
 
 /// Descarga un instalador y comprueba su SHA1 contra el archivo `<url>.sha1` que publica el
@@ -732,7 +870,7 @@ fn download_verified(url: &str, dest: &Path) -> Result<(), String> {
     }
 
     if let Ok(existing) = fs::read(dest)
-        && sha1_hex(&existing) == expected
+        && launcher::sha1_hex(&existing) == expected
     {
         return Ok(());
     }
@@ -743,7 +881,7 @@ fn download_verified(url: &str, dest: &Path) -> Result<(), String> {
         .and_then(|r| r.error_for_status())
         .and_then(|r| r.bytes())
         .map_err(|e| format!("{url}: {e}"))?;
-    if sha1_hex(&bytes) != expected {
+    if launcher::sha1_hex(&bytes) != expected {
         return Err(format!(
             "El instalador descargado de {url} no coincide con su SHA1: se descartó"
         ));
@@ -1723,6 +1861,7 @@ pub fn run() {
             migrate_instances(&paths)
                 .map_err(|e| Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error>)?;
             app.manage(paths);
+            app.manage(launcher::RunningInstances::default());
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
@@ -1741,6 +1880,7 @@ pub fn run() {
             delete_instance,
             detect_javas,
             launch_version,
+            launch_instance,
             install_fabric,
             install_forge,
             list_shaderpacks,
@@ -1953,7 +2093,7 @@ mod tests {
 
     #[test]
     fn sha1_conocido() {
-        assert_eq!(sha1_hex(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
+        assert_eq!(launcher::sha1_hex(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
     }
 
     #[test]

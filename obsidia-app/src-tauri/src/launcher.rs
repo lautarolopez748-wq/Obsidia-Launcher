@@ -19,7 +19,64 @@ use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
-use crate::new_cmd;
+use crate::options;
+
+/// Instancias en ejecución: id → pid.
+pub struct RunningInstances(pub Mutex<HashMap<String, u32>>);
+
+impl Default for RunningInstances {
+    fn default() -> Self {
+        Self(Mutex::new(HashMap::new()))
+    }
+}
+
+impl RunningInstances {
+    /// Intenta reservar una instancia. Devuelve `true` si la reserva se hizo,
+    /// `false` si ya estaba en ejecución.
+    pub fn reserve(&self, id: &str) -> bool {
+        let mut guard = self.0.lock().unwrap();
+        if guard.contains_key(id) {
+            return false;
+        }
+        guard.insert(id.to_string(), 0);
+        true
+    }
+
+    /// Registrar el PID real de una instancia ya reservada.
+    pub fn set_pid(&self, id: &str, pid: u32) {
+        if let Ok(mut guard) = self.0.lock()
+            && let Some(entry) = guard.get_mut(id)
+        {
+            *entry = pid;
+        }
+    }
+
+    /// Liberar la reserva de una instancia si el PID coincide.
+    /// Devuelve `true` si liberó, `false` si el PID era de otro proceso.
+    pub fn release_if_matches(&self, id: &str, pid: u32) -> bool {
+        if let Ok(mut guard) = self.0.lock()
+            && let Some(&existing) = guard.get(id)
+            && (existing == pid || existing == 0)
+        {
+            guard.remove(id);
+            return true;
+        }
+        false
+    }
+
+    /// Liberar la reserva incondicionalmente (para errores de lanzamiento).
+    pub fn release(&self, id: &str) {
+        if let Ok(mut guard) = self.0.lock() {
+            guard.remove(id);
+        }
+    }
+
+    /// Verificar si una instancia está en ejecución.
+    #[allow(dead_code)]
+    pub fn is_running(&self, id: &str) -> bool {
+        self.0.lock().unwrap().contains_key(id)
+    }
+}
 
 pub const UA: &str = "Obsidia/0.1 (+https://github.com/lautarolopez748-wq/Obsidia-Launcher)";
 const MANIFEST: &str = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
@@ -85,11 +142,20 @@ struct Progress {
     stage: &'static str,
     done: usize,
     total: usize,
+    instance: Option<String>,
 }
 
-/// Evento `launch-progress` → { stage, done, total }. Etapas: version, libraries, assets, starting.
-fn progress(app: &AppHandle, stage: &'static str, done: usize, total: usize) {
-    let _ = app.emit("launch-progress", Progress { stage, done, total });
+/// Evento `launch-progress` → { stage, done, total, instance }.
+fn progress(app: &AppHandle, stage: &'static str, done: usize, total: usize, instance: Option<&str>) {
+    let _ = app.emit(
+        "launch-progress",
+        Progress {
+            stage,
+            done,
+            total,
+            instance: instance.map(String::from),
+        },
+    );
 }
 
 /// Evento `minecraft-closed` → resultado del proceso y final del log.
@@ -98,6 +164,7 @@ struct CloseInfo {
     code: Option<i32>,
     success: bool,
     log: String,
+    instance: Option<String>,
 }
 
 /// Últimas líneas del log para mostrar un error útil sin volcar el archivo entero.
@@ -123,6 +190,7 @@ fn close_info(status: ExitStatus, log_path: &Path) -> CloseInfo {
         code: status.code(),
         success: status.success(),
         log: log_tail(log_path),
+        instance: None,
     }
 }
 
@@ -151,7 +219,7 @@ fn client() -> Result<reqwest::blocking::Client, String> {
         .map_err(|e| e.to_string())
 }
 
-fn sha1_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha1_hex(bytes: &[u8]) -> String {
     let mut h = Sha1::new();
     h.update(bytes);
     format!("{:x}", h.finalize())
@@ -514,7 +582,7 @@ fn norm_ram(r: Option<String>) -> String {
 
 /// Versión mayor de un Java ("1.8.0_402" → 8, "21.0.3" → 21).
 pub(crate) fn java_major(java: &str) -> Option<u32> {
-    let out = new_cmd(java).arg("-version").output().ok()?;
+    let out = crate::new_cmd(java).arg("-version").output().ok()?;
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stderr),
@@ -614,7 +682,7 @@ fn ensure_runtime(
             }
         }
     }
-    download_all(c, jobs, |d, t| progress(app, "java", d, t))?;
+    download_all(c, jobs, |d, t| progress(app, "java", d, t, None))?;
     let _ = fs::remove_file(&partial);
 
     if java.is_file() {
@@ -807,7 +875,31 @@ pub struct LaunchOptions {
     pub fullscreen: bool,
 }
 
-/// Prepara todo (descargas incluidas) y abre el juego. Bloqueante: llamarlo desde un hilo aparte.
+/// Comando final listo para ejecutar Minecraft.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildCommand {
+    pub java: String,
+    pub args: Vec<String>,
+    pub cwd: PathBuf,
+}
+
+/// Construye el comando de lanzamiento a partir del directorio de la instancia.
+///
+/// Es una función pura: no descarga ni ejecuta nada. Permite verificar que
+/// `--gameDir` y `cwd` correspondan al directorio de la instancia correcta.
+pub fn build_command(java: &str, args: Vec<String>, game_dir: &Path) -> BuildCommand {
+    let mut args = args;
+    // Asegurar que --gameDir apunte al directorio de la instancia.
+    if !args.iter().any(|a| a.starts_with("--gameDir")) {
+        args.push(format!("--gameDir {}", game_dir.display()));
+    }
+    BuildCommand {
+        java: java.to_string(),
+        args,
+        cwd: game_dir.to_path_buf(),
+    }
+}
+#[allow(clippy::too_many_arguments)]
 pub fn launch(
     app: &AppHandle,
     mc: &Path,
@@ -818,6 +910,12 @@ pub fn launch(
     opts: LaunchOptions,
     // Se llama solo si falla el runtime de Mojang: buscar Javas instalados lanza `java -version`.
     fallback_java: impl FnOnce(Option<u32>) -> Option<String>,
+    // ID de la instancia (para eventos y log).
+    instance_id: Option<String>,
+    // Callback que se ejecuta al terminar el proceso con el PID.
+    on_close: Option<Box<dyn FnOnce(u32) + Send + 'static>>,
+    // Callback que se ejecuta justo después de spawn() con el PID real.
+    on_spawn: Option<Box<dyn FnOnce(u32) + Send + 'static>>,
 ) -> Result<String, String> {
     let LaunchOptions {
         ram,
@@ -829,9 +927,9 @@ pub fn launch(
     fs::create_dir_all(game_dir).map_err(|e| format!("{}: {e}", game_dir.display()))?;
 
     // 1) Versión
-    progress(app, "version", 0, 1);
+    progress(app, "version", 0, 1, instance_id.as_deref());
     let (v, root_id) = load_version(&c, mc, version, 0)?;
-    progress(app, "version", 1, 1);
+    progress(app, "version", 1, 1, instance_id.as_deref());
 
     // 2) Java: se comprueba antes de bajar librerías o assets, para fallar rápido.
     // Prioridad: Java elegido por el usuario > runtime de Mojang de la versión > Java compatible.
@@ -949,7 +1047,7 @@ pub fn launch(
     }
     classpath.push(client_jar);
 
-    download_all(&c, jobs, |d, t| progress(app, "libraries", d, t))?;
+    download_all(&c, jobs, |d, t| progress(app, "libraries", d, t, instance_id.as_deref()))?;
 
     let missing: Vec<String> = classpath
         .iter()
@@ -1008,7 +1106,7 @@ pub fn launch(
             });
         }
     }
-    download_all(&c, asset_jobs, |d, t| progress(app, "assets", d, t))?;
+    download_all(&c, asset_jobs, |d, t| progress(app, "assets", d, t, instance_id.as_deref()))?;
 
     // 5) Natives
     for jar in &native_jars {
@@ -1084,28 +1182,13 @@ pub fn launch(
         }
     }
 
-    // Pantalla completa por perfil: sincronizar options.txt.
+    // Pantalla completa por instancia: sincronizar options.txt.
     let options_path = game_dir.join("options.txt");
-    let mut lines: Vec<String> = if options_path.exists() {
-        fs::read_to_string(&options_path)
-            .unwrap_or_default()
-            .lines()
-            .map(|l| l.to_string())
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let mut found = false;
-    for l in &mut lines {
-        if l.starts_with("fullscreen:") {
-            *l = format!("fullscreen:{}", fullscreen);
-            found = true;
-        }
+    let current = options::read_options(&options_path)?;
+    let next = options::set_entry(&current, "fullscreen:", if fullscreen { "true" } else { "false" });
+    if next != current {
+        options::write_options(&options_path, &next)?;
     }
-    if !found {
-        lines.push(format!("fullscreen:{}", fullscreen));
-    }
-    let _ = fs::write(&options_path, lines.join("\n") + "\n");
     if fullscreen {
         args.push("--fullscreen".to_string());
     }
@@ -1115,22 +1198,32 @@ pub fn launch(
         args.extend(server_args(server, &root_id)?);
     }
 
+    let cmd = build_command(&java, args, game_dir);
+
     // 7) Abrir el juego, con su salida en un log.
-    progress(app, "starting", 0, 1);
-    let log_dir = mc.join("obsidia").join("logs");
+    progress(app, "starting", 0, 1, instance_id.as_deref());
+    let log_dir = game_dir.join(".obsidia");
     fs::create_dir_all(&log_dir).map_err(|e| format!("{}: {e}", log_dir.display()))?;
-    let log_path = log_dir.join("latest.log");
+    let log_path = log_dir.join("launch.log");
     let log = fs::File::create(&log_path).map_err(|e| format!("{}: {e}", log_path.display()))?;
     let log_err = log.try_clone().map_err(|e| e.to_string())?;
 
-    let mut child = new_cmd(&java)
-        .args(&args)
-        .current_dir(game_dir)
+    let mut child = crate::new_cmd(&cmd.java)
+        .args(&cmd.args)
+        .current_dir(&cmd.cwd)
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err))
         .spawn()
         .map_err(|e| format!("No pude ejecutar Java ('{java}'): {e}"))?;
     let pid = child.id();
+
+    // Notificar PID real a RunningInstances.
+    if let Some(cb) = on_spawn {
+        cb(pid);
+    }
+
+    // Copy pid for the wait thread before moving child.
+    let pid_for_close = pid;
 
     // Un Java incompatible o un argumento inválido hace que el proceso muera enseguida.
     // Se comprueba un momento antes de informar que Minecraft inició.
@@ -1149,6 +1242,7 @@ pub fn launch(
 
     let app2 = app.clone();
     let log_path2 = log_path.clone();
+    let instance2 = instance_id.clone();
     std::thread::spawn(move || {
         let info = match child.wait() {
             Ok(status) => close_info(status, &log_path2),
@@ -1156,12 +1250,19 @@ pub fn launch(
                 code: None,
                 success: false,
                 log: format!("No pude esperar el proceso: {e}"),
+                instance: instance2.clone(),
             },
         };
+        let mut info = info;
+        info.instance = instance2;
         let _ = app2.emit("minecraft-closed", info);
+        if let Some(cb) = on_close {
+            cb(pid_for_close);
+        }
     });
 
-    progress(app, "starting", 1, 1);
+    let instance_for_progress = instance_id.clone();
+    progress(app, "starting", 1, 1, instance_for_progress.as_deref());
 
     Ok(format!(
         "Minecraft {version} iniciado como {} (pid {}). Log: {}",
@@ -1176,6 +1277,122 @@ pub fn launch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_command_game_dir_y_cwd() {
+        let gd1 = std::path::PathBuf::from("C:/inst/A");
+        let gd2 = std::path::PathBuf::from("C:/inst/B");
+        let c1 = build_command("java", vec!["--version".into()], &gd1);
+        let c2 = build_command("java", vec!["--version".into()], &gd2);
+        assert_eq!(c1.cwd, gd1);
+        assert_eq!(c2.cwd, gd2);
+        assert!(c1.args.iter().any(|a| a.contains("--gameDir") && a.contains("inst/A")));
+        assert!(c2.args.iter().any(|a| a.contains("--gameDir") && a.contains("inst/B")));
+        assert_ne!(c1, c2);
+    }
+
+    #[test]
+    fn running_instances_reserva_y_libera() {
+        // Lanzamiento Vanilla: reservas independientes.
+        let r = RunningInstances::default();
+        assert!(r.reserve("vanilla-1"));
+        assert!(!r.reserve("vanilla-1"));
+        assert!(r.is_running("vanilla-1"));
+        r.set_pid("vanilla-1", 1234);
+        // release_if_matches con PID correcto libera.
+        assert!(r.release_if_matches("vanilla-1", 1234));
+        assert!(!r.is_running("vanilla-1"));
+    }
+
+    #[test]
+    fn running_instances_pid_real_se_registra() {
+        let r = RunningInstances::default();
+        assert!(r.reserve("inst-fabric"));
+        r.set_pid("inst-fabric", 5678);
+        let guard = r.0.lock().unwrap();
+        assert_eq!(guard.get("inst-fabric"), Some(&5678));
+    }
+
+    #[test]
+    fn running_instances_no_libera_otro_pid() {
+        let r = RunningInstances::default();
+        assert!(r.reserve("inst-forge"));
+        r.set_pid("inst-forge", 9999);
+        // Intentar liberar con PID incorrecto no libera.
+        assert!(!r.release_if_matches("inst-forge", 1111));
+        assert!(r.is_running("inst-forge"));
+        // Con PID correcto sí libera.
+        assert!(r.release_if_matches("inst-forge", 9999));
+        assert!(!r.is_running("inst-forge"));
+    }
+
+    #[test]
+    fn running_instances_dos_instancias_simultaneas() {
+        let r = RunningInstances::default();
+        assert!(r.reserve("A"));
+        assert!(r.reserve("B"));
+        r.set_pid("A", 100);
+        r.set_pid("B", 200);
+        assert!(r.is_running("A"));
+        assert!(r.is_running("B"));
+        r.release_if_matches("A", 100);
+        assert!(!r.is_running("A"));
+        assert!(r.is_running("B"));
+    }
+
+    #[test]
+    fn running_instances_release_incondicional() {
+        // Simula error de lanzamiento sin PID real.
+        let r = RunningInstances::default();
+        assert!(r.reserve("inst-error"));
+        assert!(r.is_running("inst-error"));
+        r.release("inst-error");
+        assert!(!r.is_running("inst-error"));
+    }
+
+    #[test]
+    fn running_instances_legacy_diferenciado() {
+        // Legacy comparte .minecraft: clave diferenciada.
+        let r = RunningInstances::default();
+        assert!(r.reserve("legacy:.minecraft"));
+        assert!(!r.reserve("legacy:.minecraft"));
+        assert!(r.is_running("legacy:.minecraft"));
+        // Una instancia con ID no colisiona con legacy.
+        assert!(r.reserve("pabc123"));
+        assert!(r.is_running("pabc123"));
+        r.release("legacy:.minecraft");
+        assert!(!r.is_running("legacy:.minecraft"));
+        assert!(r.is_running("pabc123"));
+    }
+
+    #[test]
+    fn running_instances_mismo_id_bloquea_ambos_comandos() {
+        // launch_instance y launch_version comparten el mismo mapa.
+        // El mismo ID no puede reservarse dos veces sin importar el comando.
+        let r = RunningInstances::default();
+        assert!(r.reserve("inst-A"));
+        // Segundo intento (otro comando) bloqueado.
+        assert!(!r.reserve("inst-A"));
+        r.release("inst-A");
+        // Tras liberar, puede reservarse de nuevo.
+        assert!(r.reserve("inst-A"));
+    }
+
+    #[test]
+    fn running_instances_dos_instancias_independientes() {
+        let r = RunningInstances::default();
+        assert!(r.reserve("inst-1"));
+        assert!(r.reserve("inst-2"));
+        assert!(r.is_running("inst-1"));
+        assert!(r.is_running("inst-2"));
+        r.set_pid("inst-1", 1111);
+        r.set_pid("inst-2", 2222);
+        // Cierre de una libera solo la suya.
+        r.release_if_matches("inst-1", 1111);
+        assert!(!r.is_running("inst-1"));
+        assert!(r.is_running("inst-2"));
+    }
+
     use serde_json::json;
 
     #[test]
