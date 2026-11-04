@@ -420,12 +420,13 @@ let accHtml = '';
     return id;
   }
   // Aplica la skin elegida al resource pack del juego (solo modo offline).
-  async function applySkinToGame(silent){
+  async function applySkinToGame(silent, instance){
     if (S.ms){ if (!silent) toast('Con cuenta Microsoft se usa tu skin oficial: no se aplica el pack offline.', true); return false; }
     const url = S.skins[S.sk];
     if (!url) return false;
+    const instId = instance || inst();
     try {
-      await invoke('apply_offline_skin', { skinPngBase64:String(url), model:S.skmodel||'classic', mcVersion:(P[S.p]&&P[S.p].version)||null, instance:inst() });
+      await invoke('apply_offline_skin', { skinPngBase64:String(url), model:S.skmodel||'classic', mcVersion:(P[S.p]&&P[S.p].version)||null, instance:instId });
       if (!silent) toast('Skin aplicada al juego.');
       return true;
     } catch(e){ if (!silent) toast('No se pudo aplicar la skin: '+e, true); return false; }
@@ -435,11 +436,13 @@ let accHtml = '';
     const p = P[S.p];
     if (!p){ openNew(); return; }
     if (!validName(S.nick)){ toast('Tu nombre de jugador no es válido. Cambialo en Mi cuenta.', true); S.tab = 'account'; render(); return; }
+    const instanceId = inst();
     S.pg = 0; S.stage = 'version'; S.launchErr = ''; S.launchMsg = ''; render();
     let un = null;
     try {
       un = await listen('launch-progress', ev => {
-        const { stage, done, total } = ev.payload || {};
+        const { stage, done, total, instance } = ev.payload || {};
+        if (instance && instance !== instanceId) return;
         const r = STG[stage] || [0,99];
         S.stage = stage;
         S.pg = Math.min(99, Math.round(r[0] + (r[1]-r[0]) * (total > 0 ? done/total : 0)));
@@ -447,13 +450,20 @@ let accHtml = '';
       });
     } catch(e){ /* sin eventos: igual se lanza */ }
     try {
-      const id = await launchVersionId(p);
+      // Solo Vanilla con ID usa launch_instance.
+      const useNew = instanceId !== 'legacy' && (!p.loader || p.loader === 'Vanilla');
+     let loaderId = null;
+    if (!useNew) {
+      loaderId = await launchVersionId(p);
+    }
       // Volver a aplicar la skin elegida: si cambió el pack activo, igual queda puesta.
-      if (S.ms) invoke('remove_offline_skin', { instance:inst() }).catch(()=>{});
+      if (S.ms) invoke('remove_offline_skin', { instance:instanceId }).catch(()=>{});
       else if (S.skins[S.sk]) await applySkinToGame(true);
-      const msg = await invoke('launch_version', { version:id, username:S.nick, ram:p.ram+'G', javaPath:p.java||null, server:server||null, fullscreen:!!p.fullscreen, instance:inst() });
+       const msg = useNew
+         ? await invoke('launch_instance', { id:instanceId, server:server||null, username:S.ms ? null : S.nick })
+         : await invoke('launch_version', { version:loaderId, username:S.nick, ram:p.ram+'G', javaPath:p.java||null, server:server||null, fullscreen:!!p.fullscreen, instance:instanceId });
       S.pg = 100; S.launchMsg = msg; render();
-      listen('minecraft-closed', () => { S.pg = null; S.launchMsg = ''; render(); }).catch(()=>{});
+      const unlistenClosed = await listen('minecraft-closed', (ev) => { const payload = ev.payload || {}; if (payload.instance && payload.instance !== instanceId) return; S.pg = null; S.launchMsg = ''; render(); if (unlistenClosed) unlistenClosed(); });
     } catch(e){
       S.pg = null; S.launchErr = String(e); render();
     } finally { if (un) un(); }

@@ -7,7 +7,7 @@
 //! (`vanilla`, `fabric`, `quilt`, `neoforge`, `programmer_art`, `high_contrast`)
 //! y las entradas `file/` de packs ausentes se conservan tal cual.
 
-use crate::skin;
+use crate::options;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::fs;
@@ -49,11 +49,11 @@ pub fn list_names(mc: &Path) -> Vec<String> {
 
 /// Entradas crudas de la última línea `resourcePacks:` (con o sin prefijo `file/`).
 fn read_entries(mc: &Path) -> Result<Vec<String>, String> {
-    let content = skin::read_options(&options_path(mc))?;
-    let Some(line) = skin::find_pack_line(&content, KEY) else {
+    let content = options::read_options(&options_path(mc))?;
+    let Some(line) = options::find_pack_line(&content, KEY) else {
         return Ok(Vec::new());
     };
-    skin::parse_pack_list(line)
+    options::parse_pack_list(line)
 }
 
 /// Estado para la UI: primero los activos en orden de prioridad (el último de
@@ -148,10 +148,10 @@ pub fn save_state(mc: &Path, ui_order: Vec<String>) -> Result<(), String> {
     let wanted_options: Vec<String> = wanted.into_iter().rev().collect();
 
     let path = options_path(mc);
-    let current = skin::read_options(&path)?;
-    let line = skin::find_pack_line(&current, KEY);
+    let current = options::read_options(&path)?;
+    let line = options::find_pack_line(&current, KEY);
     let entries = match line {
-        Some(line) => skin::parse_pack_list(line)?,
+        Some(line) => options::parse_pack_list(line)?,
         None => Vec::new(),
     };
     let merged = merge_entries(&entries, &wanted_options, &available);
@@ -159,11 +159,11 @@ pub fn save_state(mc: &Path, ui_order: Vec<String>) -> Result<(), String> {
     if line.is_none() && merged.is_empty() {
         return Ok(());
     }
-    let next = skin::set_pack_entries(&current, KEY, &merged)?;
+    let next = options::set_pack_entries(&current, KEY, &merged)?;
     if next == current {
         return Ok(());
     }
-    skin::write_options(&path, &next)
+    options::write_options(&path, &next)
 }
 
 #[cfg(test)]
@@ -480,7 +480,7 @@ mod tests {
     #[test]
     fn escribe_orden_completo() {
         let options = "fov:0.5\nresourcePacks:[\"file/viejo.zip\"]\n";
-        let out = skin::set_pack_entries(
+        let out = options::set_pack_entries(
             options,
             KEY,
             &["file/b.zip".to_string(), "file/a.zip".to_string()],
@@ -494,7 +494,7 @@ mod tests {
 
     #[test]
     fn crea_renglon_si_falta() {
-        let out = skin::set_pack_entries("", KEY, &["file/a.zip".to_string()]).unwrap();
+        let out = options::set_pack_entries("", KEY, &["file/a.zip".to_string()]).unwrap();
         assert_eq!(out, "resourcePacks:[\"file/a.zip\"]");
     }
 }
