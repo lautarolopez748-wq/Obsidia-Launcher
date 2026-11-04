@@ -1,6 +1,6 @@
 export const I = { home:'<path d="M3 11l9-8 9 8v10h-6v-6H9v6H3z"/>', profiles:'<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>', mods:'<path d="M12 2l9 5v10l-9 5-9-5V7z"/><path d="M12 12l9-5M12 12v10M12 12L3 7"/>', servers:'<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18"/>', settings:'<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2"/>' };
 export const ic = k => `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">${I[k]}</svg>`;
-export const TABS = [['home','Inicio'],['profiles','Perfiles'],['mods','Mods'],['servers','Servidores'],['settings','Ajustes']];
+export const TABS = [['home','Inicio'],['profiles','Instancias'],['mods','Mods'],['servers','Servidores'],['settings','Ajustes']];
 export const G = ['linear-gradient(135deg,#8B5CF6,#C026D3)','linear-gradient(135deg,#22D3EE,#8B5CF6)','linear-gradient(135deg,#C026D3,#1E1B4B)','linear-gradient(135deg,#6366F1,#22D3EE)'];
 export const TRASH = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14M10 11v6M14 11v6"/></svg>';
 export const M = [
@@ -35,7 +35,7 @@ export function skinFace(i, size, skins) {
 }
 
 export function accCard(sk, nick, ms, skins) {
-  return `${skinFace(sk, 40, skins)}<div><div style="font-weight:600">${esc(nick) || 'Jugador'}</div><div class="mu">${ms ? 'Cuenta Microsoft' : 'Cuenta offline'}</div></div>`;
+  return `${skinFace(sk, 40, skins)}<div class="who"><b>${esc(nick) || 'Jugador'}</b><span>${ms ? 'Cuenta Microsoft' : 'Cuenta offline'}</span></div><i class="status" aria-hidden="true"></i>`;
 }
 
 export function modCard(m, busy, installedFile) {
