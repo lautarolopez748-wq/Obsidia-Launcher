@@ -1,4 +1,6 @@
 mod auth;
+mod content;
+mod fsx;
 mod instances;
 mod launcher;
 mod options;
@@ -9,7 +11,6 @@ mod skin;
 use base64::Engine;
 use paths::{InstanceRef, Paths};
 use serde::{Deserialize, Serialize};
-use sha1::{Digest, Sha1};
 use std::fs;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -679,7 +680,7 @@ async fn launch_version(
     instance: String,
 ) -> Result<String, String> {
     // Clave de bloqueo: legacy comparte .minecraft, usar clave estable diferenciada.
-    let lock_key = if instance.eq_ignore_ascii_case("legacy") {
+    let lock_key = if is_legacy_instance(&instance) {
         "legacy:.minecraft".to_string()
     } else {
         instance.clone()
@@ -710,21 +711,30 @@ async fn launch_version(
     let lock_key_close = lock_key.clone();
 
     let result = tauri::async_runtime::spawn_blocking(move || {
-        launcher::launch(&app, &mc, &gd, &version, player, opts, |required| {
-            fallback_java(&paths, required)
-        }, Some(instance.clone()), {
-            let app_for_close = app_for_spawn.clone();
-            let lock_for_close = lock_key_close;
+        launcher::launch(
+            &app,
+            &mc,
+            &gd,
+            &version,
+            player,
+            opts,
+            |required| fallback_java(&paths, required),
+            Some(instance.clone()),
+            {
+                let app_for_close = app_for_spawn.clone();
+                let lock_for_close = lock_key_close;
+                Some(Box::new(move |pid: u32| {
+                    if let Some(state) = app_for_close.try_state::<launcher::RunningInstances>() {
+                        state.release_if_matches(&lock_for_close, pid);
+                    }
+                }))
+            },
             Some(Box::new(move |pid: u32| {
-                if let Some(state) = app_for_close.try_state::<launcher::RunningInstances>() {
-                    state.release_if_matches(&lock_for_close, pid);
+                if let Some(state) = app_for_spawn.try_state::<launcher::RunningInstances>() {
+                    state.set_pid(&lock_key_spawn, pid);
                 }
-            }))
-        }, Some(Box::new(move |pid: u32| {
-            if let Some(state) = app_for_spawn.try_state::<launcher::RunningInstances>() {
-                state.set_pid(&lock_key_spawn, pid);
-            }
-        })))
+            })),
+        )
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -751,7 +761,8 @@ async fn launch_instance(
         return Err(format!("La instancia {} ya está en ejecución", id));
     }
 
-    let result = launch_instance_inner(app.clone(), paths.clone(), id.clone(), server, username).await;
+    let result =
+        launch_instance_inner(app.clone(), paths.clone(), id.clone(), server, username).await;
 
     // Si falló, quitar de running.
     if result.is_err() {
@@ -774,6 +785,12 @@ async fn launch_instance_inner(
         paths.ensure_saves_link(&instance_dir)?;
     }
 
+    // No lanzar si la instancia tiene una transacción de contenido pendiente.
+    // La instancia legacy (.minecraft) no se recupera aquí.
+    if !is_legacy_instance(&id) {
+        fsx::recover_with_journal(&instance_dir)
+            .map_err(|e| format!("La instancia {} no está recuperada: {}", id, e))?;
+    }
     // Leer el perfil y resolver versión, RAM, Java y fullscreen del backend.
     let profiles = read_json_list::<Profile>(&paths.profiles_file())?;
     let profile = profiles
@@ -965,6 +982,10 @@ fn fallback_java(paths: &Paths, required: Option<u32>) -> Option<String> {
     })
 }
 
+fn is_legacy_instance(id: &str) -> bool {
+    id.eq_ignore_ascii_case("legacy")
+}
+
 fn ensure_launcher_profiles(paths: &Paths) {
     let path = paths.launcher_profiles_file();
     if !path.exists() {
@@ -1127,6 +1148,12 @@ fn list_shaderpacks(
 }
 
 fn list_shaderpacks_in(paths: &Paths, instance: &str) -> Result<Vec<String>, String> {
+    let indexed = content::read_index(&paths.instance_dir(instance)?, "shaders")?;
+    if !indexed.is_empty() {
+        let mut names: Vec<String> = indexed.iter().map(|e| e.filename.clone()).collect();
+        names.sort();
+        return Ok(names);
+    }
     let dir = paths.instance_dir(instance)?.join("shaderpacks");
     let mut out = Vec::new();
     if let Ok(entries) = fs::read_dir(&dir) {
@@ -1151,6 +1178,12 @@ fn list_resourcepacks(
 }
 
 fn list_resourcepacks_in(paths: &Paths, instance: &str) -> Result<Vec<String>, String> {
+    let indexed = content::read_index(&paths.instance_dir(instance)?, "packs")?;
+    if !indexed.is_empty() {
+        let mut names: Vec<String> = indexed.iter().map(|e| e.filename.clone()).collect();
+        names.sort();
+        return Ok(names);
+    }
     let dir = paths.instance_dir(instance)?.join("resourcepacks");
     let mut out = Vec::new();
     if let Ok(entries) = fs::read_dir(&dir) {
@@ -1253,7 +1286,7 @@ fn remove_offline_skin_in(paths: &Paths, instance: &str) -> Result<(), String> {
 /// Subcarpeta administrada de una instancia. Valida la carpeta y resuelve la
 /// instancia (vacía o inválida es un error) antes de tocar el disco.
 fn instance_subdir(paths: &Paths, instance: &str, folder: &str) -> Result<PathBuf, String> {
-    if !["mods", "shaderpacks", "resourcepacks"].contains(&folder) {
+    if !["mods", "shaderpacks", "resourcepacks", ""].contains(&folder) {
         return Err("Carpeta no permitida".to_string());
     }
     Ok(paths.instance_dir(instance)?.join(folder))
@@ -1298,7 +1331,7 @@ fn delete_file_in_in(
             dir.display()
         ));
     }
-    let expected = if instance.eq_ignore_ascii_case("legacy") {
+    let expected = if is_legacy_instance(instance) {
         paths.minecraft.join(folder)
     } else {
         paths.instance_dir(instance)?.join(folder)
@@ -1320,6 +1353,23 @@ fn delete_file_in_in(
     } else {
         fs::remove_file(&path).map_err(|e| e.to_string())?;
     }
+
+    // Actualizar índice: eliminar entrada por slug o filename.
+    // Si el archivo era un directorio, no hay entrada en el índice.
+    // Para archivos, buscar el slug por filename y eliminar transaccionalmente.
+    let instance_root = paths.instance_dir(instance)?;
+    let kind_for_index = match folder {
+        "shaderpacks" => "shaders",
+        "resourcepacks" => "packs",
+        _ => folder,
+    };
+    let subdir = dir.clone();
+    let entries = content::read_index(&instance_root, kind_for_index)?;
+    if let Some(entry) = entries.iter().find(|e| e.filename == name) {
+        let slug = entry.slug.clone();
+        fsx::remove_entry_transactional(&instance_root, kind_for_index, &subdir, &slug)?;
+    }
+
     Ok(())
 }
 
@@ -1332,6 +1382,12 @@ fn list_installed_mods(
 }
 
 fn list_installed_mods_in(paths: &Paths, instance: &str) -> Result<Vec<String>, String> {
+    let indexed = content::read_index(&paths.instance_dir(instance)?, "mods")?;
+    if !indexed.is_empty() {
+        let mut names: Vec<String> = indexed.iter().map(|e| e.filename.clone()).collect();
+        names.sort();
+        return Ok(names);
+    }
     let dir = paths.instance_dir(instance)?.join("mods");
     let mut out = Vec::new();
     if let Ok(entries) = fs::read_dir(&dir) {
@@ -1534,23 +1590,58 @@ async fn install_mod(
         .map_err(|e| e.to_string())?;
 
     // Verificación de integridad con el SHA1 que informa Modrinth.
-    if let Some(expected) = file
+    let sha1 = file
         .get("hashes")
         .and_then(|h| h.get("sha1"))
-        .and_then(|h| h.as_str())
-    {
-        let mut hasher = Sha1::new();
-        hasher.update(&bytes);
-        if !format!("{:x}", hasher.finalize()).eq_ignore_ascii_case(expected) {
-            return Err("El archivo descargado no coincide con su SHA1: se descartó".to_string());
-        }
+        .and_then(|h| h.as_str());
+
+    let version_id = v
+        .get("id")
+        .and_then(|i| i.as_str())
+        .ok_or_else(|| "Modrinth no devolvió id de versión".to_string())?;
+    let dest = mods_dir.join(filename);
+    let instance_root = paths.instance_dir(&instance)?;
+
+    fsx::apply_update_transactional(
+        &dest,
+        &bytes,
+        sha1,
+        &instance_root,
+        "mods",
+        &mods_dir,
+        content::ContentEntry {
+            slug: slug.clone(),
+            version_id: version_id.to_string(),
+            filename: filename.to_string(),
+            sha1: sha1.map(String::from),
+            loader: Some(loader.clone()),
+            mc_version: Some(mc_version.clone()),
+            icon_url: None,
+        },
+    )?;
+
+    // Dependencias requeridas: se informan, no se instalan automáticamente.
+    // Si una dependencia obligatoria falta, el caller puede instalarla después.
+    let deps = v
+        .get("dependencies")
+        .and_then(|d| d.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let required = content::required_dependencies(&deps);
+    let installed = content::read_index(&instance_root, "mods")?;
+    let missing: Vec<String> = required
+        .iter()
+        .filter(|s| !installed.iter().any(|e| &e.slug == *s) && *s != &slug)
+        .cloned()
+        .collect();
+    if !missing.is_empty() {
+        eprintln!(
+            "Dependencias requeridas faltantes para {}: {}",
+            slug,
+            missing.join(", ")
+        );
     }
 
-    let dest = mods_dir.join(filename);
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    fs::write(&dest, bytes).map_err(|e| e.to_string())?;
     Ok(format!("Mod instalado: {filename}"))
 }
 
@@ -1660,24 +1751,41 @@ async fn download_project_file(
         .await
         .map_err(|e| e.to_string())?;
 
-    if let Some(expected) = file
+    let sha1 = file
         .get("hashes")
         .and_then(|h| h.get("sha1"))
-        .and_then(|h| h.as_str())
-    {
-        use sha1::{Digest, Sha1};
-        let mut hasher = Sha1::new();
-        hasher.update(&bytes);
-        if !format!("{:x}", hasher.finalize()).eq_ignore_ascii_case(expected) {
-            return Err("El archivo descargado no coincide con su SHA1: se descartó".to_string());
-        }
-    }
+        .and_then(|h| h.as_str());
 
+    let version_id = v
+        .get("id")
+        .and_then(|i| i.as_str())
+        .ok_or_else(|| "Modrinth no devolvió id de versión".to_string())?;
     let dest = dest_dir.join(filename);
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    fs::write(&dest, bytes).map_err(|e| e.to_string())?;
+    let instance_root = paths.instance_dir(instance)?;
+    let kind_for_index = match folder {
+        "shaderpacks" => "shaders",
+        "resourcepacks" => "packs",
+        _ => folder,
+    };
+
+    fsx::apply_update_transactional(
+        &dest,
+        &bytes,
+        sha1,
+        &instance_root,
+        kind_for_index,
+        &dest_dir,
+        content::ContentEntry {
+            slug: slug.to_string(),
+            version_id: version_id.to_string(),
+            filename: filename.to_string(),
+            sha1: sha1.map(String::from),
+            loader: None,
+            mc_version: mc_version.map(String::from),
+            icon_url: None,
+        },
+    )?;
+
     Ok(filename.to_string())
 }
 
@@ -1860,6 +1968,26 @@ pub fn run() {
                 .map_err(|e| Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error>)?;
             migrate_instances(&paths)
                 .map_err(|e| Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error>)?;
+            // Recuperación de contenido: sin crear índices innecesarios,
+            // sin tocar instancias legacy ni .minecraft.
+            // Si una instancia falla, se reporta y se continúa con las demás.
+            let profiles = read_json_list::<Profile>(&paths.profiles_file()).unwrap_or_default();
+            for profile in profiles.iter() {
+                let Some(id) = &profile.id else { continue };
+                if is_legacy_instance(id) {
+                    continue;
+                }
+                match paths.instance_dir(id) {
+                    Ok(inst_dir) => {
+                        if let Err(e) = fsx::recover_with_journal(&inst_dir) {
+                            eprintln!("Recuperación pendiente para {}: {}", id, e);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Instancia {} no disponible: {}", id, e);
+                    }
+                }
+            }
             app.manage(paths);
             app.manage(launcher::RunningInstances::default());
             Ok(())
@@ -2093,7 +2221,10 @@ mod tests {
 
     #[test]
     fn sha1_conocido() {
-        assert_eq!(launcher::sha1_hex(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
+        assert_eq!(
+            launcher::sha1_hex(b"abc"),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
     }
 
     #[test]
@@ -3204,5 +3335,14 @@ mod tests {
         fs::set_permissions(&pf, perms).unwrap();
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn legacy_id_case_insensitive() {
+        for id in ["legacy", "LEGACY", "Legacy", "LeGaCy"] {
+            assert!(is_legacy_instance(id), "debería tratar {id} como legacy");
+        }
+        assert!(!is_legacy_instance("legac"));
+        assert!(!is_legacy_instance("legacyx"));
     }
 }
