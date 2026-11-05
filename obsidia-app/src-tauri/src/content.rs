@@ -24,6 +24,15 @@ pub struct ContentEntry {
     pub loader: Option<String>,
     pub mc_version: Option<String>,
     pub icon_url: Option<String>,
+    /// Origen del contenido: "modrinth" para proyectos conocidos, "local" para
+    /// archivos sin proyecto Modrinth identificado. Predeterminado "modrinth"
+    /// para compatibilidad con índices existentes.
+    #[serde(default = "default_content_source")]
+    pub source: String,
+}
+
+fn default_content_source() -> String {
+    "modrinth".to_string()
 }
 
 /// Chequeo de actualización para `list_content`.
@@ -93,6 +102,59 @@ pub fn upsert_entry(
     write_index(instance_dir, kind, &entries)
 }
 
+/// Incorpora entradas migradas desde localStorage sin sobrescribir metadatos válidos.
+#[allow(dead_code)]
+pub fn migrate_content_map(
+    instance_dir: &Path,
+    kind: &str,
+    entries: Vec<ContentEntry>,
+) -> Result<usize, String> {
+    let mut indexed = read_index(instance_dir, kind)?;
+    let mut changed = false;
+
+    for candidate in entries {
+        let filename = candidate.filename.clone();
+        let slug = if candidate.slug.trim().is_empty() {
+            // Contenido local sin proyecto Modrinth conocido: slug único que
+            // nunca se usa como slug de Modrinth en consultas ni actualizaciones.
+            format!("local:{}", filename)
+        } else {
+            candidate.slug.clone()
+        };
+        let source = if candidate.slug.trim().is_empty() {
+            "local".to_string()
+        } else {
+            "modrinth".to_string()
+        };
+
+        if let Some(existing) = indexed
+            .iter_mut()
+            .find(|e| e.slug == slug || e.filename == filename)
+        {
+            if existing.icon_url.is_none() && candidate.icon_url.is_some() {
+                existing.icon_url = candidate.icon_url;
+                changed = true;
+            }
+        } else {
+            let mut entry = candidate;
+            entry.slug = slug;
+            if entry.source.trim().is_empty() {
+                entry.source = source;
+            }
+            if entry.version_id.trim().is_empty() {
+                entry.version_id = "unknown".to_string();
+            }
+            indexed.push(entry);
+            changed = true;
+        }
+    }
+
+    if changed {
+        write_index(instance_dir, kind, &indexed)?;
+    }
+    Ok(indexed.len())
+}
+
 /// Elimina una entrada por slug y borra el archivo.
 #[allow(dead_code)]
 pub fn remove_entry(
@@ -158,6 +220,18 @@ pub async fn list_content(
         .map_err(|e| e.to_string())?;
 
     for e in &indexed {
+        // Contenido local: nunca consultar Modrinth ni reportar actualizaciones.
+        if e.source == "local" {
+            out.push(ContentItem {
+                file: e.filename.clone(),
+                slug: e.slug.clone(),
+                version: e.version_id.clone(),
+                icon: e.icon_url.clone().unwrap_or_default(),
+                hay_actualizacion: false,
+            });
+            continue;
+        }
+
         let mut hay = false;
         if let Some(sha) = &e.sha1 {
             // Consultar Modrinth por hash.
@@ -251,6 +325,7 @@ mod tests {
             loader: Some("fabric".to_string()),
             mc_version: Some("1.21.4".to_string()),
             icon_url: Some("https://cdn.modrinth.com/icon.png".to_string()),
+            source: "modrinth".to_string(),
         };
         write_index(&dir, "mods", &[entry.clone()]).unwrap();
         let loaded = read_index(&dir, "mods").unwrap();
@@ -277,6 +352,7 @@ mod tests {
                 loader: Some("fabric".to_string()),
                 mc_version: Some("1.21.4".to_string()),
                 icon_url: None,
+                source: "modrinth".to_string(),
             },
         )
         .unwrap();
@@ -296,6 +372,7 @@ mod tests {
                 loader: Some("fabric".to_string()),
                 mc_version: Some("1.21.4".to_string()),
                 icon_url: None,
+                source: "modrinth".to_string(),
             },
         )
         .unwrap();
@@ -329,6 +406,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             },
         )
         .unwrap();
@@ -388,6 +466,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             },
         )
         .unwrap();
@@ -423,6 +502,289 @@ mod tests {
         let dir = temp_instance("vacio");
         let result = read_index(&dir, "mods");
         assert!(result.unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_content_map_incorpora_y_preserva() {
+        let dir = temp_instance("migrate");
+        let existing = ContentEntry {
+            slug: "sodium".to_string(),
+            version_id: "v1".to_string(),
+            filename: "sodium.jar".to_string(),
+            sha1: None,
+            loader: None,
+            mc_version: None,
+            icon_url: None,
+            source: "modrinth".to_string(),
+        };
+        write_index(&dir, "mods", &[existing]).unwrap();
+
+        let migrated = migrate_content_map(
+            &dir,
+            "mods",
+            vec![ContentEntry {
+                slug: "sodium".to_string(),
+                version_id: "".to_string(),
+                filename: "sodium.jar".to_string(),
+                sha1: None,
+                loader: None,
+                mc_version: None,
+                icon_url: Some("https://example.com/icon.png".to_string()),
+                source: "modrinth".to_string(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(migrated, 1);
+        let entries = read_index(&dir, "mods").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].icon_url.as_deref(),
+            Some("https://example.com/icon.png")
+        );
+        assert_eq!(entries[0].version_id, "v1");
+
+        // Idempotencia: no duplica.
+        migrate_content_map(
+            &dir,
+            "mods",
+            vec![ContentEntry {
+                slug: "sodium".to_string(),
+                version_id: "".to_string(),
+                filename: "sodium.jar".to_string(),
+                sha1: None,
+                loader: None,
+                mc_version: None,
+                icon_url: Some("https://example.com/other.png".to_string()),
+                source: "modrinth".to_string(),
+            }],
+        )
+        .unwrap();
+        let entries = read_index(&dir, "mods").unwrap();
+        assert_eq!(entries.len(), 1);
+        // No sobrescribe icono válido con otro.
+        assert_eq!(
+            entries[0].icon_url.as_deref(),
+            Some("https://example.com/icon.png")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_content_map_no_sobrescribe_metadatos() {
+        let dir = temp_instance("migrate2");
+        let existing = ContentEntry {
+            slug: "sodium".to_string(),
+            version_id: "v1".to_string(),
+            filename: "sodium.jar".to_string(),
+            sha1: Some("abc".to_string()),
+            loader: Some("fabric".to_string()),
+            mc_version: Some("1.21.4".to_string()),
+            icon_url: Some("https://example.com/icon.png".to_string()),
+            source: "modrinth".to_string(),
+        };
+        write_index(&dir, "mods", &[existing]).unwrap();
+
+        migrate_content_map(
+            &dir,
+            "mods",
+            vec![ContentEntry {
+                slug: "sodium".to_string(),
+                version_id: "".to_string(),
+                filename: "sodium.jar".to_string(),
+                sha1: None,
+                loader: None,
+                mc_version: None,
+                icon_url: None,
+                source: "modrinth".to_string(),
+            }],
+        )
+        .unwrap();
+        let entries = read_index(&dir, "mods").unwrap();
+        assert_eq!(entries[0].version_id, "v1");
+        assert_eq!(entries[0].sha1.as_deref(), Some("abc"));
+        assert_eq!(entries[0].loader.as_deref(), Some("fabric"));
+        assert_eq!(entries[0].mc_version.as_deref(), Some("1.21.4"));
+        assert_eq!(
+            entries[0].icon_url.as_deref(),
+            Some("https://example.com/icon.png")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_content_vacio() {
+        let dir = temp_instance("list-vacio");
+        let paths = crate::paths::Paths::new(dir.clone());
+        let items = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(list_content(&paths, "legacy", "mods"))
+            .unwrap();
+        assert!(items.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_content_devuelve_entradas() {
+        let dir = temp_instance("list-ok");
+        let entry = ContentEntry {
+            slug: "sodium".to_string(),
+            version_id: "v1".to_string(),
+            filename: "sodium.jar".to_string(),
+            sha1: None,
+            loader: None,
+            mc_version: None,
+            icon_url: Some("https://example.com/icon.png".to_string()),
+            source: "modrinth".to_string(),
+        };
+        write_index(&dir, "mods", &[entry.clone()]).unwrap();
+        let paths = crate::paths::Paths::new(dir.clone());
+        let items = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(list_content(&paths, "legacy", "mods"))
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].file, "sodium.jar");
+        assert_eq!(items[0].slug, "sodium");
+        assert_eq!(items[0].version, "v1");
+        assert_eq!(items[0].icon, "https://example.com/icon.png");
+        assert!(!items[0].hay_actualizacion);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_content_indice_corrupto() {
+        let dir = temp_instance("list-corrupto");
+        std::fs::write(dir.join(".obsidia").join("mods.json"), "{ corrupto").unwrap();
+        let paths = crate::paths::Paths::new(dir.clone());
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(list_content(&paths, "legacy", "mods"));
+        assert!(result.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn content_entry_source_predeterminado_es_modrinth() {
+        let entry = ContentEntry {
+            slug: "sodium".to_string(),
+            version_id: "v1".to_string(),
+            filename: "sodium.jar".to_string(),
+            sha1: None,
+            loader: Some("fabric".to_string()),
+            mc_version: Some("1.21.4".to_string()),
+            icon_url: None,
+            source: "modrinth".to_string(),
+        };
+        assert_eq!(entry.source, "modrinth");
+    }
+
+    #[test]
+    fn migrate_content_map_slug_vacio_crea_local() {
+        let dir = temp_instance("migrate-local");
+        std::fs::write(dir.join("mods").join("mod-desconocido.jar"), b"x").unwrap();
+
+        let count = migrate_content_map(
+            &dir,
+            "mods",
+            vec![ContentEntry {
+                slug: "".to_string(),
+                version_id: "".to_string(),
+                filename: "mod-desconocido.jar".to_string(),
+                sha1: None,
+                loader: None,
+                mc_version: None,
+                icon_url: None,
+                source: "local".to_string(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(count, 1);
+
+        let entries = read_index(&dir, "mods").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].slug, "local:mod-desconocido.jar");
+        assert_eq!(entries[0].source, "local");
+        // No es un slug de Modrinth: nunca se consulta como proyecto.
+        assert_ne!(entries[0].slug, "mod-desconocido.jar");
+
+        // Idempotencia: no duplica.
+        let count2 = migrate_content_map(
+            &dir,
+            "mods",
+            vec![ContentEntry {
+                slug: "".to_string(),
+                version_id: "".to_string(),
+                filename: "mod-desconocido.jar".to_string(),
+                sha1: None,
+                loader: None,
+                mc_version: None,
+                icon_url: None,
+                source: "local".to_string(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(count2, 1);
+        let entries = read_index(&dir, "mods").unwrap();
+        assert_eq!(entries.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_content_local_no_consulta_modrinth() {
+        let dir = temp_instance("list-local");
+        let entry = ContentEntry {
+            slug: "local:mod-desconocido.jar".to_string(),
+            version_id: "".to_string(),
+            filename: "mod-desconocido.jar".to_string(),
+            sha1: None,
+            loader: None,
+            mc_version: None,
+            icon_url: None,
+            source: "local".to_string(),
+        };
+        write_index(&dir, "mods", &[entry.clone()]).unwrap();
+        let paths = crate::paths::Paths::new(dir.clone());
+        let items = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(list_content(&paths, "legacy", "mods"))
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].file, "mod-desconocido.jar");
+        assert_eq!(items[0].slug, "local:mod-desconocido.jar");
+        // Contenido local nunca reporta actualización.
+        assert!(!items[0].hay_actualizacion);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nombre_archivo_igual_slug_modrinth_no_se_confunde() {
+        let dir = temp_instance("migrate-conflict");
+        // Un archivo llamado igual a un proyecto real de Modrinth pero sin slug.
+        let count = migrate_content_map(
+            &dir,
+            "mods",
+            vec![ContentEntry {
+                slug: "".to_string(),
+                version_id: "".to_string(),
+                filename: "sodium.jar".to_string(),
+                sha1: None,
+                loader: None,
+                mc_version: None,
+                icon_url: None,
+                source: "local".to_string(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(count, 1);
+        let entries = read_index(&dir, "mods").unwrap();
+        assert_eq!(entries[0].slug, "local:sodium.jar");
+        assert_eq!(entries[0].source, "local");
+        // Nunca se trata como el proyecto "sodium" de Modrinth.
+        assert_ne!(entries[0].slug, "sodium");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

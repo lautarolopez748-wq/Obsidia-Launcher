@@ -1,13 +1,18 @@
 mod auth;
 mod content;
+mod dependencies;
 mod fsx;
 mod instances;
 mod launcher;
+mod loader_version;
 mod options;
 mod packs;
 mod paths;
 mod skin;
 
+use crate::instances::InstanceMarker;
+use crate::launcher::sha1_hex;
+use crate::paths::InstanceId;
 use base64::Engine;
 use paths::{InstanceRef, Paths};
 use serde::{Deserialize, Serialize};
@@ -17,7 +22,7 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static MIGRATION_PRESERVED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 use tauri::Manager;
@@ -291,6 +296,214 @@ fn migrate_instances(paths: &Paths) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(dead_code)]
+fn now_string() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string()
+}
+
+/// Estado de una migración de perfil Legacy.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MigrationState {
+    Started,
+    Copying,
+    Completed,
+    Failed,
+}
+
+/// Registro persistente de una migración en curso. Permite reintentar tras
+/// interrupción sin perder el estado.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrationJournal {
+    pub profile_name: String,
+    pub instance_id: String,
+    pub state: MigrationState,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub copied_files: Vec<String>,
+    pub error: Option<String>,
+}
+
+/// Ruta del journal de migración de un perfil concreto.
+/// El nombre de archivo es el SHA-1 del nombre del perfil, así ningún dato
+/// proporcionado por el usuario puede introducir separadores de ruta,
+/// path traversal ni nombres inválidos de Windows. Un archivo por perfil
+/// evita que iniciar la migración de B sobrescriba el registro de A.
+#[allow(dead_code)]
+fn migration_journal_path(paths: &Paths, profile_name: &str) -> PathBuf {
+    let hash = sha1_hex(profile_name.as_bytes());
+    paths.obsidia.join(format!("migration-{hash}.json"))
+}
+
+/// Valida si `name` es seguro para usarse directamente como nombre de archivo
+/// del journal antiguo `migration-<name>.json`. Rechaza path traversal,
+/// separadores de ruta, nombres vacíos y caracteres reservados por Windows.
+fn is_safe_profile_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains(['/', '\\', '\0'])
+        && !name.contains("..")
+        && name != "."
+        && !name
+            .chars()
+            .any(|c| matches!(c, '<' | '>' | ':' | '"' | '|' | '?'))
+}
+
+/// Ruta del journal global antiguo (único archivo `migration.json`).
+/// Se conserva solo para compatibilidad con journals creados antes de este cambio.
+fn migration_journal_global_path(paths: &Paths) -> PathBuf {
+    paths.obsidia.join("migration.json")
+}
+
+fn read_journal_file(path: &Path) -> Result<Option<MigrationJournal>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let data = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if data.trim().is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_str(&data)
+        .map(Some)
+        .map_err(|e| format!("{}: journal de migración corrupto ({e})", path.display()))
+}
+
+#[allow(dead_code)]
+fn read_migration_journal(
+    paths: &Paths,
+    profile_name: &str,
+) -> Result<Option<MigrationJournal>, String> {
+    // 1. Archivo específico del perfil (formato actual, nombre seguro por hash).
+    let specific = migration_journal_path(paths, profile_name);
+    if let Some(j) = read_journal_file(&specific)? {
+        return Ok(Some(j));
+    }
+    // 2. Compatibilidad: journal antiguo inseguro `migration-<profile_name>.json`.
+    // Solo intentar leer si el nombre del perfil es seguro para usarse como archivo.
+    // Nunca se construye una ruta con datos de usuario sin validar primero.
+    if is_safe_profile_name(profile_name) {
+        let legacy_path = paths.obsidia.join(format!("migration-{profile_name}.json"));
+        if let Some(j) = read_journal_file(&legacy_path)? {
+            // Migrar el registro antiguo al nombre seguro sin perder operaciones
+            // pendientes ni sobrescribir registros de otros perfiles.
+            let _ = write_migration_journal(paths, profile_name, &j);
+            return Ok(Some(j));
+        }
+    }
+    // 3. Compatibilidad: journal global antiguo `migration.json` (único archivo
+    // para todos los perfiles, formato anterior al journal por perfil).
+    let global = migration_journal_global_path(paths);
+    if let Some(j) = read_journal_file(&global)?
+        && j.profile_name == profile_name
+    {
+        // Migrar el registro antiguo al nombre seguro por perfil.
+        let _ = write_migration_journal(paths, profile_name, &j);
+        return Ok(Some(j));
+    }
+    Ok(None)
+}
+
+#[allow(dead_code)]
+fn write_migration_journal(
+    paths: &Paths,
+    profile_name: &str,
+    journal: &MigrationJournal,
+) -> Result<(), String> {
+    let path = migration_journal_path(paths, profile_name);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let data = serde_json::to_string_pretty(journal).map_err(|e| e.to_string())?;
+    fs::write(&path, data).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Copia un directorio recursivamente sin sobrescribir archivos existentes.
+#[allow(dead_code)]
+fn copy_dir_recursive(src: &Path, dst: &Path, copied: &mut Vec<String>) -> Result<(), String> {
+    fs::create_dir_all(dst).map_err(|e| format!("{}: {e}", dst.display()))?;
+    for entry in fs::read_dir(src).map_err(|e| format!("{}: {e}", src.display()))? {
+        let entry = entry.map_err(|e| format!("{}: {e}", src.display()))?;
+        let from = entry.path();
+        let name = entry.file_name();
+        let to = dst.join(&name);
+        if to.exists() {
+            continue; // No sobrescribir archivos existentes
+        }
+        let meta = fs::symlink_metadata(&from).map_err(|e| format!("{}: {e}", from.display()))?;
+        if paths::is_reparse_meta(&meta) {
+            return Err(format!(
+                "{} no puede ser un junction ni un symlink",
+                from.display()
+            ));
+        }
+        if meta.is_dir() {
+            copy_dir_recursive(&from, &to, copied)?;
+        } else {
+            fs::copy(&from, &to).map_err(|e| format!("{}: {e}", from.display()))?;
+            if let Some(p) = to.to_str() {
+                copied.push(p.to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Limpia exclusivamente el directorio de instancia creado durante la migración.
+/// Nunca sigue ni elimina el destino del junction `saves`.
+#[allow(dead_code)]
+fn rollback_instance_dir(instance_dir: &Path) -> Result<(), String> {
+    if !instance_dir.exists() {
+        return Ok(());
+    }
+
+    // Manejar saves: si es junction, quitar solo el enlace. Si es carpeta real,
+    // abortar sin borrarla (protege mundos).
+    let saves = instance_dir.join("saves");
+    if saves.exists() {
+        let meta = fs::symlink_metadata(&saves).map_err(|e| format!("{}: {e}", saves.display()))?;
+        if paths::is_reparse_meta(&meta) {
+            paths::remove_link_only(&saves)?;
+        } else if meta.is_dir() {
+            return Err(format!(
+                "{} es una carpeta saves real; no se puede eliminar sin borrar mundos",
+                saves.display()
+            ));
+        }
+    }
+
+    // Eliminar todo lo demás dentro de la instancia.
+    if instance_dir.exists() {
+        for entry in
+            fs::read_dir(instance_dir).map_err(|e| format!("{}: {e}", instance_dir.display()))?
+        {
+            let entry = entry.map_err(|e| format!("{}: {e}", instance_dir.display()))?;
+            let path = entry.path();
+            let name = entry.file_name();
+            if name.to_string_lossy().eq_ignore_ascii_case("saves") {
+                continue;
+            }
+            let child_meta =
+                fs::symlink_metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            if paths::is_reparse_meta(&child_meta) {
+                return Err(format!(
+                    "{} es un reparse point; rollback abortado",
+                    path.display()
+                ));
+            }
+            if child_meta.is_dir() {
+                paths::safe_remove_dir_all(&path)?;
+            } else {
+                fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            }
+        }
+        fs::remove_dir(instance_dir).map_err(|e| format!("{}: {e}", instance_dir.display()))?;
+    }
+
+    Ok(())
+}
+
 #[derive(Serialize)]
 pub struct JavaInfo {
     pub path: String,
@@ -556,6 +769,219 @@ fn update_instance(
 #[tauri::command]
 fn delete_instance(paths: tauri::State<'_, Paths>, id: String) -> Result<(), String> {
     instances::delete_instance(&paths, id)
+}
+
+/// Lógica de migración extraída para pruebas unitarias.
+#[allow(dead_code)]
+fn migrate_legacy_profile_inner(paths: &Paths, profile_name: String) -> Result<(), String> {
+    let path = paths.profiles_file();
+    let mut profiles = read_json_list::<Profile>(&path)?;
+
+    // 1. Encontrar perfil Legacy exclusivamente por id == None.
+    let pos = profiles
+        .iter()
+        .position(|p| p.name == profile_name && p.id.is_none())
+        .ok_or_else(|| {
+            format!(
+                "No existe un perfil Legacy con nombre '{}' (sin id de instancia)",
+                profile_name
+            )
+        })?;
+
+    // 2. Revisar journal previo y limpiar residuos de un intento interrumpido.
+    // Cada perfil tiene su propio journal: iniciar la migración de B no borra el registro de A.
+    if let Some(journal) = read_migration_journal(paths, &profile_name)? {
+        if journal.state == MigrationState::Completed && journal.profile_name == profile_name {
+            return Err(format!(
+                "El perfil '{}' ya fue migrado a la instancia {}",
+                profile_name, journal.instance_id
+            ));
+        }
+        // Si el perfil ya tiene id (se actualizó antes de marcar el journal),
+        // verificar si la instancia está completa; si no, resetear id para reintentar.
+        if let Some(p) = profiles
+            .iter()
+            .find(|p| p.name == profile_name && p.id.is_some())
+        {
+            if let Ok(InstanceRef::Instance(inst)) = InstanceRef::parse(p.id.as_deref().unwrap())
+                && let Ok(d) = paths.instance_dir_for(&inst)
+                && d.join(".obsidia").join("instance.json").exists()
+            {
+                // Migración efectivamente completa: marcar journal y salir.
+                let mut j = journal.clone();
+                j.state = MigrationState::Completed;
+                j.completed_at = Some(now_string());
+                let _ = write_migration_journal(paths, &profile_name, &j);
+                return Ok(());
+            }
+            // Instancia no válida: resetear id del perfil para permitir reintento.
+            if let Some(p) = profiles.iter_mut().find(|p| p.name == profile_name) {
+                p.id = None;
+                p.origin = None;
+            }
+            write_json_list(&path, &profiles)?;
+        }
+
+        // Limpiar instancia parcial de intento previo del mismo perfil.
+        if let Ok(InstanceRef::Instance(inst)) = InstanceRef::parse(&journal.instance_id)
+            && let Ok(partial_dir) = paths.instance_dir_for(&inst)
+        {
+            let _ = rollback_instance_dir(&partial_dir);
+            let _ = fs::remove_file(partial_dir.join(".obsidia").join("instance.json"));
+        }
+    }
+
+    // 3. Generar id de instancia único y válido.
+    let base_id: String = profile_name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(InstanceId::MAX_LEN)
+        .collect();
+    let base_id = if base_id.is_empty() {
+        "migracion".to_string()
+    } else {
+        base_id
+    };
+    let mut new_id = base_id.clone();
+    let mut counter = 1u32;
+    while profiles.iter().any(|p| p.id.as_deref() == Some(&new_id))
+        || new_id.eq_ignore_ascii_case("legacy")
+    {
+        new_id = format!("{}-{}", base_id, counter);
+        counter += 1;
+    }
+    let inst = InstanceId::parse(&new_id)?;
+
+    // 4. Journal inicial (uno por perfil).
+    let mut journal = MigrationJournal {
+        profile_name: profile_name.clone(),
+        instance_id: new_id.clone(),
+        state: MigrationState::Started,
+        started_at: now_string(),
+        completed_at: None,
+        copied_files: Vec::new(),
+        error: None,
+    };
+    write_migration_journal(paths, &profile_name, &journal)?;
+
+    // 5. Crear directorio de instancia.
+    let instance_dir = paths.instance_dir_for(&inst)?;
+    fs::create_dir_all(&instance_dir).map_err(|e| format!("{}: {e}", instance_dir.display()))?;
+
+    // 6. Junction de saves: apunta a .minecraft/saves sin modificar el destino.
+    match paths.ensure_saves_link(&instance_dir) {
+        Ok(()) => {}
+        Err(e) => {
+            let _ = rollback_instance_dir(&instance_dir);
+            journal.state = MigrationState::Failed;
+            journal.error = Some(format!("ensure_saves_link: {e}"));
+            let _ = write_migration_journal(paths, &profile_name, &journal);
+            return Err(e);
+        }
+    }
+
+    // 7. Copiar contenido compartido (sin saves).
+    journal.state = MigrationState::Copying;
+    let _ = write_migration_journal(paths, &profile_name, &journal);
+
+    let minecraft = paths.minecraft.clone();
+    for subdir in ["mods", "shaderpacks", "resourcepacks", "config"] {
+        let src = minecraft.join(subdir);
+        if src.exists()
+            && let Err(e) =
+                copy_dir_recursive(&src, &instance_dir.join(subdir), &mut journal.copied_files)
+        {
+            let _ = rollback_instance_dir(&instance_dir);
+            journal.state = MigrationState::Failed;
+            journal.error = Some(format!("copiar {subdir}: {e}"));
+            let _ = write_migration_journal(paths, &profile_name, &journal);
+            return Err(e);
+        }
+    }
+    // options.txt (sin sobrescribir si ya existe).
+    let options_src = minecraft.join("options.txt");
+    if options_src.exists() {
+        let options_dst = instance_dir.join("options.txt");
+        if !options_dst.exists() {
+            match fs::copy(&options_src, &options_dst).map(|_| ()) {
+                Ok(()) => {
+                    if let Some(p) = options_dst.to_str() {
+                        journal.copied_files.push(p.to_string());
+                    }
+                }
+                Err(e) => {
+                    let _ = rollback_instance_dir(&instance_dir);
+                    journal.state = MigrationState::Failed;
+                    journal.error = Some(format!("copiar options.txt: {e}"));
+                    let _ = write_migration_journal(paths, &profile_name, &journal);
+                    return Err(e.to_string());
+                }
+            }
+        }
+    }
+
+    // 8. Escribir marker de instancia.
+    let profile = &profiles[pos];
+    let marker = InstanceMarker {
+        id: new_id.clone(),
+        name: profile.name.clone(),
+        schema: profile.schema,
+        origin: profile.origin.clone(),
+    };
+    let marker_data = serde_json::to_string_pretty(&marker).map_err(|e| e.to_string())?;
+    fs::create_dir_all(instance_dir.join(".obsidia")).map_err(|e| e.to_string())?;
+    if let Err(e) = fs::write(
+        instance_dir.join(".obsidia").join("instance.json"),
+        marker_data,
+    ) {
+        let _ = rollback_instance_dir(&instance_dir);
+        journal.state = MigrationState::Failed;
+        journal.error = Some(format!("escribir marker: {e}"));
+        let _ = write_migration_journal(paths, &profile_name, &journal);
+        return Err(e.to_string());
+    }
+
+    // 9. Actualizar el perfil ÚNICAMENTE después de verificar que la migración terminó.
+    profiles[pos].id = Some(new_id.clone());
+    profiles[pos].origin = Some("migrated".to_string());
+    if let Err(e) = write_json_list(&path, &profiles) {
+        let _ = rollback_instance_dir(&instance_dir);
+        journal.state = MigrationState::Failed;
+        journal.error = Some(format!("actualizar perfil: {e}"));
+        let _ = write_migration_journal(paths, &profile_name, &journal);
+        return Err(e);
+    }
+
+    // 10. Marcar journal como completado.
+    journal.state = MigrationState::Completed;
+    journal.completed_at = Some(now_string());
+    let _ = write_migration_journal(paths, &profile_name, &journal);
+
+    Ok(())
+}
+
+/// Migra un perfil Legacy (sin `id`) a una instancia independiente. Solo por
+/// solicitud explícita del usuario, un perfil a la vez. Copia mods, shaders,
+/// resource packs, configuraciones y options.txt desde `.minecraft`. No toca
+/// `.minecraft/saves` ni mundos. El perfil se actualiza solo después de
+/// verificar que la migración terminó correctamente.
+#[allow(dead_code)]
+#[tauri::command]
+fn migrate_legacy_profile(
+    paths: tauri::State<'_, Paths>,
+    profile_name: String,
+) -> Result<(), String> {
+    migrate_legacy_profile_inner(paths.inner(), profile_name)
+}
+
+/// Devuelve el estado del journal de migración de un perfil (para reintento y UI).
+#[allow(dead_code)]
+#[tauri::command]
+fn get_migration_status(
+    paths: tauri::State<'_, Paths>,
+    profile_name: String,
+) -> Result<Option<MigrationJournal>, String> {
+    read_migration_journal(paths.inner(), &profile_name)
 }
 
 fn java_version(path: &Path) -> String {
@@ -962,7 +1388,7 @@ fn fabric_installer() -> (String, String) {
 }
 
 /// Versión de Minecraft que va a una URL y al nombre de un archivo: se valida antes de usarla.
-fn check_mc_version(v: &str) -> Result<(), String> {
+pub(crate) fn check_mc_version(v: &str) -> Result<(), String> {
     if only_chars(v, &['.', '-', '_']) {
         Ok(())
     } else {
@@ -1003,6 +1429,12 @@ fn install_fabric(
     check_mc_version(&mc_version)?;
     let minecraft = paths.minecraft.clone();
     ensure_launcher_profiles(&paths);
+    // Resolver versión del loader si el llamador no la provee: única fuente de verdad.
+    let loader_version = loader_version.or_else(|| {
+        loader_version::resolve_loader_version("Fabric", &mc_version)
+            .ok()
+            .flatten()
+    });
     let (installer_ver, installer_url) = fabric_installer();
     let installer_path = paths
         .obsidia
@@ -1043,33 +1475,13 @@ fn install_forge(
     check_mc_version(&mc_version)?;
     let minecraft = paths.minecraft.clone();
     ensure_launcher_profiles(&paths);
-    // resolve forge version from promotions
-    let resp = reqwest::blocking::get(
-        "https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json",
-    )
-    .map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        return Err(format!(
-            "forge promotions request failed: HTTP {}",
-            resp.status()
-        ));
-    }
-    let promos: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
-    // Se prefiere la versión recomendada y, si no hay, la más nueva.
-    let promo = |kind: &str| {
-        promos
-            .get("promos")
-            .and_then(|p| p.get(format!("{mc_version}-{kind}")))
-            .and_then(|v| v.as_str())
-            .map(String::from)
-    };
-    let forge_ver = if let Some(v) = loader_version {
-        v
-    } else {
-        promo("recommended")
-            .or_else(|| promo("latest"))
-            .ok_or_else(|| format!("no forge version for {mc_version}"))?
-    };
+    // Resolver versión del loader si el llamador no la provee: única fuente de verdad.
+    let loader_version = loader_version.or_else(|| {
+        loader_version::resolve_loader_version("Forge", &mc_version)
+            .ok()
+            .flatten()
+    });
+    let forge_ver = loader_version.ok_or_else(|| format!("no forge version for {mc_version}"))?;
     if !only_chars(&forge_ver, &['.', '-', '_']) {
         return Err("Versión de Forge inválida".to_string());
     }
@@ -1100,6 +1512,16 @@ fn install_forge(
     ))
 }
 
+/// Comando Tauri: resuelve la versión del loader para un par (loader, versión de MC).
+/// Usado por el frontend antes de guardar un perfil o lanzar el juego.
+#[tauri::command]
+async fn resolve_loader_version_cmd(
+    loader: String,
+    mc_version: String,
+) -> Result<Option<String>, String> {
+    loader_version::resolve_loader_version(&loader, &mc_version)
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ModResult {
     pub slug: String,
@@ -1109,6 +1531,8 @@ pub struct ModResult {
     #[serde(default)]
     pub icon_url: Option<String>,
 }
+
+// Los tipos del plan viven en `dependencies` (resolución pura, sin red ni disco).
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ServerEntry {
@@ -1404,6 +1828,49 @@ fn list_installed_mods_in(paths: &Paths, instance: &str) -> Result<Vec<String>, 
 }
 
 /// Cliente HTTP con User-Agent propio (Modrinth lo exige).
+#[tauri::command]
+async fn list_content(
+    paths: tauri::State<'_, Paths>,
+    instance: String,
+    kind: String,
+) -> Result<Vec<content::ContentItem>, String> {
+    let kind = match kind.as_str() {
+        "mods" | "shaders" | "packs" => kind,
+        _ => return Err("Tipo de contenido no válido".to_string()),
+    };
+    let paths = paths.inner().clone();
+    content::list_content(&paths, &instance, &kind).await
+}
+
+#[tauri::command]
+fn migrate_content_map(
+    paths: tauri::State<'_, Paths>,
+    instance: String,
+    kind: String,
+    entries: Vec<content::ContentEntry>,
+) -> Result<usize, String> {
+    let kind = match kind.as_str() {
+        "mods" | "shaders" | "packs" => kind,
+        _ => return Err("Tipo de contenido no válido".to_string()),
+    };
+    let instance_root = paths.instance_dir(&instance)?;
+    content::migrate_content_map(&instance_root, &kind, entries)
+}
+
+async fn fetch_project_icon(client: &reqwest::Client, slug: &str) -> Option<String> {
+    let resp = client
+        .get(format!("https://api.modrinth.com/v2/project/{slug}"))
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?;
+    let json: serde_json::Value = resp.json().await.ok()?;
+    json.get("icon_url")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
 fn http() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .user_agent(launcher::UA)
@@ -1529,16 +1996,259 @@ fn install_mod_dir(
 }
 
 #[tauri::command]
+async fn fetch_compatible_version(
+    client: &reqwest::Client,
+    slug: &str,
+    mc_version: &str,
+    loader: &str,
+) -> Result<serde_json::Value, String> {
+    let mut req = client.get(format!(
+        "https://api.modrinth.com/v2/project/{slug}/version"
+    ));
+    req = req.query(&[("game_versions", format!("[\"{mc_version}\"]"))]);
+    if loader != "Vanilla" {
+        req = req.query(&[("loaders", format!("[\"{}\"]", loader.to_lowercase()))]);
+    }
+    let resp = req.send().await.map_err(|e| e.to_string())?;
+    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let versions = json.as_array().ok_or("Modrinth no devolvió versiones")?;
+    pick_version(versions)
+        .cloned()
+        .ok_or_else(|| format!("No hay una versión compatible de {slug}"))
+}
+
+fn version_file(version: &serde_json::Value) -> Result<(String, String, Option<String>), String> {
+    let files = version
+        .get("files")
+        .and_then(|f| f.as_array())
+        .ok_or("El proyecto no trae archivos")?;
+    let file = files
+        .iter()
+        .find(|f| f.get("primary").and_then(|p| p.as_bool()).unwrap_or(false))
+        .or_else(|| files.first())
+        .ok_or("El proyecto no trae archivos")?;
+    let file_url = file
+        .get("url")
+        .and_then(|u| u.as_str())
+        .ok_or("El archivo no tiene URL")?
+        .to_string();
+    let filename = file
+        .get("filename")
+        .and_then(|u| u.as_str())
+        .ok_or("El archivo no tiene nombre")?
+        .to_string();
+    let mut comps = Path::new(&filename).components();
+    match (comps.next(), comps.next()) {
+        (Some(std::path::Component::Normal(_)), None)
+            if filename.to_lowercase().ends_with(".jar") => {}
+        _ => return Err("Nombre de archivo sospechoso".to_string()),
+    }
+    let sha1 = file
+        .get("hashes")
+        .and_then(|h| h.get("sha1"))
+        .and_then(|h| h.as_str())
+        .map(str::to_string);
+    Ok((file_url, filename, sha1))
+}
+
+fn version_metadata(version: &serde_json::Value) -> Result<dependencies::VersionMetadata, String> {
+    let version_id = version
+        .get("id")
+        .and_then(|i| i.as_str())
+        .ok_or("Modrinth no devolvió id de versión")?
+        .to_string();
+    let (_, filename, _) = version_file(version)?;
+    let game_versions = version
+        .get("game_versions")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let loaders = version
+        .get("loaders")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let dependencies = version
+        .get("dependencies")
+        .and_then(|d| d.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|d| {
+                    Some(dependencies::DependencyMetadata {
+                        project_id: d.get("project_id")?.as_str()?.to_string(),
+                        dependency_type: d
+                            .get("dependency_type")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(dependencies::VersionMetadata {
+        version_id,
+        filename,
+        game_versions,
+        loaders,
+        dependencies,
+    })
+}
+
+/// Junta los metadatos (un slug → versión compatible) que necesita el resolver puro.
+///
+/// Descarga solo metadatos de Modrinth, nunca archivos: la usa tanto
+/// `plan_mod_dependencies` (sin escribir nada) como `install_mod`.
+/// Recorre el árbol en anchura desde la raíz para no descargar dos veces el
+/// mismo proyecto.
+async fn collect_candidates(
+    client: &reqwest::Client,
+    root_slug: &str,
+    mc_version: &str,
+    loader: &str,
+) -> Result<std::collections::HashMap<String, dependencies::VersionMetadata>, String> {
+    let mut candidates = std::collections::HashMap::new();
+    let mut queue = vec![root_slug.to_string()];
+    while let Some(slug) = queue.pop() {
+        if candidates.contains_key(&slug) {
+            continue;
+        }
+        let version = fetch_compatible_version(client, &slug, mc_version, loader).await?;
+        let meta = version_metadata(&version)?;
+        for dep in &meta.dependencies {
+            if dep.dependency_type == "required" {
+                queue.push(dep.project_id.clone());
+            }
+        }
+        candidates.insert(slug, meta);
+    }
+    Ok(candidates)
+}
+
+fn installed_mods(instance_root: &Path) -> Result<Vec<dependencies::InstalledMod>, String> {
+    Ok(content::read_index(instance_root, "mods")?
+        .into_iter()
+        .map(|e| dependencies::InstalledMod {
+            slug: e.slug,
+            version_id: e.version_id,
+        })
+        .collect())
+}
+
+/// Plan sin descargas ni escrituras: valida destino/instancia, junta
+/// metadatos de Modrinth y resuelve con el módulo puro. Solo lee el índice.
+async fn plan_mod_dependencies_inner(
+    paths: &Paths,
+    slug: &str,
+    mc_version: &str,
+    loader: &str,
+    instance: &str,
+) -> Result<dependencies::ModPlan, String> {
+    // Valida slug/versión/loader e instancia antes de tocar la red.
+    install_mod_dir(paths, instance, slug, mc_version, loader)?;
+    let client = http()?;
+    let candidates = collect_candidates(&client, slug, mc_version, loader).await?;
+    let instance_root = paths.instance_dir(instance)?;
+    let installed = installed_mods(&instance_root)?;
+    dependencies::build_mod_plan(slug, &candidates, mc_version, loader, &installed)
+}
+
+/// Comando Tauri: plan de instalación sin descargar ni modificar archivos.
+#[tauri::command]
+async fn plan_mod_dependencies(
+    paths: tauri::State<'_, Paths>,
+    slug: String,
+    mc_version: String,
+    loader: String,
+    instance: String,
+) -> Result<dependencies::ModPlan, String> {
+    let paths = paths.inner().clone();
+    plan_mod_dependencies_inner(&paths, &slug, &mc_version, &loader, &instance).await
+}
+
+#[tauri::command]
 async fn install_mod(
     paths: tauri::State<'_, Paths>,
     slug: String,
     mc_version: String,
     loader: String,
     instance: String,
+    confirmed_plan: dependencies::ModPlan,
 ) -> Result<String, String> {
     let paths = paths.inner().clone();
     let mods_dir = install_mod_dir(&paths, &instance, &slug, &mc_version, &loader)?;
     let client = http()?;
+    let instance_root = paths.instance_dir(&instance)?;
+    // El plan ejecutado se recalcula acá mismo (no se confía en el enviado
+    // por el frontend): si cambió alguna dependencia o versión frente al
+    // confirmado por el usuario, se aborta sin descargar nada.
+    // `install_mod_dir` valida antes de cualquier `collect_candidates`/
+    // descarga: un comando sin `confirmed_plan` es rechazado por Tauri
+    // (campo requerido) antes de ejecutar esta función, sin tocar disco.
+    let candidates = collect_candidates(&client, &slug, &mc_version, &loader).await?;
+    let installed = installed_mods(&instance_root)?;
+    let fresh_plan =
+        dependencies::build_mod_plan(&slug, &candidates, &mc_version, &loader, &installed)?;
+    if !dependencies::plan_matches(&confirmed_plan, &fresh_plan) {
+        return Err(
+            "El plan cambió desde tu confirmación (dependencias o versiones nuevas). Revisá el plan y confirmá de nuevo; no se descargó nada."
+                .to_string(),
+        );
+    }
+    let plan = fresh_plan;
+    // Dependencias primero (en orden del plan), después el mod principal.
+    // Cada descarga es transaccional (4A): si una falla, el principal no se
+    // marca como instalado y las ya instaladas no se duplican al reintentar.
+    // nombre/versión/URL/hash salen del plan verificado (mismo `version_id`);
+    // `version_file` los extrae del JSON recién descargado de esa versión.
+    for dep in &plan.dependencies {
+        if dep.already_installed {
+            continue;
+        }
+        let dep_version =
+            fetch_compatible_version(&client, &dep.slug, &mc_version, &loader).await?;
+        let (file_url, filename, sha1) = version_file(&dep_version)?;
+        let bytes = client
+            .get(&file_url)
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| e.to_string())?
+            .bytes()
+            .await
+            .map_err(|e| e.to_string())?;
+        let icon_url = fetch_project_icon(&client, &dep.slug).await;
+        let dep_dest = mods_dir.join(&filename);
+        fsx::apply_update_transactional(
+            &dep_dest,
+            &bytes,
+            sha1.clone().as_deref(),
+            &instance_root,
+            "mods",
+            &mods_dir,
+            content::ContentEntry {
+                slug: dep.slug.clone(),
+                version_id: dep.version_id.clone(),
+                filename: filename.clone(),
+                sha1,
+                loader: Some(loader.clone()),
+                mc_version: Some(mc_version.clone()),
+                icon_url,
+                source: "modrinth".to_string(),
+            },
+        )
+        .map_err(|e| format!("Dependencia {}: {e}", dep.slug))?;
+    }
     let resp = client
         .get(format!(
             "https://api.modrinth.com/v2/project/{slug}/version"
@@ -1599,6 +2309,7 @@ async fn install_mod(
         .get("id")
         .and_then(|i| i.as_str())
         .ok_or_else(|| "Modrinth no devolvió id de versión".to_string())?;
+    let icon_url = fetch_project_icon(&client, &slug).await;
     let dest = mods_dir.join(filename);
     let instance_root = paths.instance_dir(&instance)?;
 
@@ -1616,7 +2327,8 @@ async fn install_mod(
             sha1: sha1.map(String::from),
             loader: Some(loader.clone()),
             mc_version: Some(mc_version.clone()),
-            icon_url: None,
+            icon_url,
+            source: "modrinth".to_string(),
         },
     )?;
 
@@ -1760,6 +2472,7 @@ async fn download_project_file(
         .get("id")
         .and_then(|i| i.as_str())
         .ok_or_else(|| "Modrinth no devolvió id de versión".to_string())?;
+    let icon_url = fetch_project_icon(&client, slug).await;
     let dest = dest_dir.join(filename);
     let instance_root = paths.instance_dir(instance)?;
     let kind_for_index = match folder {
@@ -1782,7 +2495,8 @@ async fn download_project_file(
             sha1: sha1.map(String::from),
             loader: None,
             mc_version: mc_version.map(String::from),
-            icon_url: None,
+            icon_url,
+            source: "modrinth".to_string(),
         },
     )?;
 
@@ -2011,6 +2725,7 @@ pub fn run() {
             launch_instance,
             install_fabric,
             install_forge,
+            resolve_loader_version_cmd,
             list_shaderpacks,
             list_resourcepacks,
             get_resourcepack_state,
@@ -2019,10 +2734,13 @@ pub fn run() {
             remove_offline_skin,
             delete_file_in,
             list_installed_mods,
+            list_content,
+            migrate_content_map,
             search_mods,
             search_shaders,
             search_resourcepacks,
             install_mod,
+            plan_mod_dependencies,
             install_shaderpack,
             install_resourcepack,
             get_total_ram,
@@ -2099,6 +2817,177 @@ mod tests {
         let root = tmp_dir(name);
         let paths = Paths::new(root.join(".minecraft"));
         (root, paths)
+    }
+
+    fn plan_candidates() -> std::collections::HashMap<String, dependencies::VersionMetadata> {
+        let mk = |vid: &str, deps: &[(&str, &str)]| dependencies::VersionMetadata {
+            version_id: vid.to_string(),
+            filename: format!("{vid}.jar"),
+            game_versions: vec!["1.21.4".to_string()],
+            loaders: vec!["fabric".to_string()],
+            dependencies: deps
+                .iter()
+                .map(|(p, t)| dependencies::DependencyMetadata {
+                    project_id: p.to_string(),
+                    dependency_type: t.to_string(),
+                })
+                .collect(),
+        };
+        std::collections::HashMap::from([
+            (
+                "main".to_string(),
+                mk("v-main", &[("lib", "required"), ("opt", "optional")]),
+            ),
+            ("lib".to_string(), mk("v-lib", &[])),
+        ])
+    }
+
+    #[test]
+    fn version_metadata_extrae_datos() {
+        let v = json!({
+            "id": "v1",
+            "game_versions": ["1.21.4"],
+            "loaders": ["fabric", "quilt"],
+            "dependencies": [
+                {"project_id": "lib", "dependency_type": "required"},
+                {"project_id": "opt", "dependency_type": "optional"},
+                {"project_id": "sin-tipo"},
+                {"sin-project": "required"}
+            ],
+            "files": [{"filename": "x.jar", "url": "https://cdn/x.jar", "primary": true}]
+        });
+        let m = version_metadata(&v).unwrap();
+        assert_eq!(m.version_id, "v1");
+        assert_eq!(m.filename, "x.jar");
+        assert_eq!(m.game_versions, vec!["1.21.4"]);
+        assert_eq!(m.loaders, vec!["fabric", "quilt"]);
+        assert_eq!(m.dependencies.len(), 3);
+        assert_eq!(m.dependencies[0].project_id, "lib");
+
+        // Sin id o sin archivos válidos es error, no un plan parcial.
+        assert!(version_metadata(&json!({"id": "s"})).is_err());
+        assert!(version_metadata(&json!({"id": "s", "files": []})).is_err());
+    }
+
+    #[test]
+    fn plan_puro_no_toca_disco_ni_red() {
+        // `build_mod_plan` es el corazón de `plan_mod_dependencies`: sin red
+        // ni disco, prueba que el plan no modifica el índice ni crea archivos.
+        let (root, paths) = temp_paths("plan-puro");
+        let candidates = plan_candidates();
+        let plan =
+            dependencies::build_mod_plan("main", &candidates, "1.21.4", "fabric", &[]).unwrap();
+        assert_eq!(plan.slug, "main");
+        assert_eq!(plan.dependencies.len(), 1);
+        assert_eq!(plan.dependencies[0].slug, "lib");
+
+        // La instancia no existe en disco: ningún archivo ni índice creado.
+        let instance_root = paths.instance_dir("A").unwrap();
+        assert!(!instance_root.join("mods").exists());
+        assert!(!instance_root.join(".obsidia").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plan_invalido_falla_antes_de_red() {
+        let (root, paths) = temp_paths("plan-invalido");
+        // Instancia vacía: el error es de validación, sin red.
+        let r = install_mod_dir(&paths, "", "sodium", "1.21.4", "fabric");
+        assert!(r.is_err());
+        // Loader no soportado también falla antes de cualquier red.
+        assert!(install_mod_dir(&paths, "A", "sodium", "1.21.4", "rimjob").is_err());
+        // Slug inválido.
+        assert!(install_mod_dir(&paths, "A", "mal slug", "1.21.4", "fabric").is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plan_confirma_y_detecta_cambio() {
+        let (root, _paths) = temp_paths("plan-cambio");
+        let candidates = plan_candidates();
+        let confirmed =
+            dependencies::build_mod_plan("main", &candidates, "1.21.4", "fabric", &[]).unwrap();
+        let fresh =
+            dependencies::build_mod_plan("main", &candidates, "1.21.4", "fabric", &[]).unwrap();
+        assert!(dependencies::plan_matches(&confirmed, &fresh));
+
+        // Si Modrinth cambia una versión, el plan confirmado ya no coincide:
+        // `install_mod` aborta sin descargar nada.
+        let mut moved = candidates.clone();
+        moved.insert(
+            "lib".to_string(),
+            dependencies::VersionMetadata {
+                version_id: "v-lib-2".to_string(),
+                ..plan_candidates()["lib"].clone()
+            },
+        );
+        let fresh2 = dependencies::build_mod_plan("main", &moved, "1.21.4", "fabric", &[]).unwrap();
+        assert!(!dependencies::plan_matches(&confirmed, &fresh2));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn installed_mods_lee_el_indice_sin_escribir() {
+        let (root, paths) = temp_paths("inst-lee");
+        let a = paths.instance_dir("A").unwrap();
+        fs::create_dir_all(a.join("mods")).unwrap();
+        fs::create_dir_all(a.join(".obsidia")).unwrap();
+        content::write_index(
+            &a,
+            "mods",
+            &[content::ContentEntry {
+                slug: "lib".to_string(),
+                version_id: "v-lib".to_string(),
+                filename: "lib.jar".to_string(),
+                sha1: None,
+                loader: None,
+                mc_version: None,
+                icon_url: None,
+                source: "modrinth".to_string(),
+            }],
+        )
+        .unwrap();
+        let before = fs::read_to_string(a.join(".obsidia").join("mods.json")).unwrap();
+        let got = installed_mods(&a).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].slug, "lib");
+        // El índice queda intacto.
+        assert_eq!(
+            fs::read_to_string(a.join(".obsidia").join("mods.json")).unwrap(),
+            before
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn install_mod_sin_plan_confirmado_no_descarga() {
+        // Regresión 4C: `install_mod` exige `confirmed_plan: ModPlan` (no
+        // `Option`). Tauri rechaza el comando sin ese campo antes de
+        // ejecutar la función: sin red, sin disco, sin índice.
+        //
+        // Esa garantía es de tipos: la firma ya no admite `None`. El test
+        // cubre la mitad que sí es ejecutable sin red: el otro camino
+        // (`plan_mod_dependencies_inner`) valida con `install_mod_dir`
+        // antes de cualquier `collect_candidates`/HTTP, y el comando
+        // `install_mod` recalcula y compara con `plan_matches` obligatorio:
+        // sin `confirmedPlan` no hay comparación que pueda saltearse.
+        let (root, paths) = temp_paths("inst-sin-plan");
+        // Instancia vacía → validación pura, sin red.
+        assert!(install_mod_dir(&paths, "", "sodium", "1.21.4", "fabric").is_err());
+        // Instancia A no existe en disco: nada se creó.
+        let a = paths.instance_dir("A").unwrap();
+        assert!(!a.join("mods").exists());
+        assert!(!a.join(".obsidia").exists());
+        // El plan no puede ser `None`: `ModPlan` es requerido, y un plan
+        // arbitrario (de otro proyecto/versión) no coincide con el
+        // recalculado (`plan_confirma_y_detecta_cambio`).
+        let candidates = plan_candidates();
+        let other =
+            dependencies::build_mod_plan("lib", &candidates, "1.21.4", "fabric", &[]).unwrap();
+        let fresh =
+            dependencies::build_mod_plan("main", &candidates, "1.21.4", "fabric", &[]).unwrap();
+        assert!(!dependencies::plan_matches(&other, &fresh));
+        let _ = fs::remove_dir_all(&root);
     }
 
     fn png_sintetico(width: u32, height: u32) -> Vec<u8> {
@@ -3344,5 +4233,639 @@ mod tests {
         }
         assert!(!is_legacy_instance("legac"));
         assert!(!is_legacy_instance("legacyx"));
+    }
+
+    // ── Pruebas Bloque 6: Migración Legacy ────────────────────────────────
+
+    fn setup_legacy_minecraft(root: &Path) -> Paths {
+        let mc = root.join(".minecraft");
+        fs::create_dir_all(mc.join("mods")).unwrap();
+        fs::create_dir_all(mc.join("shaderpacks")).unwrap();
+        fs::create_dir_all(mc.join("resourcepacks")).unwrap();
+        fs::create_dir_all(mc.join("config")).unwrap();
+        fs::create_dir_all(mc.join("saves")).unwrap();
+        fs::write(mc.join("mods").join("sodium.jar"), b"mod-sodium").unwrap();
+        fs::write(mc.join("shaderpacks").join("bsl.zip"), b"shader-bsl").unwrap();
+        fs::write(mc.join("resourcepacks").join("purebd.zip"), b"pack-purebd").unwrap();
+        fs::write(mc.join("config").join("foo.txt"), b"config-foo").unwrap();
+        fs::write(mc.join("options.txt"), b"options-content").unwrap();
+        fs::create_dir_all(mc.join("saves").join("mundo")).unwrap();
+        fs::write(
+            mc.join("saves").join("mundo").join("level.dat"),
+            b"mundo-datos",
+        )
+        .unwrap();
+        let profiles = vec![
+            Profile {
+                name: "Perfil A".to_string(),
+                version: "1.21.4".to_string(),
+                username: "Jugador".to_string(),
+                ram: "2G".to_string(),
+                java_path: None,
+                loader: Some("fabric".to_string()),
+                loader_version: Some("0.14.9".to_string()),
+                fullscreen: false,
+                id: None,
+                block: None,
+                schema: 2,
+                created_at: None,
+                origin: None,
+            },
+            Profile {
+                name: "Perfil B".to_string(),
+                version: "1.20.1".to_string(),
+                username: "Jugador2".to_string(),
+                ram: "4G".to_string(),
+                java_path: None,
+                loader: Some("forge".to_string()),
+                loader_version: Some("47.2.0".to_string()),
+                fullscreen: true,
+                id: None,
+                block: None,
+                schema: 2,
+                created_at: None,
+                origin: None,
+            },
+        ];
+        let profiles_path = mc.join("obsidia").join("profiles.json");
+        fs::create_dir_all(mc.join("obsidia")).unwrap();
+        write_json_list(&profiles_path, &profiles).unwrap();
+        Paths::new(mc)
+    }
+
+    #[test]
+    fn migracion_legacy_exitosa_copia_contenido_y_actualiza_perfil() {
+        let root = tmp_dir("mig-ok");
+        let paths = setup_legacy_minecraft(&root);
+        let profiles_path = paths.profiles_file();
+
+        // Ejecutar migración del perfil A.
+        let res = migrate_legacy_profile_inner(&paths, "Perfil A".to_string());
+        assert!(res.is_ok(), "migración falló: {res:?}");
+
+        // Verificar que el perfil A ahora tiene id y origin migrated.
+        let profiles = read_json_list::<Profile>(&profiles_path).unwrap();
+        let perfil_a = profiles.iter().find(|p| p.name == "Perfil A").unwrap();
+        assert!(perfil_a.id.is_some(), "perfil A debería tener id");
+        assert_eq!(perfil_a.origin.as_deref(), Some("migrated"));
+        let id_a = perfil_a.id.as_deref().unwrap();
+
+        // El perfil B sigue sin id (legacy).
+        let perfil_b = profiles.iter().find(|p| p.name == "Perfil B").unwrap();
+        assert!(perfil_b.id.is_none(), "perfil B debería seguir sin id");
+
+        // Verificar directorio de instancia creado.
+        let inst = InstanceRef::parse(id_a).unwrap();
+        match inst {
+            InstanceRef::Instance(inst_id) => {
+                let dir = paths.instance_dir_for(&inst_id).unwrap();
+                assert!(dir.exists());
+                // Contenido copiado.
+                assert!(dir.join("mods").join("sodium.jar").exists());
+                assert!(dir.join("shaderpacks").join("bsl.zip").exists());
+                assert!(dir.join("resourcepacks").join("purebd.zip").exists());
+                assert!(dir.join("config").join("foo.txt").exists());
+                assert!(dir.join("options.txt").exists());
+                // Saves es junction, no carpeta real.
+                let saves = dir.join("saves");
+                assert!(paths::is_reparse_point(&saves));
+                // Marker existe.
+                assert!(dir.join(".obsidia").join("instance.json").exists());
+            }
+            InstanceRef::Legacy => panic!("id no debería ser legacy"),
+        }
+
+        // .minecraft/saves y mundos intactos.
+        let saves_mc = paths.shared_saves();
+        assert!(saves_mc.join("mundo").join("level.dat").exists());
+
+        // Journal completado (uno por perfil).
+        let journal = read_migration_journal(&paths, "Perfil A").unwrap().unwrap();
+        assert_eq!(journal.state, MigrationState::Completed);
+        assert_eq!(journal.profile_name, "Perfil A");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migracion_multiple_perfiles_legacy_independientes() {
+        let root = tmp_dir("mig-multi");
+        let paths = setup_legacy_minecraft(&root);
+        let profiles_path = paths.profiles_file();
+
+        // Migrar solo Perfil A.
+        migrate_legacy_profile_inner(&paths, "Perfil A".to_string()).unwrap();
+
+        // Perfil B sigue legacy.
+        let profiles = read_json_list::<Profile>(&profiles_path).unwrap();
+        let perfil_b = profiles.iter().find(|p| p.name == "Perfil B").unwrap();
+        assert!(perfil_b.id.is_none());
+
+        // Migrar Perfil B.
+        migrate_legacy_profile_inner(&paths, "Perfil B".to_string()).unwrap();
+
+        // Ambos tienen id distintos.
+        let profiles = read_json_list::<Profile>(&profiles_path).unwrap();
+        let ids: Vec<_> = profiles.iter().map(|p| p.id.clone()).collect();
+        assert_eq!(ids.iter().filter(|i| i.is_some()).count(), 2);
+        assert_ne!(ids[0], ids[1]);
+
+        // Ambos directorios de instancia existen y son independientes.
+        for p in &profiles {
+            let id = p.id.as_deref().unwrap();
+            let inst = InstanceRef::parse(id).unwrap();
+            match inst {
+                InstanceRef::Instance(inst_id) => {
+                    let dir = paths.instance_dir_for(&inst_id).unwrap();
+                    assert!(dir.exists());
+                }
+                InstanceRef::Legacy => panic!("no debería ser legacy"),
+            }
+        }
+
+        // .minecraft/saves intacto (compartido, no borrado).
+        assert!(
+            paths
+                .shared_saves()
+                .join("mundo")
+                .join("level.dat")
+                .exists()
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migracion_no_sobreescribe_archivos_existentes() {
+        let root = tmp_dir("mig-noover");
+        let paths = setup_legacy_minecraft(&root);
+
+        // Migrar Perfil A.
+        migrate_legacy_profile_inner(&paths, "Perfil A".to_string()).unwrap();
+
+        // Verificar que options.txt no se sobrescribió (contenido original de .minecraft).
+        let profiles_path = paths.profiles_file();
+        let profiles = read_json_list::<Profile>(&profiles_path).unwrap();
+        let id_a = profiles
+            .iter()
+            .find(|p| p.name == "Perfil A")
+            .unwrap()
+            .id
+            .as_deref()
+            .unwrap();
+        let inst = InstanceRef::parse(id_a).unwrap();
+        match inst {
+            InstanceRef::Instance(inst_id) => {
+                let dir = paths.instance_dir_for(&inst_id).unwrap();
+                let opts = fs::read_to_string(dir.join("options.txt")).unwrap();
+                assert_eq!(opts, "options-content");
+            }
+            InstanceRef::Legacy => panic!("no debería ser legacy"),
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migracion_rollback_fallo_escritura_perfil_no_deja_residuos() {
+        let root = tmp_dir("mig-rollback");
+        let paths = setup_legacy_minecraft(&root);
+
+        // Hacer profiles.json de solo lectura para forzar fallo al escribir el perfil.
+        let pf = paths.profiles_file();
+        let mut perms = fs::metadata(&pf).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&pf, perms).unwrap();
+
+        let res = migrate_legacy_profile_inner(&paths, "Perfil A".to_string());
+        assert!(res.is_err(), "debería fallar al escribir perfil");
+
+        // Restaurar permisos para limpieza.
+        let mut perms = fs::metadata(&pf).unwrap().permissions();
+        perms.set_readonly(false);
+        fs::set_permissions(&pf, perms).unwrap();
+
+        // El perfil sigue sin id (no se actualizó).
+        let profiles = read_json_list::<Profile>(&pf).unwrap();
+        let perfil_a = profiles.iter().find(|p| p.name == "Perfil A").unwrap();
+        assert!(
+            perfil_a.id.is_none(),
+            "perfil no debería tener id tras fallo"
+        );
+
+        // El directorio de instancia parcial debe haber sido limpiado.
+        let journal = read_migration_journal(&paths, "Perfil A").unwrap().unwrap();
+        assert_eq!(journal.state, MigrationState::Failed);
+
+        // No debe haber directorio de instancia huérfano para Perfil A.
+        let instances_root = paths.instances_root.clone();
+        if instances_root.exists() {
+            let entries: Vec<_> = fs::read_dir(&instances_root).unwrap().flatten().collect();
+            assert!(entries.is_empty(), "no debería haber instancias huérfanas");
+        }
+
+        // .minecraft/saves intacto.
+        assert!(
+            paths
+                .shared_saves()
+                .join("mundo")
+                .join("level.dat")
+                .exists()
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migracion_reintento_despues_de_fallo() {
+        let root = tmp_dir("mig-retry");
+        let paths = setup_legacy_minecraft(&root);
+
+        // Forzar fallo: profiles.json de solo lectura.
+        let pf = paths.profiles_file();
+        let mut perms = fs::metadata(&pf).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&pf, perms).unwrap();
+        let res = migrate_legacy_profile_inner(&paths, "Perfil A".to_string());
+        assert!(res.is_err());
+        // Restaurar permisos.
+        let mut perms = fs::metadata(&pf).unwrap().permissions();
+        perms.set_readonly(false);
+        fs::set_permissions(&pf, perms).unwrap();
+
+        // Reintentar: debe tener éxito.
+        let res2 = migrate_legacy_profile_inner(&paths, "Perfil A".to_string());
+        assert!(res2.is_ok(), "reintento falló: {res2:?}");
+
+        // Perfil A migrado.
+        let profiles = read_json_list::<Profile>(&pf).unwrap();
+        let perfil_a = profiles.iter().find(|p| p.name == "Perfil A").unwrap();
+        assert!(perfil_a.id.is_some());
+        assert_eq!(perfil_a.origin.as_deref(), Some("migrated"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migracion_no_toca_saves_de_minecraft() {
+        let root = tmp_dir("mig-saves");
+        let paths = setup_legacy_minecraft(&root);
+
+        // Registrar contenido y timestamp de saves antes de migrar.
+        let saves = paths.shared_saves();
+        let mundo = saves.join("mundo").join("level.dat");
+        assert!(mundo.exists());
+        let contenido_antes = fs::read(&mundo).unwrap();
+
+        migrate_legacy_profile_inner(&paths, "Perfil A".to_string()).unwrap();
+
+        // saves y mundo intactos tras migración.
+        assert!(mundo.exists());
+        assert_eq!(fs::read(&mundo).unwrap(), contenido_antes);
+
+        // La instancia tiene saves como junction apuntando a .minecraft/saves.
+        let profiles = read_json_list::<Profile>(&paths.profiles_file()).unwrap();
+        let id_a = profiles
+            .iter()
+            .find(|p| p.name == "Perfil A")
+            .unwrap()
+            .id
+            .as_deref()
+            .unwrap();
+        match InstanceRef::parse(id_a).unwrap() {
+            InstanceRef::Instance(inst_id) => {
+                let dir = paths.instance_dir_for(&inst_id).unwrap();
+                let saves_link = dir.join("saves");
+                assert!(paths::is_reparse_point(&saves_link));
+                // El junction resuelve a .minecraft/saves.
+                let real = fs::canonicalize(&saves_link).unwrap();
+                let shared_real = fs::canonicalize(&saves).unwrap();
+                assert!(real.starts_with(&shared_real) || shared_real.starts_with(&real));
+            }
+            InstanceRef::Legacy => panic!("no debería ser legacy"),
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migracion_perfil_ya_migrado_no_se_repite() {
+        let root = tmp_dir("mig-dup");
+        let paths = setup_legacy_minecraft(&root);
+
+        migrate_legacy_profile_inner(&paths, "Perfil A".to_string()).unwrap();
+
+        // Segundo intento debería fallar.
+        let res = migrate_legacy_profile_inner(&paths, "Perfil A".to_string());
+        assert!(res.is_err(), "migración duplicada debería fallar");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn journal_por_perfil_a_no_se_sobrescribe_al_migrar_b() {
+        let root = tmp_dir("mig-journal-perfil");
+        let paths = setup_legacy_minecraft(&root);
+
+        // 1. Crear manualmente un journal pendiente para Perfil A (simula interrupción).
+        use serde_json::json;
+        let journal_a = json!({
+            "profile_name": "Perfil A",
+            "instance_id": "PerfilA",
+            "state": "Started",
+            "started_at": "2026-01-01T00:00:00",
+            "completed_at": null,
+            "copied_files": [],
+            "error": null
+        });
+        let journal_path_a = paths.obsidia.join("migration-Perfil A.json");
+        fs::write(
+            &journal_path_a,
+            serde_json::to_string_pretty(&journal_a).unwrap(),
+        )
+        .unwrap();
+        assert!(journal_path_a.exists());
+
+        // 2. Migrar Perfil B: no debe tocar ni sobrescribir el journal de A.
+        migrate_legacy_profile_inner(&paths, "Perfil B".to_string()).unwrap();
+
+        // 3. El journal de A sigue existiendo con su estado original.
+        let journal_a_leido = fs::read_to_string(&journal_path_a).unwrap();
+        let ja: serde_json::Value = serde_json::from_str(&journal_a_leido).unwrap();
+        assert_eq!(ja["profile_name"], "Perfil A");
+        assert_eq!(ja["state"], "Started");
+        assert_eq!(ja["instance_id"], "PerfilA");
+
+        // 4. Perfil B sí se migró.
+        let profiles = read_json_list::<Profile>(&paths.profiles_file()).unwrap();
+        let perfil_b = profiles.iter().find(|p| p.name == "Perfil B").unwrap();
+        assert!(
+            perfil_b.id.is_some(),
+            "Perfil B debería tener id tras migrar"
+        );
+        assert_eq!(perfil_b.origin.as_deref(), Some("migrated"));
+
+        // 5. Perfil A sigue sin id (su journal pendiente no se procesó automáticamente).
+        let perfil_a = profiles.iter().find(|p| p.name == "Perfil A").unwrap();
+        assert!(perfil_a.id.is_none(), "Perfil A debería seguir sin id");
+
+        // 6. El journal de B existe con nombre seguro y está completado.
+        let journal_b = read_migration_journal(&paths, "Perfil B").unwrap().unwrap();
+        assert_eq!(journal_b.profile_name, "Perfil B");
+        assert_eq!(journal_b.state, MigrationState::Completed);
+
+        // 7. El journal de A (nombre antiguo inseguro pero válido) sigue intacto.
+        assert!(journal_path_a.exists());
+        let ja_leido = fs::read_to_string(&journal_path_a).unwrap();
+        let ja: serde_json::Value = serde_json::from_str(&ja_leido).unwrap();
+        assert_eq!(ja["profile_name"], "Perfil A");
+        assert_eq!(ja["state"], "Started");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // ── Pruebas de seguridad: nombres de journal de migración ─────────────
+
+    #[test]
+    fn journal_path_es_seguro_para_nombre_con_espacios_y_unicode() {
+        let root = tmp_dir("journal-space");
+        let mc = root.join(".minecraft");
+        fs::create_dir_all(&mc).unwrap();
+        let paths = Paths::new(mc);
+
+        let path_a = migration_journal_path(&paths, "Perfil A B");
+        let path_b = migration_journal_path(&paths, "Perfil A B");
+        assert_eq!(path_a, path_b, "mismo perfil da misma ruta");
+        let name_a = path_a.file_name().unwrap().to_str().unwrap();
+        // Prefijo + hash SHA-1 (40 hex) + .json: solo alfanumérico ASCII, guion y punto.
+        assert!(name_a.starts_with("migration-"));
+        assert!(name_a.ends_with(".json"));
+        let hash_part = &name_a["migration-".len()..(name_a.len() - ".json".len())];
+        assert!(hash_part.chars().all(|c| c.is_ascii_alphanumeric()));
+        assert_eq!(hash_part.len(), 40); // SHA-1 hex
+
+        let path_unicode = migration_journal_path(&paths, "Perfil Éñ 🎮");
+        let name_unicode = path_unicode.file_name().unwrap().to_str().unwrap();
+        assert_ne!(path_a, path_unicode, "nombre diferente da hash diferente");
+        let hash_unicode = &name_unicode["migration-".len()..(name_unicode.len() - ".json".len())];
+        assert!(hash_unicode.chars().all(|c| c.is_ascii_alphanumeric()));
+        assert_eq!(hash_unicode.len(), 40);
+    }
+
+    #[test]
+    fn journal_path_no_permite_path_traversal() {
+        let root = tmp_dir("journal-traversal");
+        let mc = root.join(".minecraft");
+        fs::create_dir_all(&mc).unwrap();
+        let paths = Paths::new(mc);
+
+        let path = migration_journal_path(&paths, "../../../etc/passwd");
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert!(!name.contains(".."));
+        assert!(!name.contains('/'));
+        assert!(!name.contains('\\'));
+        assert!(name.starts_with("migration-"));
+        assert!(name.ends_with(".json"));
+        let hash_part = &name["migration-".len()..(name.len() - ".json".len())];
+        assert!(hash_part.chars().all(|c| c.is_ascii_alphanumeric()));
+        assert_eq!(hash_part.len(), 40);
+    }
+
+    #[test]
+    fn journal_path_no_permite_caracteres_windows_invalidos() {
+        let root = tmp_dir("journal-win");
+        let mc = root.join(".minecraft");
+        fs::create_dir_all(&mc).unwrap();
+        let paths = Paths::new(mc);
+
+        for c in ['<', '>', ':', '"', '|', '?', '*'] {
+            let name = format!("perfil{c}invalido");
+            let path = migration_journal_path(&paths, &name);
+            let file_name = path.file_name().unwrap().to_str().unwrap();
+            assert!(
+                !file_name.contains(c),
+                "caracter {c} no debe aparecer en el nombre de archivo"
+            );
+            assert!(file_name.starts_with("migration-"));
+            assert!(file_name.ends_with(".json"));
+            let hash_part = &file_name["migration-".len()..(file_name.len() - ".json".len())];
+            assert!(hash_part.chars().all(|c| c.is_ascii_alphanumeric()));
+        }
+    }
+
+    #[test]
+    fn journal_path_es_estable_para_mismo_perfil() {
+        let root = tmp_dir("journal-stable");
+        let mc = root.join(".minecraft");
+        fs::create_dir_all(&mc).unwrap();
+        let paths = Paths::new(mc);
+
+        let p1 = migration_journal_path(&paths, "Perfil X");
+        let p2 = migration_journal_path(&paths, "Perfil X");
+        assert_eq!(p1, p2);
+    }
+
+    #[test]
+    fn journal_path_es_diferente_para_perfiles_distintos() {
+        let root = tmp_dir("journal-distinct");
+        let mc = root.join(".minecraft");
+        fs::create_dir_all(&mc).unwrap();
+        let paths = Paths::new(mc);
+
+        let p1 = migration_journal_path(&paths, "Perfil A");
+        let p2 = migration_journal_path(&paths, "Perfil B");
+        assert_ne!(p1, p2);
+    }
+
+    #[test]
+    fn journal_path_no_colisiona_despues_de_sanitizacion() {
+        let root = tmp_dir("journal-collision");
+        let mc = root.join(".minecraft");
+        fs::create_dir_all(&mc).unwrap();
+        let paths = Paths::new(mc);
+
+        // "A/B" y "A-B" sanitizarían igual si se usara reemplazo simple,
+        // pero con SHA-1 los hashes son diferentes.
+        let p1 = migration_journal_path(&paths, "A/B");
+        let p2 = migration_journal_path(&paths, "A-B");
+        assert_ne!(p1, p2);
+
+        // "perfil" y "perfil " (con espacio al final) también difieren.
+        let p3 = migration_journal_path(&paths, "perfil");
+        let p4 = migration_journal_path(&paths, "perfil ");
+        assert_ne!(p3, p4);
+    }
+
+    #[test]
+    fn read_migration_journal_recupera_journal_antiguo_inseguro() {
+        let root = tmp_dir("journal-legacy-ok");
+        let mc = root.join(".minecraft");
+        fs::create_dir_all(&mc.join("obsidia")).unwrap();
+        let paths = Paths::new(mc);
+
+        // Crear un journal antiguo con nombre "inseguro" pero válido como archivo.
+        use serde_json::json;
+        let journal_old = json!({
+            "profile_name": "Perfil Antiguo",
+            "instance_id": "PerfilAntiguo",
+            "state": "Started",
+            "started_at": "2026-01-01T00:00:00",
+            "completed_at": null,
+            "copied_files": [],
+            "error": null
+        });
+        let legacy_path = paths.obsidia.join("migration-Perfil Antiguo.json");
+        fs::write(
+            &legacy_path,
+            serde_json::to_string_pretty(&journal_old).unwrap(),
+        )
+        .unwrap();
+        assert!(legacy_path.exists());
+
+        // Leer mediante read_migration_journal debe encontrarlo y migrarlo al nuevo formato.
+        let result = read_migration_journal(&paths, "Perfil Antiguo");
+        assert!(result.is_ok());
+        let journal = result.unwrap().unwrap();
+        assert_eq!(journal.profile_name, "Perfil Antiguo");
+        assert_eq!(journal.state, MigrationState::Started);
+
+        // El nuevo archivo seguro debe existir ahora.
+        let new_path = migration_journal_path(&paths, "Perfil Antiguo");
+        assert!(new_path.exists());
+        let nuevo: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&new_path).unwrap()).unwrap();
+        assert_eq!(nuevo["profile_name"], "Perfil Antiguo");
+        assert_eq!(nuevo["state"], "Started");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_migration_journal_no_lee_journal_antiguo_con_nombre_inseguro() {
+        let root = tmp_dir("journal-legacy-bad");
+        let mc = root.join(".minecraft");
+        fs::create_dir_all(&mc.join("obsidia")).unwrap();
+        let paths = Paths::new(mc);
+
+        // Crear un archivo antiguo cuyo nombre contiene ".." (rechazado por
+        // is_safe_profile_name) pero que es un nombre de archivo válido literal.
+        use serde_json::json;
+        let journal_bad = json!({
+            "profile_name": "foo..bar",
+            "instance_id": "x",
+            "state": "Started",
+            "started_at": "2026-01-01T00:00:00",
+            "completed_at": null,
+            "copied_files": [],
+            "error": null
+        });
+        let bad_path = paths.obsidia.join("migration-foo..bar.json");
+        fs::write(
+            &bad_path,
+            serde_json::to_string_pretty(&journal_bad).unwrap(),
+        )
+        .unwrap();
+        assert!(bad_path.exists());
+
+        // read_migration_journal no debe intentar leer el archivo inseguro
+        // porque "foo..bar" no pasa is_safe_profile_name.
+        let result = read_migration_journal(&paths, "foo..bar");
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+
+        // Tampoco debe crear el nuevo formato para un nombre inseguro sin datos previos.
+        let new_path = migration_journal_path(&paths, "foo..bar");
+        assert!(!new_path.exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_migration_journal_journals_independientes_por_perfil() {
+        let root = tmp_dir("journal-independientes");
+        let mc = root.join(".minecraft");
+        fs::create_dir_all(&mc.join("obsidia")).unwrap();
+        let paths = Paths::new(mc);
+
+        use serde_json::json;
+        let ja = json!({
+            "profile_name": "Perfil A",
+            "instance_id": "A",
+            "state": "Started",
+            "started_at": "2026-01-01T00:00:00",
+            "completed_at": null,
+            "copied_files": [],
+            "error": null
+        });
+        let jb = json!({
+            "profile_name": "Perfil B",
+            "instance_id": "B",
+            "state": "Started",
+            "started_at": "2026-01-01T00:00:00",
+            "completed_at": null,
+            "copied_files": [],
+            "error": null
+        });
+
+        // Escribir directamente en los nombres seguros (simula migración previa).
+        let pa = migration_journal_path(&paths, "Perfil A");
+        let pb = migration_journal_path(&paths, "Perfil B");
+        fs::write(&pa, serde_json::to_string_pretty(&ja).unwrap()).unwrap();
+        fs::write(&pb, serde_json::to_string_pretty(&jb).unwrap()).unwrap();
+
+        // Leer el journal de A no debe retornar el de B.
+        let ja_leido = read_migration_journal(&paths, "Perfil A").unwrap().unwrap();
+        assert_eq!(ja_leido.profile_name, "Perfil A");
+        assert_eq!(ja_leido.instance_id, "A");
+
+        let jb_leido = read_migration_journal(&paths, "Perfil B").unwrap().unwrap();
+        assert_eq!(jb_leido.profile_name, "Perfil B");
+        assert_eq!(jb_leido.instance_id, "B");
+
+        // Un perfil sin journal retorna None.
+        let ninguno = read_migration_journal(&paths, "Perfil C").unwrap();
+        assert!(ninguno.is_none());
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

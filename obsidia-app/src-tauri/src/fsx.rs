@@ -973,6 +973,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             },
         )
         .unwrap();
@@ -994,6 +995,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             },
         )
         .unwrap();
@@ -1033,6 +1035,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             },
         )
         .unwrap();
@@ -1057,6 +1060,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             },
         );
         assert!(res.is_err());
@@ -1089,6 +1093,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             },
         )
         .unwrap();
@@ -1145,6 +1150,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             },
         )
         .unwrap();
@@ -1201,6 +1207,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             },
         )
         .unwrap();
@@ -1275,6 +1282,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             },
         )
         .unwrap();
@@ -1317,6 +1325,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             },
         )
         .unwrap();
@@ -1336,6 +1345,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             },
         )
         .unwrap();
@@ -1412,6 +1422,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             },
         )
         .unwrap();
@@ -1467,6 +1478,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             },
         )
         .unwrap();
@@ -1488,6 +1500,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             },
         )
         .unwrap();
@@ -1559,6 +1572,7 @@ mod tests {
                         loader: None,
                         mc_version: None,
                         icon_url: None,
+                        source: "modrinth".to_string(),
                     },
                 )
                 .unwrap();
@@ -1600,6 +1614,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             },
         )
         .unwrap();
@@ -1652,6 +1667,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             },
         )
         .unwrap();
@@ -1708,6 +1724,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             },
         )
         .unwrap();
@@ -1773,6 +1790,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             },
         )
         .unwrap();
@@ -1835,6 +1853,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             },
         )
         .unwrap();
@@ -1890,6 +1909,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             },
         )
         .unwrap();
@@ -1942,6 +1962,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             }],
         )
         .unwrap();
@@ -1974,6 +1995,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             }],
         )
         .unwrap();
@@ -2006,6 +2028,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             }],
         )
         .unwrap();
@@ -2037,6 +2060,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             }],
         )
         .unwrap();
@@ -2070,6 +2094,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             }],
         )
         .unwrap();
@@ -2112,6 +2137,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             },
         )
         .unwrap();
@@ -2244,6 +2270,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             },
         )
         .unwrap();
@@ -2302,6 +2329,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             }],
         )
         .unwrap();
@@ -2339,6 +2367,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             }],
         )
         .unwrap();
@@ -2383,6 +2412,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             },
         )
         .unwrap();
@@ -2455,6 +2485,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             },
         )
         .unwrap();
@@ -2550,6 +2581,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             }],
         )
         .unwrap();
@@ -2599,6 +2631,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             }],
         )
         .unwrap();
@@ -2648,6 +2681,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             }],
         )
         .unwrap();
@@ -2696,6 +2730,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             }],
         )
         .unwrap();
@@ -2742,6 +2777,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             }],
         )
         .unwrap();
@@ -2777,6 +2813,7 @@ mod tests {
                     loader: None,
                     mc_version: None,
                     icon_url: None,
+                    source: "modrinth".to_string(),
                 },
                 crate::content::ContentEntry {
                     slug: "b".to_string(),
@@ -2786,6 +2823,7 @@ mod tests {
                     loader: None,
                     mc_version: None,
                     icon_url: None,
+                    source: "modrinth".to_string(),
                 },
             ],
         )
@@ -2886,6 +2924,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             }],
         )
         .unwrap();
@@ -2934,6 +2973,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             }],
         )
         .unwrap();
@@ -2983,6 +3023,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             },
         )
         .unwrap();
@@ -3022,6 +3063,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             },
         )
         .unwrap();
@@ -3057,6 +3099,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             },
         )
         .unwrap();
@@ -3114,6 +3157,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             },
         )
         .unwrap();
@@ -3187,6 +3231,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             }],
         )
         .unwrap();
@@ -3265,6 +3310,7 @@ mod tests {
                 loader: None,
                 mc_version: None,
                 icon_url: None,
+                source: "modrinth".to_string(),
             }],
         )
         .unwrap();
@@ -3291,6 +3337,93 @@ mod tests {
         let j = read_journal(&dir).unwrap();
         assert!(j.pending.iter().all(|e| e.slug != "a"));
         assert!(j.pending.iter().any(|e| e.slug == "b"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_update_persiste_icon_url() {
+        use crate::content::{ContentEntry, read_index};
+        let dir = std::env::temp_dir().join(format!("obsidia-fsx-{}-icon", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join(".obsidia")).unwrap();
+        fs::create_dir_all(dir.join("mods")).unwrap();
+        let dest = dir.join("mods").join("mod.jar");
+
+        apply_update_transactional(
+            &dest,
+            b"v1",
+            None,
+            &dir,
+            "mods",
+            &dir.join("mods"),
+            ContentEntry {
+                slug: "mod".to_string(),
+                version_id: "v1".to_string(),
+                filename: "mod.jar".to_string(),
+                sha1: None,
+                loader: None,
+                mc_version: None,
+                icon_url: Some("https://example.com/icon.png".to_string()),
+                source: "modrinth".to_string(),
+            },
+        )
+        .unwrap();
+
+        let entries = read_index(&dir, "mods").unwrap();
+        assert_eq!(
+            entries[0].icon_url.as_deref(),
+            Some("https://example.com/icon.png")
+        );
+
+        // Actualización conserva/refresca icono.
+        apply_update_transactional(
+            &dest,
+            b"v2",
+            None,
+            &dir,
+            "mods",
+            &dir.join("mods"),
+            ContentEntry {
+                slug: "mod".to_string(),
+                version_id: "v2".to_string(),
+                filename: "mod.jar".to_string(),
+                sha1: None,
+                loader: None,
+                mc_version: None,
+                icon_url: Some("https://example.com/icon2.png".to_string()),
+                source: "modrinth".to_string(),
+            },
+        )
+        .unwrap();
+        let entries = read_index(&dir, "mods").unwrap();
+        assert_eq!(
+            entries[0].icon_url.as_deref(),
+            Some("https://example.com/icon2.png")
+        );
+
+        // None se maneja correctamente.
+        apply_update_transactional(
+            &dest,
+            b"v3",
+            None,
+            &dir,
+            "mods",
+            &dir.join("mods"),
+            ContentEntry {
+                slug: "mod".to_string(),
+                version_id: "v3".to_string(),
+                filename: "mod.jar".to_string(),
+                sha1: None,
+                loader: None,
+                mc_version: None,
+                icon_url: None,
+                source: "modrinth".to_string(),
+            },
+        )
+        .unwrap();
+        let entries = read_index(&dir, "mods").unwrap();
+        assert!(entries[0].icon_url.is_none());
 
         let _ = fs::remove_dir_all(&dir);
     }
