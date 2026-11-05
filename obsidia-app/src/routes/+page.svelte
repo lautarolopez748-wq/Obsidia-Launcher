@@ -20,10 +20,14 @@ let accHtml = '';
     skins:[], sk:-1, skmodel:'classic',
     pstate:[], ptextures:{}, filemap:{ mods:{}, shaders:{}, packs:{} },
     files:{ mods:[], shaders:[], packs:[] },
+    content:{ mods:[], shaders:[], packs:[] },
+    contentIcons:{ mods:{}, shaders:{}, packs:{} },
+    migratingContent:false, migratedInstance:'', migratingProfile:'',
     results:{ mods:null, shaders:null, packs:null }, searching:false, seq:0, searchSeq:0, installSeq:0, busy:{},
     sv:[], af:false, rf:false, es:null, ns:'', na:'',
-    np:false, npEdit:-1, npName:'', npVersion:'', npLoader:'Vanilla', npRam:4, npJava:'', npErr:'', npBusy:false, npFullscreen:false, npBlock:'',
-    javas:[]
+    np:false, npEdit:-1, npName:'', npVersion:'', npLoader:'Vanilla', npLoaderVersion:'', npRam:4, npJava:'', npErr:'', npBusy:false, npFullscreen:false, npBlock:'',
+    javas:[],
+    plan:null, planSlug:'', planKind:''
   };
 
   // ───────────── Utilidades ─────────────
@@ -101,8 +105,10 @@ let accHtml = '';
     return false;
   }
   function iconFor(kind, file){
-    const map = fileMap(kind);
     const target = norm(fileName(file));
+    const cmap = (S.contentIcons && S.contentIcons[kind]) ? S.contentIcons[kind] : {};
+    if (cmap[file]) return cmap[file];
+    const map = fileMap(kind);
     for (const slug of Object.keys(map)){
       const v = map[slug];
       if (!v || !v.icon) continue;
@@ -138,7 +144,7 @@ let accHtml = '';
 
   // ───────────── Perfiles ─────────────
   function cards(){
-    return P.map((p,i)=>`<div class="pcard ${i==S.p?'on':''}" role="button" tabindex="0" data-act="sel" data-i="${i}"><div class="slot"><img src="/images/blocks/${p.block||'Crafting_Table'}.png" alt=""></div><div class="pinfo"><b>${esc(p.n)}</b><span class="${i==S.p?'on':''}">${i==S.p?'Activo · ':''}${esc(p.s)}</span></div><button class="edit" data-act="ped" data-i="${i}">Editar</button></div>`).join('');
+    return P.map((p,i)=>`<div class="pcard ${i==S.p?'on':''}" role="button" tabindex="0" data-act="sel" data-i="${i}"><div class="slot"><img src="/images/blocks/${p.block||'Crafting_Table'}.png" alt=""></div><div class="pinfo"><b>${esc(p.n)}</b><span class="${i==S.p?'on':''}">${i==S.p?'Activo · ':''}${esc(p.s)}</span></div>${S.migratingProfile===p.n?'<span class="mu" style="color:#FBBF24">Migrando…</span>':`<button class="edit" data-act="ped" data-i="${i}">Editar</button>${p.id?'':`<button class="mig" data-act="migrate" data-i="${i}" title="Migrar a instancia independiente">Migrar</button>`}`}</div>`).join('');
   }
   const newCard = `<button class="newcard" data-act="new"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>Nueva instancia</button>`;
 
@@ -299,14 +305,57 @@ let accHtml = '';
   } catch(e) { return "<h1>MODS ERROR: " + esc(String(e)) + "</h1>"; }
   }
 
-  async function refreshFiles(){
-    const [m, s, r, ps] = await Promise.all([
-      invoke('list_installed_mods', { instance:inst() }).catch(()=>[]),
-      invoke('list_shaderpacks', { instance:inst() }).catch(()=>[]),
-      invoke('list_resourcepacks', { instance:inst() }).catch(()=>[]),
+  async function migrateContentMaps(){
+     const instance = inst();
+     if (S.migratingContent || S.migratedInstance === instance) return;
+     S.migratingContent = true;
+     let ok = true;
+     try {
+       for (const kind of ['mods','shaders','packs']){
+         const map = fileMap(kind);
+         const seen = new Set();
+         const entries = [];
+         for (const [slug, v] of Object.entries(map)){
+           const file = (v && typeof v === 'object') ? (v.file || '') : (typeof v === 'string' ? v : '');
+           const f = fileName(file);
+           if (!f) continue;
+           if (seen.has(f)) continue;
+           seen.add(f);
+           entries.push({ slug, version_id:'unknown', filename:f, sha1:null, loader:null, mc_version:null, icon_url: (v && v.icon) ? v.icon : null });
+         }
+         if (entries.length){
+           try { await invoke('migrate_content_map', { instance, kind, entries }); }
+           catch(e){ console.error('migrate_content_map', kind, e); ok = false; }
+         }
+       }
+     } finally {
+       if (ok) S.migratedInstance = instance;
+       S.migratingContent = false;
+     }
+   }
+async function refreshFiles(){
+    if (S.migratedInstance !== inst()) await migrateContentMaps();
+const [mc, sc, pc, ps] = await Promise.all([
+      invoke('list_content', { instance:inst(), kind:'mods' }).catch(()=>null),
+      invoke('list_content', { instance:inst(), kind:'shaders' }).catch(()=>null),
+      invoke('list_content', { instance:inst(), kind:'packs' }).catch(()=>null),
       invoke('get_resourcepack_state', { instance:inst() }).catch(()=>[])
     ]);
+    let m = (mc && Array.isArray(mc) && mc.length) ? mc.map(x=>x.file) : null;
+    let s = (sc && Array.isArray(sc) && sc.length) ? sc.map(x=>x.file) : null;
+    let r = (pc && Array.isArray(pc) && pc.length) ? pc.map(x=>x.file) : null;
+    if (m === null) m = await invoke('list_installed_mods', { instance:inst() }).catch(()=>[]);
+    if (s === null) s = await invoke('list_shaderpacks', { instance:inst() }).catch(()=>[]);
+    if (r === null) r = await invoke('list_resourcepacks', { instance:inst() }).catch(()=>[]);
     S.files = { mods:m||[], shaders:s||[], packs:r||[] };
+    S.content = { mods:mc||[], shaders:sc||[], packs:pc||[] };
+    S.contentIcons = { mods:{}, shaders:{}, packs:{} };
+    for (const kind of ['mods','shaders','packs']){
+      const arr = S.content[kind] || [];
+      const map = {};
+      for (const e of arr) if (e && e.file) map[e.file] = e.icon || '';
+      S.contentIcons[kind] = map;
+    }
     S.pstate = ps||[];
     loadFileMap();
   }
@@ -336,17 +385,31 @@ let accHtml = '';
   }
 
   async function doInstall(kind, slug){
+    // Mods: plan previo sin descargas + confirmación explícita.
+    if (kind==='mods'){
+      if (S.busy[slug] || S.plan) return;
+      const p = P[S.p];
+      if (!p){ toast('Creá una instancia primero.', true); return; }
+      if ((p.loader||'Vanilla')==='Vanilla'){ toast('Esta instancia es Vanilla: creá una instancia Fabric o Forge para usar mods.', true); return; }
+      S.busy[slug] = 1; refreshGrid();
+      try {
+        const plan = await invoke('plan_mod_dependencies', { slug, mcVersion:p.version, loader:p.loader.toLowerCase(), instance:inst() });
+        if (S.busy[slug] && plan) { S.plan = plan; S.planSlug = slug; S.planKind = kind; }
+        else toast('No se pudo planear la instalación.', true);
+      } catch(e){ toast('No se pudo planear la instalación: '+e, true); }
+      delete S.busy[slug];
+      refreshGrid(); render();
+      return;
+    }
     if (S.busy[slug]) return;
     const mySeq = ++S.installSeq;
     const p = P[S.p];
     if (!p){ toast('Creá una instancia primero.', true); return; }
-    if (kind==='mods' && (p.loader||'Vanilla')==='Vanilla'){ toast('Esta instancia es Vanilla: creá una instancia Fabric o Forge para usar mods.', true); return; }
     S.busy[slug] = 1; refreshGrid();
     try {
       if (mySeq !== S.installSeq) return;
       let res = null;
-      if (kind==='mods') res = await invoke('install_mod', { slug, mcVersion:p.version, loader:p.loader.toLowerCase(), instance:inst() });
-      else if (kind==='shaders') res = await invoke('install_shaderpack', { slug, mcVersion:p.version, instance:inst() });
+      if (kind==='shaders') res = await invoke('install_shaderpack', { slug, mcVersion:p.version, instance:inst() });
       else res = await invoke('install_resourcepack', { slug, mcVersion:p.version, instance:inst() });
       const result = (S.results && S.results[kind]) ? S.results[kind].find(r => r.slug === slug) : null;
       if (res) rememberFile(kind, slug, res, result && result.icon_url);
@@ -354,6 +417,40 @@ let accHtml = '';
     } catch(e){ toast('No se pudo instalar: '+e, true); }
     delete S.busy[slug];
     await refreshFiles(); loadFileMap(); refreshGrid(); render();
+  }
+
+  // Instala el plan confirmado tal cual (el backend lo recalcula y verifica).
+  async function doInstallConfirmed(){
+    if (!S.plan) return;
+    const p = P[S.p];
+    if (!p){ toast('Creá una instancia primero.', true); return; }
+    const slug = S.planSlug, kind = S.planKind;
+    if (S.busy[slug]) return;
+    S.busy[slug] = 1;
+    const plan = S.plan;
+    S.plan = null; S.planSlug=''; S.planKind='';
+    render();
+    try {
+      const res = await invoke('install_mod', { slug, mcVersion:p.version, loader:p.loader.toLowerCase(), instance:inst(), confirmedPlan:plan });
+      const result = (S.results && S.results[kind]) ? S.results[kind].find(r => r.slug === slug) : null;
+      if (res) rememberFile(kind, slug, res, result && result.icon_url);
+      toast('Instalado correctamente.');
+    } catch(e){ toast('No se pudo instalar: '+e, true); }
+    delete S.busy[slug];
+    await refreshFiles(); loadFileMap(); refreshGrid(); render();
+  }
+
+  function planModal(){
+    const pl = S.plan;
+    if (!pl) return '';
+    const deps = (pl.dependencies||[]).map(d=>`<div style="display:flex;align-items:center;gap:12px;padding:6px 12px;border-radius:12px;background:rgba(255,255,255,.04)"><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(d.slug)}</span><span class="mu" style="font-size:12px">${esc(d.filename)}</span><span class="pf" style="color:${d.already_installed?'#A9A5B8':'#6EE7B7'}">${d.already_installed?'Ya instalada':'A instalar'}</span></div>`).join('');
+    return `<div class="md-back" data-act="plancancel"><div class="md gl" style="width:min(520px,94vw);padding:26px;display:flex;flex-direction:column;gap:14px">
+      <h2 style="margin:0">Confirmar instalación</h2>
+      <div class="mu">Se instalarán primero las dependencias obligatorias y después el mod principal.</div>
+      <div style="display:flex;align-items:center;gap:12px;padding:8px 12px;border-radius:12px;background:rgba(255,255,255,.04)"><b style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(pl.slug)}</b><span class="mu" style="font-size:12px">${esc(pl.filename)}</span><span class="pf" style="color:#C4B5FD">Mod principal</span></div>
+      ${(pl.dependencies||[]).length?deps:'<div class="mu">Este mod no tiene dependencias obligatorias.</div>'}
+      <div style="display:flex;gap:10px;justify-content:flex-end"><button class="sec" style="height:42px" data-act="plancancel">Cancelar</button><button class="ib" style="margin:0;height:42px;padding:0 22px" data-act="planinstall">Instalar</button></div>
+    </div></div>`;
   }
 
   // ───────────── Servidores ─────────────
@@ -396,6 +493,7 @@ let accHtml = '';
     accHtml = accCard(S.sk, S.nick, S.ms, S.skins);
     navHtml = TABS.map(t=>`<button class="${t[0]==S.tab?'on':''}" data-act="go" data-t="${t[0]}">${ic(t[0])}${t[1]}</button>`).join('');
     let html = { home, profiles, mods, servers, settings, account }[S.tab]();
+    if (S.plan) html += planModal();
     if (S.np) html += npModal();
     if (S.msc) html += msModal();
     Q('#view').innerHTML = html;
@@ -414,7 +512,9 @@ let accHtml = '';
     let id = await findLoaderVersion(p);
     if (id) return id;
     S.stage = 'loader'; S.pg = 3; render();
-    await invoke(p.loader==='Fabric' ? 'install_fabric' : 'install_forge', { mcVersion:p.version });
+    const installArgs = { mcVersion:p.version };
+    if (p.loaderVersion) installArgs.loader_version = p.loaderVersion;
+    await invoke(p.loader==='Fabric' ? 'install_fabric' : 'install_forge', installArgs);
     id = await findLoaderVersion(p);
     if (!id) throw new Error('No encontré el loader '+p.loader+' después de instalarlo.');
     return id;
@@ -478,7 +578,7 @@ let accHtml = '';
     const list = await invoke('get_profiles').catch(e => { toast(String(e), true); return []; });
     P = (list||[]).map(p => {
       const loader = p.loader || 'Vanilla';
-      return { n:p.name, version:p.version, loader, ram:normRam(p.ram), java:p.java_path||'', username:p.username, fullscreen:!!p.fullscreen, id:p.id||'', block:p.block||'', s:loader+' · '+p.version };
+      return { n:p.name, version:p.version, loader, loaderVersion:p.loader_version||'', ram:normRam(p.ram), java:p.java_path||'', username:p.username, fullscreen:!!p.fullscreen, id:p.id||'', block:p.block||'', s:loader+' · '+p.version };
     });
     let i = P.findIndex(x => x.n === select);
     if (i < 0) { try { i = P.findIndex(x => x.n === localStorage.getItem('obsidia.sel')); } catch(e){ i = -1; } }
@@ -497,11 +597,12 @@ let accHtml = '';
   }
   function openNew(){
     S.np = true; S.npEdit = -1; S.npName = ''; S.npVersion = VERSIONS[0] || '1.21.4'; S.npLoader = 'Vanilla';
-    S.npRam = Math.min(S.defRam, S.totalRam); S.npJava = ''; S.npErr = ''; S.npBusy = false; S.npFullscreen = false; S.npBlock = ''; render();
+    S.npLoaderVersion = ''; S.npRam = Math.min(S.defRam, S.totalRam); S.npJava = ''; S.npErr = ''; S.npBusy = false; S.npFullscreen = false; S.npBlock = ''; render();
   }
   function openEdit(i){
     const p = P[i]; if (!p) return;
     S.np = true; S.npEdit = i; S.npName = p.n; S.npVersion = p.version; S.npLoader = p.loader || 'Vanilla';
+    S.npLoaderVersion = p.loaderVersion || '';
     S.npRam = p.ram; S.npJava = p.java || ''; S.npErr = ''; S.npBusy = false; S.npFullscreen = !!p.fullscreen; S.npBlock = p.block || ''; render();
   }
   async function saveProfileFromModal(){
@@ -509,14 +610,21 @@ let accHtml = '';
     const name = val('#np-name').trim() || ('Instancia '+(P.length+1));
     S.npName = name; S.npVersion = val('#np-version'); S.npLoader = val('#np-loader') || 'Vanilla';
     S.npRam = +val('#np-ram') || 4; S.npJava = val('#np-java'); S.npFullscreen = !!(Q('#np-fullscreen') && Q('#np-fullscreen').checked); S.npBlock = val('#np-block');
+    // Resolver la versión del loader antes de guardar: única fuente de verdad.
+    let loaderVersion = S.npLoaderVersion || '';
+    if (S.npLoader && S.npLoader !== 'Vanilla'){
+      try { loaderVersion = await invoke('resolve_loader_version_cmd', { loader:S.npLoader, mc_version:S.npVersion }) || ''; }
+      catch(e){ S.npErr = `No se pudo resolver la versión del loader ${S.npLoader}: ${e}`; render(); S.npBusy = false; return; }
+      if (!loaderVersion){ S.npErr = `El loader ${S.npLoader} no tiene versión para ${S.npVersion}`; render(); S.npBusy = false; return; }
+    }
     const old = S.npEdit >= 0 ? P[S.npEdit] : null;
     if (P.some((x,i) => x.n === name && i !== S.npEdit)){ S.npErr = 'Ya existe una instancia con ese nombre.'; render(); return; }
     S.npBusy = true;
     try {
       if (old && old.id) {
-        await invoke('update_instance', { id: old.id, profile:{ name, version:S.npVersion, username:S.nick, ram:S.npRam+'G', java_path:S.npJava||null, loader:S.npLoader, fullscreen:S.npFullscreen, block:S.npBlock||null, id: old.id } });
+        await invoke('update_instance', { id: old.id, profile:{ name, version:S.npVersion, username:S.nick, ram:S.npRam+'G', java_path:S.npJava||null, loader:S.npLoader, loader_version: loaderVersion || null, fullscreen:S.npFullscreen, block:S.npBlock||null, id: old.id } });
       } else {
-        await invoke('create_instance', { profile:{ name, version:S.npVersion, username:S.nick, ram:S.npRam+'G', java_path:S.npJava||null, loader:S.npLoader, fullscreen:S.npFullscreen, block:S.npBlock||null, id: (old ? old.id : newId()) || null } });
+        await invoke('create_instance', { profile:{ name, version:S.npVersion, username:S.nick, ram:S.npRam+'G', java_path:S.npJava||null, loader:S.npLoader, loader_version: loaderVersion || null, fullscreen:S.npFullscreen, block:S.npBlock||null, id: (old ? old.id : newId()) || null } });
       }
       await loadProfiles(name);
       selectProfile(S.p);
@@ -538,6 +646,25 @@ let accHtml = '';
     else if (a=='play'){ play(); }
     else if (a=='new'){ openNew(); }
     else if (a=='ped'){ openEdit(+d.i); }
+    else if (a=='migrate'){
+        const p = P[+d.i];
+        if (!p || p.id){ toast('Este perfil ya es una instancia propia.', true); return; }
+        const confirmMsg = `¿Migrar el perfil '${esc(p.n)}' a una instancia independiente?\n\nSe copiarán mods, shaders, resource packs, configuraciones y options.txt desde .minecraft.\n\nLa instalación original de .minecraft no se moverá ni se borrará.\nLos mundos compartidos se conservan para todas las instancias.\n\nEsta acción es por este perfil solamente; no se migra nada automáticamente.`;
+        if (!confirm(confirmMsg)) return;
+        S.migratingProfile = p.n;
+        render();
+        try {
+            await invoke('migrate_legacy_profile', { profile_name: p.n });
+            await loadProfiles(p.n);
+            selectProfile(S.p);
+            toast('Perfil migrado a instancia independiente.');
+        } catch(e){
+            toast('No se pudo migrar: '+String(e), true);
+        } finally {
+            S.migratingProfile = '';
+            render();
+        }
+    }
     else if (a=='npclose'){ if (e.target !== b) return; S.np = false; S.npEdit = -1; render(); }
     else if (a=='npcreate'){ saveProfileFromModal(); }
     else if (a=='npdel'){
@@ -559,6 +686,8 @@ let accHtml = '';
     else if (a=='pdown'){ const i = +d.i; if (i<S.pstate.length-1 && S.pstate[i].enabled && S.pstate[i+1].enabled){ [S.pstate[i+1], S.pstate[i]] = [S.pstate[i], S.pstate[i+1]]; savePacks(); render(); } }
     else if (a=='pauto'){ S.pstate = [...S.pstate].sort((x,y) => (Number(y.enabled)-Number(x.enabled)) || x.name.localeCompare(y.name)); savePacks(); render(); }
     else if (a=='inst'){ doInstall(d.kind, d.slug); }
+    else if (a=='plancancel'){ if (e.target !== b) return; S.plan = null; S.planSlug=''; S.planKind=''; render(); }
+    else if (a=='planinstall'){ doInstallConfirmed(); }
     else if (a=='fdel'){
       const folder = { mods:'mods', shaders:'shaderpacks', packs:'resourcepacks' }[d.kind];
       try { await invoke('delete_file_in', { folder, name:d.file, instance:inst() }); forgetFile(d.kind, d.file); toast('Eliminado.'); }
@@ -642,6 +771,7 @@ let accHtml = '';
   }
   function onKey(e){
     if ((e.key==='Enter' || e.key===' ') && e.target.matches && e.target.matches('[role=button][data-act]')){ e.preventDefault(); e.target.click(); }
+    if (e.key==='Escape' && S.plan){ S.plan = null; S.planSlug=''; S.planKind=''; render(); }
     if (e.key==='Escape' && (S.np || S.msc)){ if (S.msc) invoke('ms_cancel').catch(()=>{}); S.np = false; S.msc = null; S.npEdit = -1; render(); }
   }
 
