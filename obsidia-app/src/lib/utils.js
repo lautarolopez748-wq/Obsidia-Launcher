@@ -113,7 +113,7 @@ export function safeImageUrl(src) {
   try { return encodeURI(s).replace(/'/g, '%27').replace(/&/g, '%26'); } catch(e){ return ''; }
 }
 
-export function resCard(kind, r, busy, installedFile) {
+export function resCard(kind, r, busy, installedFile, progress) {
   const inst = installedFile;
   /** @param {any} src @param {string} grad */
   const bg = (src, grad) => {
@@ -128,7 +128,19 @@ export function resCard(kind, r, busy, installedFile) {
   const thumb = kind === 'mods'
     ? `<div style="display:flex;align-items:center;gap:12px"><div class="mi" style='${bg(r.icon_url, modGrad)}'></div><b>${esc(r.title)}</b></div>`
     : `<div style='position:relative;height:176px;border-radius:14px;overflow:hidden;${bg(r.icon_url, kind === 'packs' ? packGrad : shaderGrad)}'><div style="position:absolute;left:0;right:0;bottom:0;padding:14px;background:linear-gradient(transparent,rgba(10,8,20,.9))"><b style="font-size:17px;line-height:1.3">${esc(r.title)}</b></div></div>`;
-  return `<div class="mc gl">${thumb}<div class="mu" style="line-height:1.5">${esc(r.description)}</div><div class="mu" style="font-size:12px">${(r.downloads || 0).toLocaleString('es-AR')} descargas</div><div style="display:flex;gap:10px;margin-top:auto"><button class="ib ${inst ? 'in' : ''}" style="flex:1;margin:0" ${inst || busy ? 'disabled' : ''} data-act="inst" data-kind="${kind}" data-slug="${esc(r.slug)}">${busy ? 'Instalando…' : inst ? 'Instalado ✓' : 'Instalar'}</button>${inst ? trb(kind, inst, 38) : ''}<button class="sec" style="height:38px;padding:0 14px" data-act="openmod" data-kind="${kind}" data-slug="${esc(r.slug)}">Ver</button></div></div>`;
+  let btnLabel = 'Instalar';
+  let btnDisabled = false;
+  if (progress){
+    if (progress.stage === 'resolving'){ btnLabel = 'Resolviendo dependencias…'; btnDisabled = true; }
+    else if (progress.stage === 'downloading'){
+      const pct = progress.total > 0 ? Math.round(100 * progress.done / progress.total) : 0;
+      btnLabel = `Descargando ${pct} %`; btnDisabled = true;
+    }
+    else if (progress.stage === 'applying'){ btnLabel = 'Instalando…'; btnDisabled = true; }
+  }
+  if (btnDisabled || busy){ btnDisabled = true; }
+  if (inst){ btnLabel = 'Instalado ✓'; }
+  return `<div class="mc gl">${thumb}<div class="mu" style="line-height:1.5">${esc(r.description)}</div><div class="mu" style="font-size:12px">${(r.downloads || 0).toLocaleString('es-AR')} descargas</div><div style="display:flex;gap:10px;margin-top:auto"><button class="ib ${inst ? 'in' : ''}" style="flex:1;margin:0" ${btnDisabled ? 'disabled' : ''} data-act="inst" data-kind="${kind}" data-slug="${esc(r.slug)}">${btnLabel}</button>${inst ? trb(kind, inst, 38) : ''}<button class="sec" style="height:38px;padding:0 14px" data-act="openmod" data-kind="${kind}" data-slug="${esc(r.slug)}">Ver</button></div></div>`;
 }
 
 export function irisBanner(busy) {
