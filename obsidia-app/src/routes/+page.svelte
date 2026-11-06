@@ -9,8 +9,8 @@ import { ic, TABS, G, TRASH, LOADERS, RAMS, STG, LBL, esc, norm, validName, norm
 
   // ───────────── Estado ─────────────
   let P = [];
-$: navHtml = TABS.map(([k,label])=>`<button class="${S.tab===k?'on':''}" data-act="go" data-t="${k}" aria-label="${label}">${ic(k)}<span>${esc(label)}</span></button>`).join('');
-$: accHtml = accCard(S.sk, S.nick, S.ms, S.skins);
+  let navHtml = '';
+  let accHtml = '';
   let VERSIONS = [];
   let S = {
     tab:'home', p:0, sec:'mods', q:'', f:'Todos',
@@ -27,7 +27,8 @@ $: accHtml = accCard(S.sk, S.nick, S.ms, S.skins);
     sv:[], af:false, rf:false, es:null, ns:'', na:'',
     np:false, npEdit:-1, npName:'', npVersion:'', npLoader:'Vanilla', npLoaderVersion:'', npRam:4, npJava:'', npErr:'', npBusy:false, npFullscreen:false, npBlock:'',
     javas:[],
-    plan:null, planSlug:'', planKind:'', planId:null, planInstance:'', pendingRender:false
+    plan:null, planSlug:'', planKind:'', planId:null, planInstance:'', pendingRender:false,
+    progress:{}, prePlans:{}, updateCheckTs:{}, prePlanPending:[]
   };
 
   // ───────────── Utilidades ─────────────
@@ -329,7 +330,7 @@ $: accHtml = accCard(S.sk, S.nick, S.ms, S.skins);
         ? `<div class="gl" style="padding:16px 18px;display:flex;align-items:center;gap:12px;flex-wrap:wrap"><span class="mu">No se pudo buscar: ${esc(err)}</span><button class="sec" style="height:38px;padding:0 16px" data-act="retrysearch">Reintentar</button></div>`
         : `<div class="mu">${S.searching?'Buscando en Modrinth…':'Cargando…'}</div>`;
     } else {
-      h += res.length ? res.map(r => resCard(kind, r, S.busy[r.slug], installedFile(kind, r.slug) || findFile(kind, r.slug, r.title))).join('') : '<div class="mu">No hay resultados en Modrinth.</div>';
+      h += res.length ? res.map(r => resCard(kind, r, S.busy[r.slug], installedFile(kind, r.slug) || findFile(kind, r.slug, r.title), S.progress[r.slug])).join('') : '<div class="mu">No hay resultados en Modrinth.</div>';
     }
     return h;
   }
@@ -408,27 +409,40 @@ async function loadInventory(instance){
   /** @param {string} kind @param {string} [instance] */
   async function refreshKind(kind, instance){
     const target = instance || inst();
-    const inv = await loadInventory(target);
     const r = await invoke('list_content', { instance: target, kind }).catch(()=>null);
-    if (Array.isArray(r)) { inv.files[kind] = r.map(x=>x.file); inv.content[kind] = r; inv.icons[kind] = {}; const m = {}; for (const e of r) if (e && e.file) m[e.file] = e.icon || ''; inv.icons[kind] = m; }
-    if (kind === 'packs') inv.pstate = await invoke('get_resourcepack_state', { instance: target }).catch(()=>[]);
-    if (target === inst()){
-      await syncInventory(target);
+    if (Array.isArray(r)) {
+      S.files[kind] = r.map(x=>x.file);
+      S.content[kind] = r;
+      S.contentIcons[kind] = {};
+      const m = {}; for (const e of r) if (e && e.file) m[e.file] = e.icon || '';
+      S.contentIcons[kind] = m;
+    }
+    if (kind === 'packs') {
+      S.pstate = await invoke('get_resourcepack_state', { instance: target }).catch(()=>[]);
+    }
+    if (target === inst()) {
+      loadFileMap();
       if (S.tab === 'mods') { refreshGrid(); renderOrDefer(); }
     }
-    // background update check for this kind
-    (async () => {
-      try {
-        const ups = await invoke('check_content_updates', { instance: target, kind });
-        if (Array.isArray(ups)){
-          const m = new Map(ups.map(u => [u.file, !!u.hay_actualizacion]));
-          const arr = inv.content[kind] || [];
-          for (const e of arr) if (m.has(e.file)) e.hay_actualizacion = m.get(e.file);
-        }
-      } catch(e){}
-      if (target !== inst()) return;
-      if (S.tab === 'mods') { refreshGrid(); renderOrDefer(); }
-    })();
+  }
+
+  /** @param {string} kind @param {string} [instance] */
+  async function checkUpdatesIfDue(kind, instance){
+    const target = instance || inst();
+    const key = `${target}|${kind}`;
+    const now = Date.now();
+    const last = S.updateCheckTs[key] || 0;
+    if (now - last < 600000) return;
+    try {
+      const ups = await invoke('check_content_updates', { instance: target, kind });
+      S.updateCheckTs[key] = now;
+      if (Array.isArray(ups)){
+        const m = new Map(ups.map(u => [u.file, !!u.hay_actualizacion]));
+        const arr = S.content[kind] || [];
+        for (const e of arr) if (m.has(e.file)) e.hay_actualizacion = m.get(e.file);
+      }
+    } catch(e){}
+    if (target === inst() && S.tab === 'mods') { refreshGrid(); renderOrDefer(); }
   }
   async function refreshFiles(){
     const instance = inst();
@@ -531,43 +545,53 @@ async function savePacks(){
       perfOpId = slug+'-'+Date.now();
       perfLog('clic_instalar');
       S.busy[slug] = 1; refreshGrid();
-      try {
-        perfLog('inicio_resolucion');
-        const result = await invoke('plan_mod_dependencies', { slug, mcVersion:p.version, loader:p.loader.toLowerCase(), instance });
-        perfLog('fin_resolucion');
-        if (!S.busy[slug] || !result) { delete S.busy[slug]; refreshGrid(); render(); return; }
-        const plan = result.plan;
-        const planId = result.plan_id;
-        const pending = (plan.dependencies||[]).filter(d => !d.already_installed);
-        if (pending.length === 0) {
-          // Todas las dependencias ya están instaladas: instalar directamente sin modal.
-          try {
-            perfLog('inicio_invoke_install_mod');
-            const res = await invoke('install_mod', { slug, mcVersion:p.version, loader:p.loader.toLowerCase(), instance, confirmedPlan:plan, planId });
-            perfLog('respuesta_backend');
-            const result2 = (S.results && S.results[kind]) ? S.results[kind].find(r => r.slug === slug) : null;
-            if (res) rememberFile(kind, slug, res, result2 && result2.icon_url, instance);
-            toast('Instalado correctamente.');
-            perfLog('boton_instalado');
-          } catch(e){ toast('No se pudo instalar: '+e, true); }
+      let result = null;
+      const preKey = `${slug}|${instance}`;
+      const pre = S.prePlans.find(x => x && x.key === preKey);
+      if (pre && Date.now() - pre.ts < 240000) {
+        result = { plan: pre.plan, plan_id: pre.planId };
+      }
+      if (!result) {
+        try {
+          perfLog('inicio_resolucion');
+          const result2 = await invoke('plan_mod_dependencies', { slug, mcVersion:p.version, loader:p.loader.toLowerCase(), instance });
+          perfLog('fin_resolucion');
+          result = result2;
+        } catch(e) {
+          S.planId = null;
+          toast('No se pudo planear la instalación: '+e, true);
           delete S.busy[slug];
-          await refreshKind(kind, instance);
-          perfLog('fin_refreshkind');
+          refreshGrid(); render();
           return;
         }
-        // Hay dependencias pendientes: el modal viaja con el plan y su planId intactos.
-        S.plan = plan;
-        S.planId = planId;
-        S.planSlug = slug;
-        S.planKind = kind;
-        S.planInstance = instance;
-        delete S.busy[slug];
-        refreshGrid(); render();
-        return;
-      } catch(e){
-        S.planId = null;
-        toast('No se pudo planear la instalación: '+e, true);
       }
+      if (!S.busy[slug] || !result) { delete S.busy[slug]; refreshGrid(); render(); return; }
+      const plan = result.plan;
+      const planId = result.plan_id;
+      const pending = (plan.dependencies||[]).filter(d => !d.already_installed);
+      if (pending.length === 0) {
+        try {
+          perfLog('inicio_invoke_install_mod');
+          const res = await invoke('install_mod', { slug, mcVersion:p.version, loader:p.loader.toLowerCase(), instance, confirmedPlan:plan, planId, iconUrl: pre && pre.iconUrl });
+          perfLog('respuesta_backend');
+          const result2 = (S.results && S.results[kind]) ? S.results[kind].find(r => r.slug === slug) : null;
+          if (res) rememberFile(kind, slug, res, result2 && result2.icon_url, instance);
+          toast('Instalado correctamente.');
+          perfLog('boton_instalado');
+        } catch(e){ toast('No se pudo instalar: '+e, true); }
+        delete S.busy[slug];
+        await refreshKind(kind, instance);
+        perfLog('fin_refreshkind');
+        return;
+      }
+      S.plan = plan;
+      S.planId = planId;
+      S.planSlug = slug;
+      S.planKind = kind;
+      S.planInstance = instance;
+      delete S.busy[slug];
+      refreshGrid(); render();
+      return;
       delete S.busy[slug];
       refreshGrid(); render();
       return;
@@ -609,7 +633,7 @@ async function savePacks(){
     render();
     try {
       perfLog('inicio_invoke_install_mod');
-      const res = await invoke('install_mod', { slug, mcVersion:p.version, loader:p.loader.toLowerCase(), instance, confirmedPlan:plan, planId });
+      const res = await invoke('install_mod', { slug, mcVersion:p.version, loader:p.loader.toLowerCase(), instance, confirmedPlan:plan, planId, iconUrl: S.prePlans.find(x => x && x.key === `${slug}|${instance}`)?.iconUrl });
       perfLog('respuesta_backend');
       const result = (S.results && S.results[kind]) ? S.results[kind].find(r => r.slug === slug) : null;
       if (res) rememberFile(kind, slug, res, result && result.icon_url, instance);
@@ -938,7 +962,7 @@ function account(){
     const b = e.target.closest('[data-act]');
     if (!b) return;
     const a = b.dataset.act, d = b.dataset;
-    if (a=='go'){ S.tab = d.t; render(); if (d.t==='servers') pingAll(); if (d.t==='mods'){ if (S.content.mods && S.content.mods.length) doSearch(); else syncInventory(inst()).then(()=>{ if (S.tab==='mods') doSearch(); }); } }
+    if (a=='go'){ S.tab = d.t; render(); if (d.t==='servers') pingAll(); if (d.t==='mods'){ if (S.content.mods && S.content.mods.length) { doSearch(); checkUpdatesIfDue('mods'); } else { await syncInventory(inst()); doSearch(); checkUpdatesIfDue('mods'); } } }
     else if (a=='sel'){ selectProfile(+d.i); render(); syncInventory(inst()).then(()=>{ if (S.tab==='home'||S.tab==='profiles') render(); }).catch(()=>{}); }
     else if (a=='play'){ play(); }
     else if (a=='new'){ openNew(); }
@@ -1130,6 +1154,8 @@ function account(){
     const focusId = ae && ae.id ? ae.id : '';
     const selStart = ae && typeof ae.selectionStart === 'number' ? ae.selectionStart : null;
     const selEnd = ae && typeof ae.selectionEnd === 'number' ? ae.selectionEnd : null;
+    navHtml = TABS.map(([k,label])=>`<button class="${S.tab===k?'on':''}" data-act="go" data-t="${k}" aria-label="${label}">${ic(k)}<span>${esc(label)}</span></button>`).join('');
+    accHtml = accCard(S.sk, S.nick, S.ms, S.skins);
     let html = { home, profiles, mods, servers, settings, account }[S.tab]();
     if (S.np) html += npModal();
     if (S.msc) html += msModal();
@@ -1188,6 +1214,39 @@ function account(){
     render();
   }
 
+  // Progreso de instalación (install-progress) por slug.
+  let progressUn = null;
+
+  // Pre-planificación por mouseover/focusin sobre botones "Instalar" de mods.
+  let prePlanTimer = null;
+
+  async function prePlanMod(slug, instance){
+    const key = `${slug}|${instance}`;
+    if (S.prePlans.find(x => x && x.key === key)) return;
+    const p = P[S.p];
+    try {
+      const result = await invoke('plan_mod_dependencies', { slug, mcVersion:(p&&p.version)||'', loader:(p&&p.loader||'Vanilla').toLowerCase(), instance });
+      if (result && result.plan) {
+        const iconUrl = (S.results && S.results.mods) ? S.results.mods.find(r => r.slug === slug)?.icon_url : null;
+        S.prePlans.push({ key, plan: result.plan, planId: result.plan_id, ts: Date.now(), iconUrl });
+        if (S.tab === 'mods') refreshGrid();
+      }
+    } catch(e){ /* pre-plan opcional: no bloquear */ }
+  }
+
+  function onPrePlanMouseOver(e){
+    const b = e.target.closest('[data-act="inst"][data-kind="mods"]');
+    if (!b) return;
+    const slug = b.dataset.slug;
+    if (!slug) return;
+    const instance = inst();
+    prePlanTimer = setTimeout(() => { prePlanMod(slug, instance); prePlanTimer = null; }, 250);
+  }
+
+  function onPrePlanMouseOut(){
+    if (prePlanTimer) { clearTimeout(prePlanTimer); prePlanTimer = null; }
+  }
+
   onMount(() => {
     // En producción se bloquean menú contextual y recarga; en dev quedan disponibles
     // para depurar. El menú sí se permite dentro de campos editables.
@@ -1207,6 +1266,17 @@ function account(){
     document.addEventListener('change', onChange);
     document.addEventListener('input', onInput);
     document.addEventListener('keydown', onKey);
+    // Progreso de instalación en tiempo real.
+    listen('install-progress', ev => {
+      const { stage, slug, instance, done, total } = ev.payload || {};
+      if (!slug) return;
+      S.progress[slug] = { stage, done, total };
+      if (S.tab === 'mods') refreshGrid();
+    }).then(u => { progressUn = u; }).catch(() => { progressUn = null; });
+    // Pre-planificación al pasar el mouse sobre botones "Instalar" de mods.
+    document.addEventListener('mouseover', onPrePlanMouseOver);
+    document.addEventListener('mouseout', onPrePlanMouseOut);
+    document.addEventListener('focusin', onPrePlanMouseOver);
     init();
     return () => {
       if (prod) {
@@ -1217,6 +1287,11 @@ function account(){
       document.removeEventListener('change', onChange);
       document.removeEventListener('input', onInput);
       document.removeEventListener('keydown', onKey);
+      document.removeEventListener('mouseover', onPrePlanMouseOver);
+      document.removeEventListener('mouseout', onPrePlanMouseOut);
+      document.removeEventListener('focusin', onPrePlanMouseOver);
+      if (prePlanTimer) clearTimeout(prePlanTimer);
+      if (progressUn) { try { progressUn(); } catch(e){} progressUn = null; }
     };
   });
 </script>
