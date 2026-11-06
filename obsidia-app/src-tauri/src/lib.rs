@@ -14,18 +14,236 @@ use crate::instances::InstanceMarker;
 use crate::launcher::sha1_hex;
 use crate::paths::InstanceId;
 use base64::Engine;
+use futures_util::StreamExt;
 use paths::{InstanceRef, Paths};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use sha1::{Digest, Sha1};
+use std::collections::HashMap;
 use std::fs;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{OnceLock, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static MIGRATION_PRESERVED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
-use tauri::Manager;
+use tauri::{Emitter, Manager};
+use tokio::task::JoinSet;
+
+/// Caché de planes de instalación resueltos.
+/// Evita volver a consultar metadatos de Modrinth cuando el usuario confirma
+/// un plan ya resuelto por `plan_mod_dependencies`.
+struct CachedPlan {
+    candidates: std::collections::HashMap<String, dependencies::VersionMetadata>,
+    mc_version: String,
+    loader: String,
+    instance: String,
+    created_at: std::time::Instant,
+}
+
+static PLAN_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<u64, CachedPlan>>,
+> = std::sync::OnceLock::new();
+static PLAN_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Cliente HTTP global reutilizado (pool de conexiones + TLS compartido).
+static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+/// Entrada de caché con marca de tiempo para TTL.
+struct CacheEntry {
+    value: Vec<String>,
+    fetched_at: Instant,
+}
+
+/// TTL de la caché de listado de versiones: 1 hora.
+const VERSION_CACHE_TTL_SECS: u64 = 3600;
+
+static VERSION_CACHE: OnceLock<Mutex<HashMap<String, CacheEntry>>> = OnceLock::new();
+
+fn version_cache_get(key: &str) -> Option<Vec<String>> {
+    let m = VERSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let guard = m.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = guard.get(key)?;
+    if entry.fetched_at.elapsed().as_secs() < VERSION_CACHE_TTL_SECS {
+        Some(entry.value.clone())
+    } else {
+        None
+    }
+}
+
+fn version_cache_insert(key: String, value: Vec<String>) {
+    let m = VERSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = m.lock().unwrap_or_else(|e| e.into_inner());
+    guard.insert(
+        key,
+        CacheEntry {
+            value,
+            fetched_at: Instant::now(),
+        },
+    );
+}
+
+/// Tiempo de vida de un plan en caché (5 minutos).
+const PLAN_TTL_SECS: u64 = 300;
+
+/// Número máximo de planes en caché.
+const PLAN_CACHE_MAX: usize = 100;
+
+/// Limpia planes expirados y aplica límite de tamaño.
+fn plan_cache_cleanup() {
+    let mut cache = plan_cache();
+    let now = std::time::Instant::now();
+    cache.retain(|_, p| now.duration_since(p.created_at).as_secs() < PLAN_TTL_SECS);
+    if cache.len() > PLAN_CACHE_MAX {
+        // Eliminar los más antiguos
+        let mut entries: Vec<(u64, std::time::Instant)> =
+            cache.iter().map(|(id, p)| (*id, p.created_at)).collect();
+        entries.sort_by_key(|(_, t)| *t);
+        let to_remove = entries.len() - PLAN_CACHE_MAX;
+        for (id, _) in entries.iter().take(to_remove) {
+            cache.remove(id);
+        }
+    }
+}
+
+fn plan_cache_next_id() -> u64 {
+    PLAN_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Devuelve un guard de la caché de planes, inicializándola perezosamente si es necesario.
+fn plan_cache() -> std::sync::MutexGuard<'static, std::collections::HashMap<u64, CachedPlan>> {
+    let lock = PLAN_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    lock.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Escribe un evento de performance a %TEMP%\obsidia-performance.log.
+/// Nunca falla la instalación si el logging falla.
+/// No-op fuera de builds de debug para no escribir en disco en release.
+fn log_performance(msg: &str) {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let temp_dir = std::env::var("TEMP")
+        .or_else(|_| std::env::var("TMP"))
+        .unwrap_or_else(|_| ".".to_string());
+    let log_path = std::path::Path::new(&temp_dir).join("obsidia-performance.log");
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| format!("{}.{}", d.as_secs(), d.subsec_millis()))
+        .unwrap_or_else(|_| "0".to_string());
+    let line = format!("[{}] {}\n", timestamp, msg);
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+}
+
+/// Comando Tauri para recibir eventos de performance del frontend y escribirlos al log.
+#[tauri::command]
+async fn log_performance_event(event: String) {
+    log_performance(&event);
+}
+
+/// Progreso de instalación de mods para el evento `install-progress`.
+#[derive(Serialize, Clone)]
+struct InstallProgress {
+    stage: &'static str,
+    slug: String,
+    instance: String,
+    done: usize,
+    total: usize,
+}
+
+/// Emite el evento `install-progress` → { stage, slug, instance, done, total }.
+/// Nunca falla el comando si el envío falla.
+fn install_progress(
+    app: &tauri::AppHandle,
+    stage: &'static str,
+    slug: &str,
+    instance: &str,
+    done: usize,
+    total: usize,
+) {
+    let _ = app.emit(
+        "install-progress",
+        InstallProgress {
+            stage,
+            slug: slug.to_string(),
+            instance: instance.to_string(),
+            done,
+            total,
+        },
+    );
+}
+
+/// Descarga con streaming, acumulando en `Vec<u8>`, calculando SHA-1
+/// incremental y emitiendo `install-progress` (stage "downloading") como
+/// máximo cada 100 ms o cada 5 %. Si hay `expected_sha1`, lo compara al final.
+async fn download_with_progress(
+    client: &reqwest::Client,
+    url: &str,
+    expected_sha1: Option<&str>,
+    app: &tauri::AppHandle,
+    slug: &str,
+    instance: &str,
+) -> Result<(Vec<u8>, String), String> {
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| e.to_string())?;
+
+    let total = resp.content_length().unwrap_or(0) as usize;
+    let mut stream = resp.bytes_stream();
+
+    let mut hasher = Sha1::new();
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut last_emit = Instant::now();
+    let mut last_pct: usize = 0;
+
+    install_progress(app, "downloading", slug, instance, 0, total);
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| e.to_string())?;
+        hasher.update(&chunk);
+        bytes.extend_from_slice(&chunk);
+
+        let now = Instant::now();
+        let elapsed_ms = now.duration_since(last_emit).as_millis();
+        let pct = if total > 0 {
+            (bytes.len() * 100 / total).min(100)
+        } else {
+            0
+        };
+        let pct_advanced = total > 0 && pct >= last_pct.saturating_add(5);
+
+        if elapsed_ms >= 100 || pct_advanced {
+            last_emit = now;
+            last_pct = pct;
+            install_progress(app, "downloading", slug, instance, bytes.len(), total);
+        }
+    }
+
+    install_progress(app, "downloading", slug, instance, bytes.len(), total);
+
+    let sha1_hex = format!("{:x}", hasher.finalize());
+
+    // Detección temprana: si hay hash esperado y no coincide, fallar antes de
+    // aplicar la transacción (apply_batch_transactional lo chequea de nuevo).
+    if let Some(expected) = expected_sha1 {
+        if !sha1_hex.eq_ignore_ascii_case(expected) {
+            return Err(format!(
+                "El archivo descargado no coincide con su SHA1: se descartó"
+            ));
+        }
+    }
+
+    Ok((bytes, sha1_hex))
+}
 
 pub(crate) fn new_cmd<S: AsRef<std::ffi::OsStr>>(program: S) -> Command {
     let mut c = std::process::Command::new(program);
@@ -510,7 +728,7 @@ pub struct JavaInfo {
     pub version: String,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_installed_versions(paths: tauri::State<'_, Paths>) -> Result<Vec<String>, String> {
     let dir = paths.versions.clone();
     let mut out = Vec::new();
@@ -529,7 +747,13 @@ fn get_installed_versions(paths: tauri::State<'_, Paths>) -> Result<Vec<String>,
 
 #[tauri::command]
 async fn list_versions() -> Result<Vec<String>, String> {
-    let resp = reqwest::get("https://piston-meta.mojang.com/mc/game/version_manifest_v2.json")
+    if let Some(cached) = version_cache_get("minecraft_versions") {
+        return Ok(cached);
+    }
+    let client = http()?;
+    let resp = client
+        .get("https://piston-meta.mojang.com/mc/game/version_manifest_v2.json")
+        .send()
         .await
         .map_err(|e| e.to_string())?;
     let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
@@ -546,6 +770,7 @@ async fn list_versions() -> Result<Vec<String>, String> {
             }
         }
     }
+    version_cache_insert("minecraft_versions".to_string(), ids.clone());
     Ok(ids)
 }
 #[tauri::command]
@@ -554,7 +779,8 @@ async fn list_fabric_versions(mc_version: String) -> Result<Vec<String>, String>
         "https://meta.fabricmc.net/v2/versions/loader/{}",
         mc_version
     );
-    let resp = reqwest::get(&url).await.map_err(|e| e.to_string())?;
+    let client = http()?;
+    let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!(
             "fabric versions request failed: HTTP {}",
@@ -579,11 +805,16 @@ async fn list_fabric_versions(mc_version: String) -> Result<Vec<String>, String>
 
 #[tauri::command]
 async fn list_forge_versions(mc_version: String) -> Result<Vec<String>, String> {
-    let resp = reqwest::get(
-        "https://maven.minecraftforge.net/net/minecraftforge/forge/maven-metadata.xml",
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    let cache_key = format!("forge_{}", mc_version);
+    if let Some(cached) = version_cache_get(&cache_key) {
+        return Ok(cached);
+    }
+    let client = http()?;
+    let resp = client
+        .get("https://maven.minecraftforge.net/net/minecraftforge/forge/maven-metadata.xml")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!(
             "forge versions request failed: HTTP {}",
@@ -605,6 +836,7 @@ async fn list_forge_versions(mc_version: String) -> Result<Vec<String>, String> 
     }
     out.sort();
     out.dedup();
+    version_cache_insert(cache_key, out.clone());
     Ok(out)
 }
 
@@ -649,12 +881,12 @@ pub(crate) fn write_json_list<T: Serialize>(path: &Path, list: &[T]) -> Result<(
     write_atomic(path, &data)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_profiles(paths: tauri::State<'_, Paths>) -> Result<Vec<Profile>, String> {
     read_json_list(&paths.profiles_file())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn save_profile(paths: tauri::State<'_, Paths>, profile: Profile) -> Result<(), String> {
     // Crear/asegurar el junction de mundos al registrar una instancia propia.
     if let Some(id) = &profile.id
@@ -724,7 +956,7 @@ fn remove_instance_files_keeping_saves(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn delete_profile(paths: tauri::State<'_, Paths>, name: String) -> Result<(), String> {
     let path = paths.profiles_file();
     let mut profiles = read_json_list::<Profile>(&path)?;
@@ -752,12 +984,12 @@ fn delete_profile(paths: tauri::State<'_, Paths>, name: String) -> Result<(), St
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn create_instance(paths: tauri::State<'_, Paths>, profile: Profile) -> Result<(), String> {
     instances::create_instance(&paths, profile)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn update_instance(
     paths: tauri::State<'_, Paths>,
     id: String,
@@ -766,7 +998,7 @@ fn update_instance(
     instances::update_instance(&paths, id, profile)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn delete_instance(paths: tauri::State<'_, Paths>, id: String) -> Result<(), String> {
     instances::delete_instance(&paths, id)
 }
@@ -966,7 +1198,7 @@ fn migrate_legacy_profile_inner(paths: &Paths, profile_name: String) -> Result<(
 /// `.minecraft/saves` ni mundos. El perfil se actualiza solo después de
 /// verificar que la migración terminó correctamente.
 #[allow(dead_code)]
-#[tauri::command]
+#[tauri::command(async)]
 fn migrate_legacy_profile(
     paths: tauri::State<'_, Paths>,
     profile_name: String,
@@ -1563,12 +1795,14 @@ impl Default for AppSettings {
     }
 }
 
-#[tauri::command]
-fn list_shaderpacks(
+#[tauri::command(async)]
+async fn list_shaderpacks(
     paths: tauri::State<'_, Paths>,
     instance: String,
 ) -> Result<Vec<String>, String> {
-    list_shaderpacks_in(&paths, &instance)
+    let paths = paths.inner().clone();
+    let instance_c = instance.clone();
+    spawn_blocking_result(move || list_shaderpacks_in(&paths, &instance_c)).await
 }
 
 fn list_shaderpacks_in(paths: &Paths, instance: &str) -> Result<Vec<String>, String> {
@@ -1593,12 +1827,14 @@ fn list_shaderpacks_in(paths: &Paths, instance: &str) -> Result<Vec<String>, Str
     Ok(out)
 }
 
-#[tauri::command]
-fn list_resourcepacks(
+#[tauri::command(async)]
+async fn list_resourcepacks(
     paths: tauri::State<'_, Paths>,
     instance: String,
 ) -> Result<Vec<String>, String> {
-    list_resourcepacks_in(&paths, &instance)
+    let paths = paths.inner().clone();
+    let instance_c = instance.clone();
+    spawn_blocking_result(move || list_resourcepacks_in(&paths, &instance_c)).await
 }
 
 fn list_resourcepacks_in(paths: &Paths, instance: &str) -> Result<Vec<String>, String> {
@@ -1716,14 +1952,15 @@ fn instance_subdir(paths: &Paths, instance: &str, folder: &str) -> Result<PathBu
     Ok(paths.instance_dir(instance)?.join(folder))
 }
 
-#[tauri::command]
-fn delete_file_in(
+#[tauri::command(async)]
+async fn delete_file_in(
     paths: tauri::State<'_, Paths>,
     folder: String,
     name: String,
     instance: String,
 ) -> Result<(), String> {
-    delete_file_in_in(&paths, &folder, &name, &instance)
+    let paths = paths.inner().clone();
+    spawn_blocking_result(move || delete_file_in_in(&paths, &folder, &name, &instance)).await
 }
 
 fn delete_file_in_in(
@@ -1797,12 +2034,14 @@ fn delete_file_in_in(
     Ok(())
 }
 
-#[tauri::command]
-fn list_installed_mods(
+#[tauri::command(async)]
+async fn list_installed_mods(
     paths: tauri::State<'_, Paths>,
     instance: String,
 ) -> Result<Vec<String>, String> {
-    list_installed_mods_in(&paths, &instance)
+    let paths = paths.inner().clone();
+    let instance_c = instance.clone();
+    spawn_blocking_result(move || list_installed_mods_in(&paths, &instance_c)).await
 }
 
 fn list_installed_mods_in(paths: &Paths, instance: &str) -> Result<Vec<String>, String> {
@@ -1843,6 +2082,20 @@ async fn list_content(
 }
 
 #[tauri::command]
+async fn check_content_updates(
+    paths: tauri::State<'_, Paths>,
+    instance: String,
+    kind: String,
+) -> Result<Vec<content::UpdateStatus>, String> {
+    let kind = match kind.as_str() {
+        "mods" | "shaders" | "packs" => kind,
+        _ => return Err("Tipo de contenido no válido".to_string()),
+    };
+    let paths = paths.inner().clone();
+    content::check_content_updates(&paths, &instance, &kind).await
+}
+
+#[tauri::command(async)]
 fn migrate_content_map(
     paths: tauri::State<'_, Paths>,
     instance: String,
@@ -1871,11 +2124,62 @@ async fn fetch_project_icon(client: &reqwest::Client, slug: &str) -> Option<Stri
         .map(str::to_string)
 }
 
-fn http() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .user_agent(launcher::UA)
-        .build()
-        .map_err(|e| e.to_string())
+/// Consulta iconos de varios proyectos en una sola llamada a Modrinth.
+/// Devuelve un mapa slug -> icon_url para los proyectos que lo tengan.
+async fn fetch_project_icons_batch(
+    client: &reqwest::Client,
+    slugs: &[String],
+) -> Result<HashMap<String, String>, String> {
+    if slugs.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let ids_json = serde_json::to_string(slugs).map_err(|e| e.to_string())?;
+    let resp = client
+        .get("https://api.modrinth.com/v2/projects")
+        .query(&[("ids", &ids_json)])
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?;
+    let projects: Vec<serde_json::Value> = resp.json().await.map_err(|e| e.to_string())?;
+    let mut out = HashMap::new();
+    for p in projects {
+        if let Some(id) = p.get("id").and_then(|v| v.as_str())
+            && let Some(icon) = p.get("icon_url").and_then(|v| v.as_str())
+        {
+            out.insert(id.to_string(), icon.to_string());
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn http() -> Result<reqwest::Client, String> {
+    Ok(HTTP_CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .user_agent(launcher::UA)
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(60))
+                .pool_idle_timeout(Duration::from_secs(90))
+                .pool_max_idle_per_host(8)
+                .build()
+                .expect("no se pudo construir el cliente HTTP global")
+        })
+        .clone())
+}
+
+/// Ejecuta una operación de bloqueo (I/O o mutex de fsx) fuera del runtime
+/// de Tokio, para no quedarse sin workers async. Propaga el error de String
+/// de la operación interna.
+async fn spawn_blocking_result<F, R>(f: F) -> Result<R, String>
+where
+    F: FnOnce() -> Result<R, String> + Send + 'static,
+    R: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Busca proyectos en Modrinth (`project_type`: mod, shader o resourcepack).
@@ -1995,7 +2299,6 @@ fn install_mod_dir(
     instance_subdir(paths, instance, "mods")
 }
 
-#[tauri::command]
 async fn fetch_compatible_version(
     client: &reqwest::Client,
     slug: &str,
@@ -2052,12 +2355,16 @@ fn version_file(version: &serde_json::Value) -> Result<(String, String, Option<S
 }
 
 fn version_metadata(version: &serde_json::Value) -> Result<dependencies::VersionMetadata, String> {
+    let project_id = version
+        .get("project_id")
+        .and_then(|p| p.as_str())
+        .map(str::to_string);
     let version_id = version
         .get("id")
         .and_then(|i| i.as_str())
         .ok_or("Modrinth no devolvió id de versión")?
         .to_string();
-    let (_, filename, _) = version_file(version)?;
+    let (file_url, filename, file_sha1) = version_file(version)?;
     let game_versions = version
         .get("game_versions")
         .and_then(|v| v.as_array())
@@ -2091,17 +2398,24 @@ fn version_metadata(version: &serde_json::Value) -> Result<dependencies::Version
                             .and_then(|t| t.as_str())
                             .unwrap_or("")
                             .to_string(),
+                        version_id: d
+                            .get("version_id")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
                     })
                 })
                 .collect()
         })
         .unwrap_or_default();
     Ok(dependencies::VersionMetadata {
+        project_id,
         version_id,
         filename,
         game_versions,
         loaders,
         dependencies,
+        file_url: Some(file_url),
+        file_sha1,
     })
 }
 
@@ -2110,28 +2424,89 @@ fn version_metadata(version: &serde_json::Value) -> Result<dependencies::Version
 /// Descarga solo metadatos de Modrinth, nunca archivos: la usa tanto
 /// `plan_mod_dependencies` (sin escribir nada) como `install_mod`.
 /// Recorre el árbol en anchura desde la raíz para no descargar dos veces el
-/// mismo proyecto.
+/// mismo proyecto. Las consultas de metadatos se ejecutan en paralelo con un
+/// límite de 4 solicitudes simultáneas para no saturar la red.
 async fn collect_candidates(
     client: &reqwest::Client,
     root_slug: &str,
     mc_version: &str,
     loader: &str,
 ) -> Result<std::collections::HashMap<String, dependencies::VersionMetadata>, String> {
-    let mut candidates = std::collections::HashMap::new();
-    let mut queue = vec![root_slug.to_string()];
-    while let Some(slug) = queue.pop() {
-        if candidates.contains_key(&slug) {
-            continue;
-        }
-        let version = fetch_compatible_version(client, &slug, mc_version, loader).await?;
-        let meta = version_metadata(&version)?;
-        for dep in &meta.dependencies {
-            if dep.dependency_type == "required" {
-                queue.push(dep.project_id.clone());
-            }
-        }
-        candidates.insert(slug, meta);
+    use std::collections::{HashSet, VecDeque};
+
+    let mut candidates: std::collections::HashMap<String, dependencies::VersionMetadata> =
+        std::collections::HashMap::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+    queue.push_back(root_slug.to_string());
+    seen.insert(root_slug.to_string());
+
+    const PARALLELISM: usize = 8;
+
+    let mut set = JoinSet::new();
+
+    // Lanzar las primeras PARALLELISM tareas.
+    for _ in 0..PARALLELISM {
+        let Some(slug) = queue.pop_front() else { break };
+        let client = client.clone();
+        let slug_owned = slug.clone();
+        let mc = mc_version.to_string();
+        let ld = loader.to_string();
+        set.spawn(async move {
+            let version = fetch_compatible_version(&client, &slug_owned, &mc, &ld).await?;
+            let meta = version_metadata(&version)?;
+            let deps: Vec<String> = meta
+                .dependencies
+                .iter()
+                .filter(|d| d.dependency_type == "required")
+                .map(|d| d.project_id.clone())
+                .collect();
+            Ok::<(String, dependencies::VersionMetadata, Vec<String>), String>((
+                slug_owned, meta, deps,
+            ))
+        });
     }
+
+    // Ventana deslizante: al terminar una tarea se reponé una nueva con sus
+    // dependencias descubiertas, manteniendo hasta PARALLELISM en vuelo.
+    while let Some(res) = set.join_next().await {
+        match res.map_err(|e| e.to_string()) {
+            Ok(inner) => match inner {
+                Ok((slug, meta, deps)) => {
+                    candidates.insert(slug.clone(), meta);
+                    for dep in deps {
+                        if seen.insert(dep.clone()) {
+                            queue.push_back(dep);
+                        }
+                    }
+                    // Reponer con la siguiente del cola si hay.
+                    if let Some(next_slug) = queue.pop_front() {
+                        let client = client.clone();
+                        let next_owned = next_slug.clone();
+                        let mc = mc_version.to_string();
+                        let ld = loader.to_string();
+                        set.spawn(async move {
+                            let version =
+                                fetch_compatible_version(&client, &next_owned, &mc, &ld).await?;
+                            let meta = version_metadata(&version)?;
+                            let deps: Vec<String> = meta
+                                .dependencies
+                                .iter()
+                                .filter(|d| d.dependency_type == "required")
+                                .map(|d| d.project_id.clone())
+                                .collect();
+                            Ok::<(String, dependencies::VersionMetadata, Vec<String>), String>((
+                                next_owned, meta, deps,
+                            ))
+                        });
+                    }
+                }
+                Err(e) => return Err(e),
+            },
+            Err(e) => return Err(e),
+        }
+    }
+
     Ok(candidates)
 }
 
@@ -2140,9 +2515,149 @@ fn installed_mods(instance_root: &Path) -> Result<Vec<dependencies::InstalledMod
         .into_iter()
         .map(|e| dependencies::InstalledMod {
             slug: e.slug,
+            project_id: e.project_id,
             version_id: e.version_id,
+            mc_version: e.mc_version,
+            loader: e.loader,
         })
         .collect())
+}
+
+/// Recupera metadatos faltantes consultando Modrinth para una versión instalada.
+/// Solo enriquece si la versión instalada resulta compatible con el perfil
+/// actual; si no se puede verificar, deja los campos en None (comportamiento
+/// conservador).
+/// Las consultas se ejecutan en paralelo con un límite de 6 solicitudes
+/// simultáneas.
+async fn enrich_installed_mods(
+    client: &reqwest::Client,
+    mc_version: &str,
+    loader: &str,
+    installed: &mut [dependencies::InstalledMod],
+) {
+    const PARALLELISM: usize = 6;
+
+    let to_query: Vec<usize> = installed
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| {
+            !e.version_id.trim().is_empty()
+                && e.version_id != "unknown"
+                && (e.mc_version.is_none() || e.loader.is_none())
+        })
+        .map(|(i, _)| i)
+        .collect();
+
+    if to_query.is_empty() {
+        return;
+    }
+
+    let mut results: Vec<(usize, bool)> = Vec::with_capacity(to_query.len());
+    let mut set = JoinSet::new();
+    let mut to_query = to_query.into_iter();
+
+    // Llenar la ventana inicial con hasta PARALLELISM tareas en vuelo.
+    for _ in 0..PARALLELISM {
+        let Some(idx) = to_query.next() else { break };
+        let client = client.clone();
+        let vid = installed[idx].version_id.clone();
+        let mc = mc_version.to_string();
+        let ld = loader.to_string();
+        set.spawn(async move {
+            let compat = query_version_compatible(&client, &vid, &mc, &ld).await;
+            (idx, compat)
+        });
+    }
+
+    // Ventana deslizante: al terminar una tarea se reponé otra, manteniendo
+    // hasta PARALLELISM en vuelo. Los resultados se aplican por índice, no
+    // por orden de llegada, porque JoinSet no preserva el orden de envío.
+    while let Some(res) = set.join_next().await {
+        if let Ok((idx, success)) = res {
+            results.push((idx, success));
+        }
+        if let Some(idx) = to_query.next() {
+            let client = client.clone();
+            let vid = installed[idx].version_id.clone();
+            let mc = mc_version.to_string();
+            let ld = loader.to_string();
+            set.spawn(async move {
+                let compat = query_version_compatible(&client, &vid, &mc, &ld).await;
+                (idx, compat)
+            });
+        }
+    }
+
+    apply_enrichment(installed, results, mc_version, loader);
+}
+
+/// Consulta Modrinth y devuelve si la versión `vid` es compatible con
+/// `mc_version`/`loader`. Cualquier error de red o parseo cuenta como
+/// incompatible (comportamiento conservador).
+async fn query_version_compatible(
+    client: &reqwest::Client,
+    vid: &str,
+    mc_version: &str,
+    loader: &str,
+) -> bool {
+    let resp = match client
+        .get(format!("https://api.modrinth.com/v2/version/{}", vid))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    if !resp.status().is_success() {
+        return false;
+    }
+    let v: serde_json::Value = match resp.json().await {
+        Ok(j) => j,
+        Err(_) => return false,
+    };
+    let supports_mc = v
+        .get("game_versions")
+        .and_then(|a| a.as_array())
+        .map(|a| {
+            a.iter()
+                .any(|x| x.as_str().map(|s| s == mc_version).unwrap_or(false))
+        })
+        .unwrap_or(true);
+    let supports_loader = v
+        .get("loaders")
+        .and_then(|a| a.as_array())
+        .map(|a| {
+            a.iter().any(|x| {
+                x.as_str()
+                    .map(|s| s.eq_ignore_ascii_case(loader))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(true);
+    supports_mc && supports_loader
+}
+
+/// Aplica los resultados de compatibilidad a los mods instalados por índice.
+/// `results` contiene (índice, ¿compatible?). Se aplica por índice y no por
+/// orden de llegada porque las tareas concurrentes no preservan el orden de
+/// envío de `JoinSet`.
+fn apply_enrichment(
+    installed: &mut [dependencies::InstalledMod],
+    results: Vec<(usize, bool)>,
+    mc_version: &str,
+    loader: &str,
+) {
+    for (idx, success) in results {
+        if !success {
+            continue;
+        }
+        if installed[idx].mc_version.is_none() {
+            installed[idx].mc_version = Some(mc_version.to_string());
+        }
+        if installed[idx].loader.is_none() {
+            installed[idx].loader = Some(loader.to_string());
+        }
+    }
 }
 
 /// Plan sin descargas ni escrituras: valida destino/instancia, junta
@@ -2153,50 +2668,134 @@ async fn plan_mod_dependencies_inner(
     mc_version: &str,
     loader: &str,
     instance: &str,
-) -> Result<dependencies::ModPlan, String> {
+) -> Result<
+    (
+        dependencies::ModPlan,
+        std::collections::HashMap<String, dependencies::VersionMetadata>,
+    ),
+    String,
+> {
     // Valida slug/versión/loader e instancia antes de tocar la red.
     install_mod_dir(paths, instance, slug, mc_version, loader)?;
     let client = http()?;
     let candidates = collect_candidates(&client, slug, mc_version, loader).await?;
     let instance_root = paths.instance_dir(instance)?;
-    let installed = installed_mods(&instance_root)?;
-    dependencies::build_mod_plan(slug, &candidates, mc_version, loader, &installed)
+    let mut installed = spawn_blocking_result(move || installed_mods(&instance_root)).await?;
+    enrich_installed_mods(&client, mc_version, loader, &mut installed).await;
+    let plan = dependencies::build_mod_plan(slug, &candidates, mc_version, loader, &installed)?;
+    Ok((plan, candidates))
+}
+
+/// Resultado del plan de instalación: incluye el identificador opaco del plan
+/// para que `install_mod` pueda reusar los metadatos resueltos sin volver a
+/// consultar Modrinth.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PlanResult {
+    pub plan_id: u64,
+    pub plan: dependencies::ModPlan,
 }
 
 /// Comando Tauri: plan de instalación sin descargar ni modificar archivos.
+/// Guarda los metadatos resueltos en un caché temporal asociado a `plan_id`.
 #[tauri::command]
 async fn plan_mod_dependencies(
+    app: tauri::AppHandle,
     paths: tauri::State<'_, Paths>,
     slug: String,
     mc_version: String,
     loader: String,
     instance: String,
-) -> Result<dependencies::ModPlan, String> {
+) -> Result<PlanResult, String> {
     let paths = paths.inner().clone();
-    plan_mod_dependencies_inner(&paths, &slug, &mc_version, &loader, &instance).await
+    install_progress(&app, "resolving", &slug, &instance, 0, 1);
+    let (plan, candidates) =
+        plan_mod_dependencies_inner(&paths, &slug, &mc_version, &loader, &instance).await?;
+    install_progress(&app, "resolving", &slug, &instance, 1, 1);
+
+    let plan_id = plan_cache_next_id();
+    plan_cache_cleanup();
+    let mut cache = plan_cache();
+    cache.insert(
+        plan_id,
+        CachedPlan {
+            candidates,
+            mc_version: mc_version.clone(),
+            loader: loader.clone(),
+            instance: instance.clone(),
+            created_at: std::time::Instant::now(),
+        },
+    );
+
+    Ok(PlanResult { plan_id, plan })
 }
 
 #[tauri::command]
 async fn install_mod(
+    app: tauri::AppHandle,
     paths: tauri::State<'_, Paths>,
     slug: String,
     mc_version: String,
     loader: String,
     instance: String,
     confirmed_plan: dependencies::ModPlan,
+    plan_id: Option<u64>,
 ) -> Result<String, String> {
+    let t_install = Instant::now();
     let paths = paths.inner().clone();
     let mods_dir = install_mod_dir(&paths, &instance, &slug, &mc_version, &loader)?;
     let client = http()?;
     let instance_root = paths.instance_dir(&instance)?;
+    install_progress(&app, "resolving", &slug, &instance, 0, 1);
     // El plan ejecutado se recalcula acá mismo (no se confía en el enviado
     // por el frontend): si cambió alguna dependencia o versión frente al
     // confirmado por el usuario, se aborta sin descargar nada.
     // `install_mod_dir` valida antes de cualquier `collect_candidates`/
     // descarga: un comando sin `confirmed_plan` es rechazado por Tauri
     // (campo requerido) antes de ejecutar esta función, sin tocar disco.
-    let candidates = collect_candidates(&client, &slug, &mc_version, &loader).await?;
-    let installed = installed_mods(&instance_root)?;
+    let candidates = if let Some(pid) = plan_id {
+        plan_cache_cleanup();
+        let candidates_from_cache = {
+            let cache = plan_cache();
+            match cache.get(&pid) {
+                Some(cached) => {
+                    // Validar que el caché coincida con los parámetros de la petición.
+                    if cached.mc_version != mc_version
+                        || cached.loader != loader
+                        || cached.instance != instance
+                    {
+                        return Err(
+                            "El plan en caché no coincide con la instancia solicitada".to_string()
+                        );
+                    }
+                    Some(cached.candidates.clone())
+                }
+                None => None,
+            }
+        }; // lock se suelta aquí
+        match candidates_from_cache {
+            Some(c) => c,
+            None => {
+                // Plan expirado o inexistente: resolver de nuevo.
+                collect_candidates(&client, &slug, &mc_version, &loader).await?
+            }
+        }
+    } else {
+        // Sin plan_id: resolver de nuevo (comportamiento original).
+        collect_candidates(&client, &slug, &mc_version, &loader).await?
+    };
+    log_performance(&format!(
+        "[install_mod] {} collect_candidates: {:?}",
+        slug,
+        t_install.elapsed()
+    ));
+    let instance_root_c1 = instance_root.clone();
+    let mut installed = spawn_blocking_result(move || installed_mods(&instance_root_c1)).await?;
+    enrich_installed_mods(&client, &mc_version, &loader, &mut installed).await;
+    log_performance(&format!(
+        "[install_mod] {} enrich+plan: {:?}",
+        slug,
+        t_install.elapsed()
+    ));
     let fresh_plan =
         dependencies::build_mod_plan(&slug, &candidates, &mc_version, &loader, &installed)?;
     if !dependencies::plan_matches(&confirmed_plan, &fresh_plan) {
@@ -2206,159 +2805,310 @@ async fn install_mod(
         );
     }
     let plan = fresh_plan;
+    install_progress(&app, "resolving", &slug, &instance, 1, 1);
     // Dependencias primero (en orden del plan), después el mod principal.
-    // Cada descarga es transaccional (4A): si una falla, el principal no se
-    // marca como instalado y las ya instaladas no se duplican al reintentar.
-    // nombre/versión/URL/hash salen del plan verificado (mismo `version_id`);
-    // `version_file` los extrae del JSON recién descargado de esa versión.
-    for dep in &plan.dependencies {
-        if dep.already_installed {
-            continue;
-        }
-        let dep_version =
-            fetch_compatible_version(&client, &dep.slug, &mc_version, &loader).await?;
-        let (file_url, filename, sha1) = version_file(&dep_version)?;
-        let bytes = client
-            .get(&file_url)
-            .send()
-            .await
-            .and_then(|r| r.error_for_status())
-            .map_err(|e| e.to_string())?
-            .bytes()
-            .await
-            .map_err(|e| e.to_string())?;
-        let icon_url = fetch_project_icon(&client, &dep.slug).await;
-        let dep_dest = mods_dir.join(&filename);
-        fsx::apply_update_transactional(
-            &dep_dest,
-            &bytes,
-            sha1.clone().as_deref(),
-            &instance_root,
-            "mods",
-            &mods_dir,
-            content::ContentEntry {
-                slug: dep.slug.clone(),
-                version_id: dep.version_id.clone(),
-                filename: filename.clone(),
-                sha1,
-                loader: Some(loader.clone()),
-                mc_version: Some(mc_version.clone()),
-                icon_url,
-                source: "modrinth".to_string(),
-            },
-        )
-        .map_err(|e| format!("Dependencia {}: {e}", dep.slug))?;
-    }
-    let resp = client
-        .get(format!(
-            "https://api.modrinth.com/v2/project/{slug}/version"
-        ))
-        .query(&[
-            ("game_versions", format!("[\"{mc_version}\"]")),
-            ("loaders", format!("[\"{loader}\"]")),
-        ])
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    let versions = json.as_array().ok_or("Modrinth no devolvió versiones")?;
-    let v = pick_version(versions).ok_or("No hay una versión compatible de este mod")?;
-    let files = v
-        .get("files")
-        .and_then(|f| f.as_array())
-        .ok_or("El mod no trae archivos")?;
-    let file = files
+    // Todas las descargas (dependencias + raíz) se ejecutan en paralelo con
+    // un semáforo de 4 concurrentes. Las transacciones se aplican en un solo
+    // lote bajo un único lock de instancia.
+    const DL_PARALLELISM: usize = 4;
+    let deps_to_download: Vec<&dependencies::DependencyPlan> = plan
+        .dependencies
         .iter()
-        .find(|f| f.get("primary").and_then(|p| p.as_bool()).unwrap_or(false))
-        .or_else(|| files.first())
-        .ok_or("El mod no trae archivos")?;
-    let file_url = file
-        .get("url")
-        .and_then(|u| u.as_str())
-        .ok_or("El archivo no tiene URL")?;
-    let filename = file
-        .get("filename")
-        .and_then(|u| u.as_str())
-        .ok_or("El archivo no tiene nombre")?;
+        .filter(|d| !d.already_installed)
+        .collect();
 
-    // El nombre viene de un servidor externo: solo un nombre simple que termine en .jar.
-    let mut comps = Path::new(filename).components();
+    // Validar nombre de archivo del raíz ANTES de lanzar cualquier descarga.
+    let root_meta = candidates
+        .get(&slug)
+        .ok_or_else(|| format!("Falta candidato para {}", slug))?;
+    let root_file_url = root_meta
+        .file_url
+        .clone()
+        .ok_or_else(|| format!("Sin URL para {}", slug))?;
+    let root_filename = root_meta.filename.clone();
+    let root_sha1 = root_meta.file_sha1.clone();
+    let root_version_id = root_meta.version_id.clone();
+    let root_project_id = root_meta.project_id.clone();
+
+    let mut comps = Path::new(&root_filename).components();
     match (comps.next(), comps.next()) {
         (Some(std::path::Component::Normal(_)), None)
-            if filename.to_lowercase().ends_with(".jar") => {}
+            if root_filename.to_lowercase().ends_with(".jar") => {}
         _ => return Err("Nombre de archivo sospechoso en la respuesta de Modrinth".to_string()),
     }
 
-    let bytes = client
-        .get(file_url)
-        .send()
-        .await
-        .and_then(|r| r.error_for_status())
-        .map_err(|e| e.to_string())?
-        .bytes()
-        .await
-        .map_err(|e| e.to_string())?;
+    // Descargar dependencias y raíz en paralelo, limitada por semáforo.
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(DL_PARALLELISM));
+    let mut set = JoinSet::new();
 
-    // Verificación de integridad con el SHA1 que informa Modrinth.
-    let sha1 = file
-        .get("hashes")
-        .and_then(|h| h.get("sha1"))
-        .and_then(|h| h.as_str());
+    for dep in &deps_to_download {
+        let dep_meta = candidates
+            .get(&dep.slug)
+            .ok_or_else(|| format!("Falta candidato para {}", dep.slug))?;
+        let file_url = dep_meta
+            .file_url
+            .clone()
+            .ok_or_else(|| format!("Sin URL para {}", dep.slug))?;
+        let filename = dep_meta.filename.clone();
+        let sha1 = dep_meta.file_sha1.clone();
+        let dep_slug = dep.slug.clone();
+        let client = client.clone();
+        let sem = sem.clone();
+        let app_dl = app.clone();
+        let dep_instance = instance.clone();
+        set.spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            let (bytes, _dl_sha1) = download_with_progress(
+                &client,
+                &file_url,
+                sha1.as_deref(),
+                &app_dl,
+                &dep_slug,
+                &dep_instance,
+            )
+            .await?;
+            Ok::<(String, String, Option<String>, Vec<u8>), String>(
+                (dep_slug, filename, sha1, bytes),
+            )
+        });
+    }
 
-    let version_id = v
-        .get("id")
-        .and_then(|i| i.as_str())
-        .ok_or_else(|| "Modrinth no devolvió id de versión".to_string())?;
-    let icon_url = fetch_project_icon(&client, &slug).await;
-    let dest = mods_dir.join(filename);
-    let instance_root = paths.instance_dir(&instance)?;
+    // Raíz también por el mismo semáforo.
+    let slug_dl = slug.clone();
+    let sem_root = sem.clone();
+    let client_root = client.clone();
+    let app_root = app.clone();
+    let root_instance = instance.clone();
+    set.spawn(async move {
+        let _permit = sem_root.acquire().await.unwrap();
+        let (bytes, _dl_sha1) = download_with_progress(
+            &client_root,
+            &root_file_url,
+            root_sha1.as_deref(),
+            &app_root,
+            &slug_dl,
+            &root_instance,
+        )
+        .await?;
+        Ok::<(String, String, Option<String>, Vec<u8>), String>(
+            (slug_dl, root_filename.clone(), root_sha1.clone(), bytes),
+        )
+    });
 
-    fsx::apply_update_transactional(
-        &dest,
-        &bytes,
-        sha1,
-        &instance_root,
-        "mods",
-        &mods_dir,
-        content::ContentEntry {
+    // Esperar a que todas las descargas terminen. Si alguna falla, no se
+    // aplica nada al disco.
+    let t_dl_start = Instant::now();
+    let mut downloaded: Vec<(String, String, Option<String>, Vec<u8>)> = Vec::new();
+    while let Some(res) = set.join_next().await {
+        match res.map_err(|e| e.to_string()) {
+            Ok(val) => downloaded.push(val?),
+            Err(e) => return Err(e),
+        }
+    }
+    let duracion_descarga = t_dl_start.elapsed();
+
+    // Verificar que todas las descargas están presentes.
+    let mut by_slug: std::collections::HashMap<String, (String, Option<String>, Vec<u8>)> =
+        std::collections::HashMap::new();
+    for (s, filename, sha1, bytes) in downloaded {
+        by_slug.insert(s, (filename, sha1, bytes));
+    }
+    for dep in &deps_to_download {
+        if !by_slug.contains_key(&dep.slug) {
+            return Err(format!("Falta descarga para {}", dep.slug));
+        }
+    }
+    if !by_slug.contains_key(&slug) {
+        return Err(format!("Falta descarga para {}", slug));
+    }
+
+    // Construir lote: dependencias en orden del plan, raíz al final.
+    let mut batch_items: Vec<fsx::BatchItem> = Vec::with_capacity(deps_to_download.len() + 1);
+
+    for dep in &deps_to_download {
+        let (filename, sha1, bytes) = by_slug
+            .get(&dep.slug)
+            .cloned()
+            .ok_or_else(|| format!("Falta descarga para {}", dep.slug))?;
+        batch_items.push(fsx::BatchItem {
+            dest: mods_dir.join(&filename),
+            bytes,
+            expected_sha1: sha1.clone(),
+            entry: content::ContentEntry {
+                slug: dep.slug.clone(),
+                project_id: dep.project_id.clone(),
+                version_id: dep.version_id.clone(),
+                filename,
+                sha1,
+                loader: Some(loader.clone()),
+                mc_version: Some(mc_version.clone()),
+                icon_url: None,
+                source: "modrinth".to_string(),
+                managed_by_obsidia: true,
+            },
+        });
+    }
+
+    let (root_dl_filename, root_dl_sha1, root_dl_bytes) = by_slug
+        .get(&slug)
+        .cloned()
+        .ok_or_else(|| format!("Falta descarga para {}", slug))?;
+    batch_items.push(fsx::BatchItem {
+        dest: mods_dir.join(&root_dl_filename),
+        bytes: root_dl_bytes,
+        expected_sha1: root_dl_sha1.clone(),
+        entry: content::ContentEntry {
             slug: slug.clone(),
-            version_id: version_id.to_string(),
-            filename: filename.to_string(),
-            sha1: sha1.map(String::from),
+            project_id: root_project_id,
+            version_id: root_version_id,
+            filename: root_dl_filename,
+            sha1: root_dl_sha1,
             loader: Some(loader.clone()),
             mc_version: Some(mc_version.clone()),
-            icon_url,
+            icon_url: None,
             source: "modrinth".to_string(),
+            managed_by_obsidia: true,
         },
-    )?;
+    });
+
+    let instance_root_batch = instance_root.clone();
+    let mods_dir_batch = mods_dir.clone();
+    install_progress(&app, "applying", &slug, &instance, 0, 1);
+    spawn_blocking_result(move || {
+        fsx::apply_batch_transactional(
+            &instance_root_batch,
+            "mods",
+            &mods_dir_batch,
+            batch_items,
+        )
+    }).await?;
+    install_progress(&app, "applying", &slug, &instance, 1, 1);
+
+    // Iconos en segundo plano: no bloquea el retorno de install_mod.
+    // Pide iconos en batch (raíz + dependencias) y los escribe con un solo
+    // lock de instancia.
+    let client_icon = client.clone();
+    let instance_root_icon = instance_root.clone();
+    let slug_icon_root = slug.clone();
+    let dep_slugs_icon: Vec<String> = deps_to_download
+        .iter()
+        .map(|d| d.slug.clone())
+        .collect();
+    let all_icon_slugs: Vec<String> = std::iter::once(slug_icon_root.clone())
+        .chain(dep_slugs_icon.into_iter())
+        .collect();
+    tokio::spawn(async move {
+        let t_icon = Instant::now();
+        match fetch_project_icons_batch(&client_icon, &all_icon_slugs).await {
+            Ok(icons) => {
+                if !icons.is_empty() {
+                    let instance_root_icon_c1 = instance_root_icon.clone();
+                    let icons_c1 = icons.clone();
+                    if let Err(e) = spawn_blocking_result(move || {
+                        fsx::update_entry_icons(
+                            &instance_root_icon_c1,
+                            "mods",
+                            &icons_c1,
+                        )
+                    }).await
+                    {
+                        log_performance(&format!(
+                            "[install_mod] {} icono_batch_error: {}",
+                            slug_icon_root, e
+                        ));
+                    } else {
+                        log_performance(&format!(
+                            "[install_mod] {} icono_batch_ok: {:?} iconos",
+                            slug_icon_root,
+                            icons.len(),
+                        ));
+                    }
+                } else {
+                    log_performance(&format!(
+                        "[install_mod] {} icono_batch_sin_iconos: {:?}",
+                        slug_icon_root,
+                        t_icon.elapsed()
+                    ));
+                }
+            }
+            Err(e) => {
+                log_performance(&format!(
+                    "[install_mod] {} icono_batch_fallo: {}",
+                    slug_icon_root, e
+                ));
+            }
+        }
+    });
 
     // Dependencias requeridas: se informan, no se instalan automáticamente.
     // Si una dependencia obligatoria falta, el caller puede instalarla después.
-    let deps = v
-        .get("dependencies")
-        .and_then(|d| d.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let deps: Vec<serde_json::Value> = root_meta
+        .dependencies
+        .iter()
+        .map(|d| {
+            json!({
+                "project_id": d.project_id,
+                "dependency_type": d.dependency_type,
+                "version_id": d.version_id
+            })
+        })
+        .collect();
     let required = content::required_dependencies(&deps);
-    let installed = content::read_index(&instance_root, "mods")?;
+    let installed =
+        spawn_blocking_result(move || content::read_index(&instance_root, "mods")).await?;
     let missing: Vec<String> = required
         .iter()
         .filter(|s| !installed.iter().any(|e| &e.slug == *s) && *s != &slug)
         .cloned()
         .collect();
     if !missing.is_empty() {
-        eprintln!(
+        log_performance(&format!(
             "Dependencias requeridas faltantes para {}: {}",
             slug,
             missing.join(", ")
-        );
+        ));
     }
+
+    log_performance(&format!(
+        "[install_mod] {} TOTAL: {:?} tamano={} bytes velocidad={:.2} MB/s",
+        slug,
+        t_install.elapsed(),
+        {
+            let root_dl = by_slug
+                .get(&slug)
+                .ok_or_else(|| format!("Falta descarga para {}", slug))?;
+            let tamano_bytes = root_dl.2.len();
+            let filename = root_dl.0.clone();
+            // Usamos filename abajo en el Ok(); pero aquí solo necesitamos tamano_bytes.
+            // filename se define después para el Ok.
+            let _ = filename;
+            tamano_bytes
+        },
+        {
+            let secs = duracion_descarga.as_secs_f64();
+            let secs = if secs > 0.0 { secs } else { 0.001 };
+            {
+                let root_dl = by_slug
+                    .get(&slug)
+                    .ok_or_else(|| format!("Falta descarga para {}", slug))?;
+                let tamano_bytes = root_dl.2.len();
+                tamano_bytes as f64 / secs / 1_000_000.0
+            }
+        }
+    ));
+
+    let filename = by_slug
+        .get(&slug)
+        .ok_or_else(|| format!("Falta descarga para {}", slug))?
+        .0
+        .clone();
 
     Ok(format!("Mod instalado: {filename}"))
 }
 
 #[tauri::command]
 async fn install_shaderpack(
+    app: tauri::AppHandle,
     paths: tauri::State<'_, Paths>,
     slug: String,
     mc_version: Option<String>,
@@ -2366,6 +3116,7 @@ async fn install_shaderpack(
 ) -> Result<String, String> {
     let paths = paths.inner().clone();
     download_project_file(
+        &app,
         &paths,
         &slug,
         "shaderpacks",
@@ -2377,6 +3128,7 @@ async fn install_shaderpack(
 
 #[tauri::command(async)]
 async fn install_resourcepack(
+    app: tauri::AppHandle,
     paths: tauri::State<'_, Paths>,
     slug: String,
     mc_version: Option<String>,
@@ -2384,6 +3136,7 @@ async fn install_resourcepack(
 ) -> Result<String, String> {
     let paths = paths.inner().clone();
     download_project_file(
+        &app,
         &paths,
         &slug,
         "resourcepacks",
@@ -2410,12 +3163,14 @@ fn download_project_dir(
 }
 
 async fn download_project_file(
+    app: &tauri::AppHandle,
     paths: &Paths,
     slug: &str,
     folder: &str,
     mc_version: Option<&str>,
     instance: &str,
 ) -> Result<String, String> {
+    install_progress(app, "downloading", slug, instance, 0, 1);
     let dest_dir = download_project_dir(paths, instance, folder, slug)?;
     let client = http()?;
     let mut req = client.get(format!(
@@ -2453,15 +3208,15 @@ async fn download_project_file(
         _ => return Err("Nombre de archivo sospechoso".to_string()),
     }
 
-    let bytes = client
-        .get(file_url)
-        .send()
-        .await
-        .and_then(|r| r.error_for_status())
-        .map_err(|e| e.to_string())?
-        .bytes()
-        .await
-        .map_err(|e| e.to_string())?;
+    let (bytes, _dl_sha1) = download_with_progress(
+        &client,
+        &file_url,
+        None,
+        app,
+        slug,
+        instance,
+    )
+    .await?;
 
     let sha1 = file
         .get("hashes")
@@ -2472,33 +3227,86 @@ async fn download_project_file(
         .get("id")
         .and_then(|i| i.as_str())
         .ok_or_else(|| "Modrinth no devolvió id de versión".to_string())?;
-    let icon_url = fetch_project_icon(&client, slug).await;
     let dest = dest_dir.join(filename);
     let instance_root = paths.instance_dir(instance)?;
-    let kind_for_index = match folder {
-        "shaderpacks" => "shaders",
-        "resourcepacks" => "packs",
-        _ => folder,
+    let kind_for_index: String = match folder {
+        "shaderpacks" => "shaders".to_string(),
+        "resourcepacks" => "packs".to_string(),
+        _ => folder.to_string(),
     };
 
-    fsx::apply_update_transactional(
-        &dest,
-        &bytes,
-        sha1,
-        &instance_root,
-        kind_for_index,
-        &dest_dir,
-        content::ContentEntry {
-            slug: slug.to_string(),
-            version_id: version_id.to_string(),
-            filename: filename.to_string(),
-            sha1: sha1.map(String::from),
-            loader: None,
-            mc_version: mc_version.map(String::from),
-            icon_url,
-            source: "modrinth".to_string(),
-        },
-    )?;
+    let entry = content::ContentEntry {
+        slug: slug.to_string(),
+        project_id: v
+            .get("project_id")
+            .and_then(|p| p.as_str())
+            .map(str::to_string),
+        version_id: version_id.to_string(),
+        filename: filename.to_string(),
+        sha1: sha1.map(String::from),
+        loader: None,
+        mc_version: mc_version.map(String::from),
+        icon_url: None,
+        source: "modrinth".to_string(),
+        managed_by_obsidia: true,
+    };
+    install_progress(app, "downloading", slug, instance, 1, 1);
+    install_progress(app, "applying", slug, instance, 0, 1);
+    let instance_root_batch = instance_root.clone();
+    let kind_for_index_batch = kind_for_index.clone();
+    spawn_blocking_result(move || {
+        fsx::apply_batch_transactional(
+            &instance_root_batch,
+            &kind_for_index_batch,
+            &dest_dir,
+            vec![fsx::BatchItem {
+                dest,
+                bytes,
+                expected_sha1: entry.sha1.clone(),
+                entry,
+            }],
+        )
+    }).await?;
+    install_progress(app, "applying", slug, instance, 1, 1);
+
+    // Ícono en segundo plano: no bloquea el retorno de download_project_file.
+    let client_icon = client.clone();
+    let slug_icon = slug.to_string();
+    let instance_root_icon = instance_root.clone();
+    let kind_for_index_icon = kind_for_index.clone();
+    tokio::spawn(async move {
+        let t_icon = Instant::now();
+        match fetch_project_icons_batch(&client_icon, &[slug_icon.clone()]).await {
+            Ok(icons) => {
+                if !icons.is_empty() {
+                    let instance_root_icon_c1 = instance_root_icon.clone();
+                    let icons_c1 = icons.clone();
+                    let _ = spawn_blocking_result(move || {
+                        fsx::update_entry_icons(
+                            &instance_root_icon_c1,
+                            &kind_for_index_icon,
+                            &icons_c1,
+                        )
+                    }).await;
+                    log_performance(&format!(
+                        "[download_project_file] {} icono_batch_ok: {:?}",
+                        slug_icon, t_icon.elapsed()
+                    ));
+                } else {
+                    log_performance(&format!(
+                        "[download_project_file] {} icono_batch_sin_iconos: {:?}",
+                        slug_icon, t_icon.elapsed()
+                    ));
+                }
+            }
+            Err(e) => {
+                log_performance(&format!(
+                    "[download_project_file] {} icono_batch_fallo: {}",
+                    slug_icon, e
+                ));
+            }
+        }
+    });
 
     Ok(filename.to_string())
 }
@@ -2618,7 +3426,7 @@ fn ping_server(address: String) -> Result<String, String> {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_settings(paths: tauri::State<'_, Paths>) -> Result<AppSettings, String> {
     let path = paths.settings_file();
     if !path.exists() {
@@ -2629,7 +3437,7 @@ fn get_settings(paths: tauri::State<'_, Paths>) -> Result<AppSettings, String> {
     Ok(settings)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn save_settings(paths: tauri::State<'_, Paths>, settings: AppSettings) -> Result<(), String> {
     let path = paths.settings_file();
     if let Some(parent) = path.parent() {
@@ -2720,6 +3528,7 @@ pub fn run() {
             create_instance,
             update_instance,
             delete_instance,
+            migrate_legacy_profile,
             detect_javas,
             launch_version,
             launch_instance,
@@ -2735,11 +3544,13 @@ pub fn run() {
             delete_file_in,
             list_installed_mods,
             list_content,
+            check_content_updates,
             migrate_content_map,
             search_mods,
             search_shaders,
             search_resourcepacks,
             install_mod,
+            log_performance_event,
             plan_mod_dependencies,
             install_shaderpack,
             install_resourcepack,
@@ -2821,6 +3632,7 @@ mod tests {
 
     fn plan_candidates() -> std::collections::HashMap<String, dependencies::VersionMetadata> {
         let mk = |vid: &str, deps: &[(&str, &str)]| dependencies::VersionMetadata {
+            project_id: None,
             version_id: vid.to_string(),
             filename: format!("{vid}.jar"),
             game_versions: vec!["1.21.4".to_string()],
@@ -2830,8 +3642,11 @@ mod tests {
                 .map(|(p, t)| dependencies::DependencyMetadata {
                     project_id: p.to_string(),
                     dependency_type: t.to_string(),
+                    version_id: None,
                 })
                 .collect(),
+            file_url: None,
+            file_sha1: None,
         };
         std::collections::HashMap::from([
             (
@@ -2917,6 +3732,7 @@ mod tests {
         moved.insert(
             "lib".to_string(),
             dependencies::VersionMetadata {
+                project_id: None,
                 version_id: "v-lib-2".to_string(),
                 ..plan_candidates()["lib"].clone()
             },
@@ -2937,6 +3753,7 @@ mod tests {
             "mods",
             &[content::ContentEntry {
                 slug: "lib".to_string(),
+                project_id: None,
                 version_id: "v-lib".to_string(),
                 filename: "lib.jar".to_string(),
                 sha1: None,
@@ -2944,6 +3761,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             }],
         )
         .unwrap();
@@ -2957,6 +3775,47 @@ mod tests {
             before
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn apply_enrichment_asigna_por_indice_no_por_orden() {
+        // Resultados mezclados que llegan fuera de orden: el índice 2 es
+        // verdadero, el 0 falso, el 1 verdadero. Debe aplicarse por índice.
+        let mut installed = vec![
+            dependencies::InstalledMod {
+                slug: "a".into(),
+                project_id: None,
+                version_id: "v1".into(),
+                mc_version: None,
+                loader: None,
+            },
+            dependencies::InstalledMod {
+                slug: "b".into(),
+                project_id: None,
+                version_id: "v2".into(),
+                mc_version: None,
+                loader: None,
+            },
+            dependencies::InstalledMod {
+                slug: "c".into(),
+                project_id: None,
+                version_id: "v3".into(),
+                mc_version: None,
+                loader: None,
+            },
+        ];
+        // Simula orden de llegada mezclado: (2,true), (0,false), (1,true).
+        let results = vec![(2, true), (0, false), (1, true)];
+        apply_enrichment(&mut installed, results, "1.21.4", "fabric");
+
+        // Índice 0 fue falso → sin enriquecer.
+        assert_eq!(installed[0].mc_version, None);
+        assert_eq!(installed[0].loader, None);
+        // Índices 1 y 2 fueron verdaderos → enriquecidos.
+        assert_eq!(installed[1].mc_version, Some("1.21.4".to_string()));
+        assert_eq!(installed[1].loader, Some("fabric".to_string()));
+        assert_eq!(installed[2].mc_version, Some("1.21.4".to_string()));
+        assert_eq!(installed[2].loader, Some("fabric".to_string()));
     }
 
     #[test]
@@ -4869,3 +5728,4 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 }
+

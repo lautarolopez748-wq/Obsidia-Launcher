@@ -1,16 +1,16 @@
-<script>
+﻿<script>
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
 import Sidebar from "$lib/components/Sidebar.svelte";
 import Toast from "$lib/components/Toast.svelte";
 
-import { I, ic, TABS, G, TRASH, M, LOADERS, RAMS, STG, LBL, esc, norm, validName, normRam, head, skinFace, accCard, modCard, trb, resCard, irisBanner } from "$lib/utils.js";
+import { ic, TABS, G, TRASH, LOADERS, RAMS, STG, LBL, esc, norm, validName, normRam, skinFace, skinFull, paintSkinCanvases, accCard, trb, resCard, irisBanner, safeImageUrl } from "$lib/utils.js";
 
   // ───────────── Estado ─────────────
   let P = [];
-let navHtml = '';
-let accHtml = '';
+$: navHtml = TABS.map(([k,label])=>`<button class="${S.tab===k?'on':''}" data-act="go" data-t="${k}" aria-label="${label}">${ic(k)}<span>${esc(label)}</span></button>`).join('');
+$: accHtml = accCard(S.sk, S.nick, S.ms, S.skins);
   let VERSIONS = [];
   let S = {
     tab:'home', p:0, sec:'mods', q:'', f:'Todos',
@@ -18,16 +18,16 @@ let accHtml = '';
     defRam:4, totalRam:16, t:{ lite:false },
     nick:'Jugador', ms:false, ml:false, msc:null,
     skins:[], sk:-1, skmodel:'classic',
-    pstate:[], ptextures:{}, filemap:{ mods:{}, shaders:{}, packs:{} },
+    pstate:[], filemap:{ mods:{}, shaders:{}, packs:{} },
     files:{ mods:[], shaders:[], packs:[] },
     content:{ mods:[], shaders:[], packs:[] },
     contentIcons:{ mods:{}, shaders:{}, packs:{} },
-    migratingContent:false, migratedInstance:'', migratingProfile:'',
-    results:{ mods:null, shaders:null, packs:null }, searching:false, seq:0, searchSeq:0, installSeq:0, busy:{},
+    migratingContent:false, migratedInstance:'', migratingProfile:'', inv:{}, invLoading:{}, searchCache:{}, searchPending:{},
+    results:{ mods:null, shaders:null, packs:null }, searching:false, searchErr:{ mods:'', shaders:'', packs:'' }, searchSeq:0, busy:{},
     sv:[], af:false, rf:false, es:null, ns:'', na:'',
     np:false, npEdit:-1, npName:'', npVersion:'', npLoader:'Vanilla', npLoaderVersion:'', npRam:4, npJava:'', npErr:'', npBusy:false, npFullscreen:false, npBlock:'',
     javas:[],
-    plan:null, planSlug:'', planKind:''
+    plan:null, planSlug:'', planKind:'', planId:null, planInstance:'', pendingRender:false
   };
 
   // ───────────── Utilidades ─────────────
@@ -39,27 +39,35 @@ let accHtml = '';
   // Categorías tal como las nombra Modrinth (facet `categories`).
   const CAT = { 'Optimización':'optimization', 'Gráficos':'graphics', 'Utilidades':'utility' };
   // La clave vieja de localStorage se conserva para no perder los mapas ya guardados.
-  const mapKey = kind => 'obsidia.map.' + ((P[S.p] && P[S.p].id) || 'global') + '.' + kind;
-  function fileMap(kind){
-    try { const m = JSON.parse(localStorage.getItem(mapKey(kind)) || '{}'); return m && typeof m === 'object' ? m : {}; }
+  // Los perfiles sin id usan la clave histórica 'global'.
+  /** @param {any} x */
+  const mapInstance = x => (x && x !== 'legacy') ? x : 'global';
+  /** @param {string} kind @param {string} [instance] */
+  const mapKey = (kind, instance) => 'obsidia.map.' + mapInstance(instance || (P[S.p] && P[S.p].id)) + '.' + kind;
+  /** @param {string} kind @param {string} [instance] */
+  function fileMap(kind, instance){
+    try { const m = JSON.parse(localStorage.getItem(mapKey(kind, instance)) || '{}'); return m && typeof m === 'object' ? m : {}; }
     catch(e){ return {}; }
   }
-  function saveFileMap(kind, map){ try { localStorage.setItem(mapKey(kind), JSON.stringify(map)); } catch(e){} }
+  /** @param {string} kind @param {any} map @param {string} [instance] */
+  function saveFileMap(kind, map, instance){ try { localStorage.setItem(mapKey(kind, instance), JSON.stringify(map)); } catch(e){} }
   const fileName = v => { let x = String(v ?? "").trim(); x = x.replace(/^(?:Mod|Shader(?:pack)?|Resource ?pack|Shaderpack|Resourcepack)\s+instalado:\s*/i, ""); const parts = x.split(/[\\\/]/); return (parts.pop() || x).trim(); };
-  function rememberFile(kind, slug, file, icon){
+  /** @param {string} kind @param {string} slug @param {string} file @param {string} [icon] @param {string} [instance] */
+  function rememberFile(kind, slug, file, icon, instance){
     if (!slug || !file) return;
-    const map = fileMap(kind);
+    const map = fileMap(kind, instance);
     const f = fileName(file);
     const ic = icon || (map[slug] && map[slug].icon) || (map[f] && map[f].icon) || '';
     map[slug] = { file: f, icon: ic };
     if (kind !== 'mods') map[f] = { file: f, icon: ic };
-    saveFileMap(kind, map);
+    saveFileMap(kind, map, instance);
   }
-  function forgetFile(kind, file){
-    const map = fileMap(kind); let changed = false;
+  /** @param {string} kind @param {string} file @param {string} [instance] */
+  function forgetFile(kind, file, instance){
+    const map = fileMap(kind, instance); let changed = false;
     const target = fileName(file);
     for (const k of Object.keys(map)) if (map[k] && fileName(map[k].file || map[k]) === target){ delete map[k]; changed = true; }
-    if (changed) saveFileMap(kind, map);
+    if (changed) saveFileMap(kind, map, instance);
   }
   function loadFileMap(){
     S.filemap = { mods:{}, shaders:{}, packs:{} };
@@ -99,7 +107,7 @@ let accHtml = '';
     for (const raw of [key, title]){
       if (!raw) continue; const kk = norm(raw); if (!kk || !ff.startsWith(kk)) continue;
       const rest = ff.slice(kk.length); if (!rest) return true;
-      if (/^(?:v?\\d|mc\\d|r\\d)/.test(rest)) return true;
+      if (/^(?:v?\d|mc\d|r\d)/.test(rest)) return true;
       if (/^(?:fabric|forge|neoforge|quilt|jar|zip)/.test(rest)) return true;
     }
     return false;
@@ -125,14 +133,24 @@ let accHtml = '';
     }
     return '';
   }
-  const blockFor = p => { try { return localStorage.getItem('obsidia.block.' + ((p && p.id) || 'global')) || 'grass'; } catch(e){ return 'grass'; } };
-  const setBlockFor = (id, b) => { try { localStorage.setItem('obsidia.block.' + (id || 'global'), b); } catch(e){} };
   const refreshGrid = () => { const g = Q('#grid'); if (g) g.innerHTML = grid(); };
 
   function toast(msg, bad){
     const t = Q('#toast'); if (!t) return;
     t.textContent = msg; t.className = 'toast show' + (bad ? ' bad' : '');
     clearTimeout(toast.t); toast.t = setTimeout(() => { t.className = 'toast'; }, 5000);
+  }
+
+  // Solo enlaces https de dominios de Microsoft para el login por código.
+  /** @param {any} raw */
+  function isMicrosoftUrl(raw){
+    try {
+      const u = new URL(String(raw || ''));
+      if (u.protocol !== 'https:') return false;
+      const h = u.hostname.toLowerCase();
+      return ['microsoft.com','live.com','microsoftonline.com','msftauth.net','msauth.net','office.com']
+        .some(d => h === d || h.endsWith('.' + d));
+    } catch(e){ return false; }
   }
 
   const sw = (k,l,d) => `<div class="row gl"><div><div style="font-weight:600">${l}</div><div class="mu">${d}</div></div><button class="sw" role="switch" aria-label="${l}" aria-checked="${S.t[k]}" data-act="tg" data-k="${k}"></button></div>`;
@@ -144,7 +162,10 @@ let accHtml = '';
 
   // ───────────── Perfiles ─────────────
   function cards(){
-    return P.map((p,i)=>`<div class="pcard ${i==S.p?'on':''}" role="button" tabindex="0" data-act="sel" data-i="${i}"><div class="slot"><img src="/images/blocks/${p.block||'Crafting_Table'}.png" alt=""></div><div class="pinfo"><b>${esc(p.n)}</b><span class="${i==S.p?'on':''}">${i==S.p?'Activo · ':''}${esc(p.s)}</span></div>${S.migratingProfile===p.n?'<span class="mu" style="color:#FBBF24">Migrando…</span>':`<button class="edit" data-act="ped" data-i="${i}">Editar</button>${p.id?'':`<button class="mig" data-act="migrate" data-i="${i}" title="Migrar a instancia independiente">Migrar</button>`}`}</div>`).join('');
+    return P.map((p,i)=>{
+      const block = esc(encodeURIComponent(p.block || 'Crafting_Table'));
+      return `<div class="pcard ${i==S.p?'on':''}" role="button" tabindex="0" data-act="sel" data-i="${i}"><div class="slot"><img src="/images/blocks/${block}.png" alt=""></div><div class="pinfo"><b>${esc(p.n)}</b><span class="${i==S.p?'on':''}">${i==S.p?'Activo · ':''}${esc(p.s)}</span></div>${S.migratingProfile===p.n?'<span class="mu" style="color:#FBBF24">Migrando…</span>':`<button class="edit" data-act="ped" data-i="${i}">Editar</button>${p.id?'':`<button class="mig" data-act="migrate" data-i="${i}" title="Migrar a instancia independiente">Migrar</button>`}`}</div>`;
+    }).join('');
   }
   const newCard = `<button class="newcard" data-act="new"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>Nueva instancia</button>`;
 
@@ -265,6 +286,26 @@ let accHtml = '';
   </div>`;
   }
   function profiles(){ return `<div class="home"><h1>Instancias</h1><div class="mu" style="margin:6px 0 18px">Elegí con cuál jugar o creá una nueva.</div><div class="cards">${cards()}${newCard}</div></div>`; }
+  function settings(){
+    return `<div class="home">
+      <h1>Configuración</h1>
+      <div class="mu" style="margin:6px 0 18px">Ajustes generales de Obsidia.</div>
+      <div class="gl mc">
+        <div class="row">
+          <div>
+            <div style="font-weight:600">RAM asignada por defecto</div>
+            <div class="mu">Límite para instancias nuevas (máx ${S.totalRam} GB).</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:12px">
+            <b id="ramv">${S.defRam} GB</b>
+            <input type="range" id="ram" min="2" max="${S.totalRam}" step="1" value="${S.defRam}">
+          </div>
+        </div>
+        <hr style="border:0;border-top:1px solid rgba(255,255,255,.05);margin:0">
+        ${sw('lite', 'Modo ligero', 'Desactiva animaciones y transiciones.')}
+      </div>
+    </div>`;
+  }
 
   // ───────────── Mods / shaders / resource packs ─────────────
   function installedList(kind){
@@ -273,17 +314,20 @@ let accHtml = '';
     const names = { mods:'Mods instalados', shaders:'Shaders instalados', packs:'Resource packs instalados' };
     const grad = kind==='mods' ? 'linear-gradient(135deg,#8B5CF6,#22D3EE)' : kind==='shaders' ? 'linear-gradient(135deg,#FBBF24,#F472B6)' : 'repeating-linear-gradient(90deg,rgba(0,0,0,.14) 0 8px,transparent 8px 16px),linear-gradient(135deg,#34D399,#22D3EE)';
     return `<div class="gl" style="grid-column:1/-1;padding:18px 20px;display:flex;flex-direction:column;gap:8px"><b>${names[kind]}</b>${files.map(f=>{
-      const icon = iconFor(kind, f);
-      const bg = icon ? `background-image:url(${esc(icon)}),${grad};background-size:cover;background-position:center` : `background:${grad}`;
-      return `<div style="display:flex;align-items:center;gap:12px;padding:6px 12px;border-radius:12px;background:rgba(255,255,255,.04)"><div class="mi" style="${bg}"></div><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(f)}</span>${trb(kind,f,34)}</div>`;
+      const icon = safeImageUrl(iconFor(kind, f));
+      const bg = icon ? `background-image:url("${icon}"),${grad};background-size:cover;background-position:center` : `background:${grad}`;
+      return `<div style="display:flex;align-items:center;gap:12px;padding:6px 12px;border-radius:12px;background:rgba(255,255,255,.04)"><div class="mi" style='${bg}'></div><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(f)}</span>${trb(kind,f,34)}</div>`;
     }).join('')}</div>`;
   }
   function grid(){
     const kind = S.sec, q = S.q.trim(), res = S.results[kind];
     let h = '';
     if (kind==='shaders' && !findFile('mods','iris')) h += irisBanner(S.busy['iris']);
-  if (!res){
-      h += `<div class="mu">${S.searching?'Buscando en Modrinth…':'Cargando…'}</div>`;
+    if (!res){
+      const err = S.searchErr[kind];
+      h += err
+        ? `<div class="gl" style="padding:16px 18px;display:flex;align-items:center;gap:12px;flex-wrap:wrap"><span class="mu">No se pudo buscar: ${esc(err)}</span><button class="sec" style="height:38px;padding:0 16px" data-act="retrysearch">Reintentar</button></div>`
+        : `<div class="mu">${S.searching?'Buscando en Modrinth…':'Cargando…'}</div>`;
     } else {
       h += res.length ? res.map(r => resCard(kind, r, S.busy[r.slug], installedFile(kind, r.slug) || findFile(kind, r.slug, r.title))).join('') : '<div class="mu">No hay resultados en Modrinth.</div>';
     }
@@ -298,11 +342,9 @@ let accHtml = '';
     return `<div class="gl" style="padding:18px 20px;display:flex;flex-direction:column;gap:10px"><div style="display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap"><div><b>Resource packs</b><div class="mu">El orden es la prioridad: el de arriba gana.</div></div><button class="sec" style="height:38px;padding:0 16px" data-act="pauto">Ordenar automático</button></div>${rows}</div>`;
   }
   function mods(){
-    try {
     const p = P[S.p];
     const ph = { mods:'Buscar en Modrinth…', shaders:'Buscar shaders…', packs:'Buscar resource packs…' }[S.sec];
     return `<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap"><h1>Mods</h1><div class="gl" style="padding:9px 16px;color:#C9C7DD;font-size:14px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%">Instancia: ${p?esc(p.n)+' · '+esc(p.loader||'Vanilla'):'—'}</div></div>${seg()}${S.sec==='packs'?packsPanel():''}${installedList(S.sec)}<input id="q" class="srch" aria-label="${ph}" placeholder="${ph}" value="${esc(S.q)}">${S.sec==='mods'&&!S.q.trim()?`<div class="chips">${['Todos','Optimización','Gráficos','Utilidades'].map(c=>`<button class="chip ${c==S.f?'on':''}" data-act="f" data-c="${c}">${c}</button>`).join('')}</div>`:''}<div class="g3" id="grid">${grid()}</div>`;
-  } catch(e) { return "<h1>MODS ERROR: " + esc(String(e)) + "</h1>"; }
   }
 
   async function migrateContentMaps(){
@@ -333,122 +375,262 @@ let accHtml = '';
        S.migratingContent = false;
      }
    }
-async function refreshFiles(){
-    if (S.migratedInstance !== inst()) await migrateContentMaps();
-const [mc, sc, pc, ps] = await Promise.all([
-      invoke('list_content', { instance:inst(), kind:'mods' }).catch(()=>null),
-      invoke('list_content', { instance:inst(), kind:'shaders' }).catch(()=>null),
-      invoke('list_content', { instance:inst(), kind:'packs' }).catch(()=>null),
-      invoke('get_resourcepack_state', { instance:inst() }).catch(()=>[])
-    ]);
-    let m = (mc && Array.isArray(mc) && mc.length) ? mc.map(x=>x.file) : null;
-    let s = (sc && Array.isArray(sc) && sc.length) ? sc.map(x=>x.file) : null;
-    let r = (pc && Array.isArray(pc) && pc.length) ? pc.map(x=>x.file) : null;
-    if (m === null) m = await invoke('list_installed_mods', { instance:inst() }).catch(()=>[]);
-    if (s === null) s = await invoke('list_shaderpacks', { instance:inst() }).catch(()=>[]);
-    if (r === null) r = await invoke('list_resourcepacks', { instance:inst() }).catch(()=>[]);
-    S.files = { mods:m||[], shaders:s||[], packs:r||[] };
-    S.content = { mods:mc||[], shaders:sc||[], packs:pc||[] };
-    S.contentIcons = { mods:{}, shaders:{}, packs:{} };
-    for (const kind of ['mods','shaders','packs']){
-      const arr = S.content[kind] || [];
-      const map = {};
-      for (const e of arr) if (e && e.file) map[e.file] = e.icon || '';
-      S.contentIcons[kind] = map;
-    }
-    S.pstate = ps||[];
+async function loadInventory(instance){
+    if (S.inv[instance]) return S.inv[instance];
+    if (S.invLoading[instance]) return await S.invLoading[instance];
+    const promise = (async () => {
+      const [mc, sc, pc, ps] = await Promise.all([
+        invoke('list_content', { instance, kind:'mods' }).catch(()=>null),
+        invoke('list_content', { instance, kind:'shaders' }).catch(()=>null),
+        invoke('list_content', { instance, kind:'packs' }).catch(()=>null),
+        invoke('get_resourcepack_state', { instance }).catch(()=>[])
+      ]);
+      let m = (mc && Array.isArray(mc) && mc.length) ? mc.map(x=>x.file) : null;
+      let sh = (sc && Array.isArray(sc) && sc.length) ? sc.map(x=>x.file) : null;
+      let r = (pc && Array.isArray(pc) && pc.length) ? pc.map(x=>x.file) : null;
+      if (m === null) m = await invoke('list_installed_mods', { instance }).catch(()=>[]);
+      if (sh === null) sh = await invoke('list_shaderpacks', { instance }).catch(()=>[]);
+      if (r === null) r = await invoke('list_resourcepacks', { instance }).catch(()=>[]);
+      const inv = { files:{ mods:m||[], shaders:sh||[], packs:r||[] }, content:{ mods:mc||[], shaders:sc||[], packs:pc||[] }, icons:{ mods:{}, shaders:{}, packs:{} }, pstate: ps||[] };
+      for (const kind of ['mods','shaders','packs']) { const arr = inv.content[kind] || []; const map = {}; for (const e of arr) if (e && e.file) map[e.file] = e.icon || ''; inv.icons[kind] = map; }
+      S.inv[instance] = inv;
+      delete S.invLoading[instance];
+      return inv;
+    })();
+    S.invLoading[instance] = promise;
+    return promise;
+  }
+  async function syncInventory(instance){
+    const inv = await loadInventory(instance);
+    S.files = inv.files; S.content = inv.content; S.contentIcons = inv.icons; S.pstate = inv.pstate;
     loadFileMap();
   }
-  async function savePacks(){
+  /** @param {string} kind @param {string} [instance] */
+  async function refreshKind(kind, instance){
+    const target = instance || inst();
+    const inv = await loadInventory(target);
+    const r = await invoke('list_content', { instance: target, kind }).catch(()=>null);
+    if (Array.isArray(r)) { inv.files[kind] = r.map(x=>x.file); inv.content[kind] = r; inv.icons[kind] = {}; const m = {}; for (const e of r) if (e && e.file) m[e.file] = e.icon || ''; inv.icons[kind] = m; }
+    if (kind === 'packs') inv.pstate = await invoke('get_resourcepack_state', { instance: target }).catch(()=>[]);
+    if (target === inst()){
+      await syncInventory(target);
+      if (S.tab === 'mods') { refreshGrid(); renderOrDefer(); }
+    }
+    // background update check for this kind
+    (async () => {
+      try {
+        const ups = await invoke('check_content_updates', { instance: target, kind });
+        if (Array.isArray(ups)){
+          const m = new Map(ups.map(u => [u.file, !!u.hay_actualizacion]));
+          const arr = inv.content[kind] || [];
+          for (const e of arr) if (m.has(e.file)) e.hay_actualizacion = m.get(e.file);
+        }
+      } catch(e){}
+      if (target !== inst()) return;
+      if (S.tab === 'mods') { refreshGrid(); renderOrDefer(); }
+    })();
+  }
+  async function refreshFiles(){
+    const instance = inst();
+    await syncInventory(instance);
+    (async () => {
+      for (const k of ['mods','shaders','packs']) {
+        try {
+          const ups = await invoke('check_content_updates', { instance, kind:k });
+          if (Array.isArray(ups)) {
+            const m = new Map(ups.map(u => [u.file, !!u.hay_actualizacion]));
+            const arr = S.content[k] || [];
+            for (const e of arr) if (m.has(e.file)) e.hay_actualizacion = m.get(e.file);
+          }
+        } catch(e){}
+      }
+      if (S.tab === 'mods') { refreshGrid(); renderOrDefer(); }
+    })();
+  }
+  // Si hay un modal abierto, el render se difiere hasta que se cierre (que ya re-renderiza).
+  function renderOrDefer(){
+    if (S.np || S.msc){ S.pendingRender = true; return; }
+    render();
+  }
+async function savePacks(){
     const active = S.pstate.filter(x=>x.enabled).map(x=>x.name);
     try { await invoke('save_resourcepack_state', { active, instance:inst() }); }
     catch(e){ toast('No se pudo guardar el orden de packs: '+e, true); }
-    await refreshFiles(); refreshGrid();
+    await refreshKind('packs');
   }
 
-  const CATMAP = { 'Optimización':'optimization', 'Utilidades':'utility' };
   async function doSearch(){
     const kind = S.sec, q = S.q.trim(), my = ++S.searchSeq;
-    const cat = (kind==='mods' && !q && S.f !== 'Todos') ? (CATMAP[S.f] || null) : null;
-    const text = q || (kind==='mods' && !q && S.f === 'Gráficos' ? 'graphics' : '');
-    if (kind==='mods' && !q && !cat && S.f!=='Todos'){ S.results.mods = null; S.searching = false; refreshGrid(); return; }
-    S.searching = true; S.results[kind] = null; refreshGrid();
-    const cmd = { mods:'search_mods', shaders:'search_shaders', packs:'search_resourcepacks' }[kind];
-    let res = [];
+    const cat = (kind==='mods' && !q && S.f !== 'Todos') ? (CAT[S.f] || null) : null;
+    const text = q;
+    S.searchErr[kind] = '';
     const p = P[S.p];
     const ver = (p && p.version) || null;
     const lod = (kind==='mods' && p && p.loader && p.loader !== 'Vanilla') ? p.loader : null;
-    try { res = await invoke(cmd, { query:text, category: cat, version: ver, loader: lod }); } catch(e){ if (my===S.seq) toast('La búsqueda falló: '+e, true); }
-    if (my !== S.searchSeq) return;
-    S.results[kind] = Array.isArray(res) ? res : [];
-    S.searching = false; refreshGrid();
+    const key = [kind, text, cat||'', ver||'', lod||'', inst()].join('|');
+    const cached = S.searchCache[key];
+    if (cached) {
+      S.results[kind] = cached.res;
+      S.searching = false;
+      refreshGrid();
+    } else {
+      S.searching = true;
+      S.results[kind] = null;
+      refreshGrid();
+    }
+    // Evitar solicitudes duplicadas simultáneas.
+    if (S.searchPending[key]) {
+      try { await S.searchPending[key]; } catch(e){}
+      return;
+    }
+    // Caché fresca: no consultar de nuevo.
+    if (cached && (Date.now() - cached.ts) < 300000) return;
+    const cmd = { mods:'search_mods', shaders:'search_shaders', packs:'search_resourcepacks' }[kind];
+    let promise = (async () => {
+      let res;
+      try {
+        res = await invoke(cmd, { query:text, category: cat, version: ver, loader: lod });
+      } catch(e){
+        if (my !== S.searchSeq) return;
+        // No cachear el error: así "Reintentar" vuelve a consultar de verdad.
+        S.results[kind] = null;
+        S.searching = false;
+        S.searchErr[kind] = String(e);
+        refreshGrid();
+        return;
+      }
+      if (my !== S.searchSeq) return;
+      const arr = Array.isArray(res) ? res : [];
+      S.searchCache[key] = { res: arr, ts: Date.now() };
+      S.results[kind] = arr;
+      S.searching = false;
+      refreshGrid();
+    })();
+    S.searchPending[key] = promise;
+    try { await promise; } finally { delete S.searchPending[key]; }
+  }
+
+  // Identificador de operación para correlacionar eventos de performance.
+  let perfOpId = null;
+  function perfLog(stage, extra='') {
+    if (!import.meta.env.DEV) return;
+    const t = Date.now();
+    const msg = `[PERF][${perfOpId||'-'}] ${stage} t=${t} ${extra}`;
+    console.log(msg);
+    try { invoke('log_performance_event', { event: msg }).catch(()=>{}); } catch(e){}
   }
 
   async function doInstall(kind, slug){
+    const instance = inst();
+    const p = P[S.p];
     // Mods: plan previo sin descargas + confirmación explícita.
     if (kind==='mods'){
       if (S.busy[slug] || S.plan) return;
-      const p = P[S.p];
       if (!p){ toast('Creá una instancia primero.', true); return; }
       if ((p.loader||'Vanilla')==='Vanilla'){ toast('Esta instancia es Vanilla: creá una instancia Fabric o Forge para usar mods.', true); return; }
+      perfOpId = slug+'-'+Date.now();
+      perfLog('clic_instalar');
       S.busy[slug] = 1; refreshGrid();
       try {
-        const plan = await invoke('plan_mod_dependencies', { slug, mcVersion:p.version, loader:p.loader.toLowerCase(), instance:inst() });
-        if (S.busy[slug] && plan) { S.plan = plan; S.planSlug = slug; S.planKind = kind; }
-        else toast('No se pudo planear la instalación.', true);
-      } catch(e){ toast('No se pudo planear la instalación: '+e, true); }
+        perfLog('inicio_resolucion');
+        const result = await invoke('plan_mod_dependencies', { slug, mcVersion:p.version, loader:p.loader.toLowerCase(), instance });
+        perfLog('fin_resolucion');
+        if (!S.busy[slug] || !result) { delete S.busy[slug]; refreshGrid(); render(); return; }
+        const plan = result.plan;
+        const planId = result.plan_id;
+        const pending = (plan.dependencies||[]).filter(d => !d.already_installed);
+        if (pending.length === 0) {
+          // Todas las dependencias ya están instaladas: instalar directamente sin modal.
+          try {
+            perfLog('inicio_invoke_install_mod');
+            const res = await invoke('install_mod', { slug, mcVersion:p.version, loader:p.loader.toLowerCase(), instance, confirmedPlan:plan, planId });
+            perfLog('respuesta_backend');
+            const result2 = (S.results && S.results[kind]) ? S.results[kind].find(r => r.slug === slug) : null;
+            if (res) rememberFile(kind, slug, res, result2 && result2.icon_url, instance);
+            toast('Instalado correctamente.');
+            perfLog('boton_instalado');
+          } catch(e){ toast('No se pudo instalar: '+e, true); }
+          delete S.busy[slug];
+          await refreshKind(kind, instance);
+          perfLog('fin_refreshkind');
+          return;
+        }
+        // Hay dependencias pendientes: el modal viaja con el plan y su planId intactos.
+        S.plan = plan;
+        S.planId = planId;
+        S.planSlug = slug;
+        S.planKind = kind;
+        S.planInstance = instance;
+        delete S.busy[slug];
+        refreshGrid(); render();
+        return;
+      } catch(e){
+        S.planId = null;
+        toast('No se pudo planear la instalación: '+e, true);
+      }
       delete S.busy[slug];
       refreshGrid(); render();
       return;
     }
     if (S.busy[slug]) return;
-    const mySeq = ++S.installSeq;
-    const p = P[S.p];
     if (!p){ toast('Creá una instancia primero.', true); return; }
+    perfOpId = slug+'-'+Date.now();
+    perfLog('clic_instalar');
     S.busy[slug] = 1; refreshGrid();
     try {
-      if (mySeq !== S.installSeq) return;
       let res = null;
-      if (kind==='shaders') res = await invoke('install_shaderpack', { slug, mcVersion:p.version, instance:inst() });
-      else res = await invoke('install_resourcepack', { slug, mcVersion:p.version, instance:inst() });
+      if (kind==='shaders') res = await invoke('install_shaderpack', { slug, mcVersion:p.version, instance });
+      else res = await invoke('install_resourcepack', { slug, mcVersion:p.version, instance });
+      perfLog('respuesta_backend');
       const result = (S.results && S.results[kind]) ? S.results[kind].find(r => r.slug === slug) : null;
-      if (res) rememberFile(kind, slug, res, result && result.icon_url);
+      if (res) rememberFile(kind, slug, res, result && result.icon_url, instance);
       toast('Instalado correctamente.');
+      perfLog('boton_instalado');
     } catch(e){ toast('No se pudo instalar: '+e, true); }
     delete S.busy[slug];
-    await refreshFiles(); loadFileMap(); refreshGrid(); render();
+    await refreshKind(kind, instance);
+    perfLog('fin_refreshkind');
   }
 
   // Instala el plan confirmado tal cual (el backend lo recalcula y verifica).
   async function doInstallConfirmed(){
     if (!S.plan) return;
+    const instance = S.planInstance || inst();
     const p = P[S.p];
     if (!p){ toast('Creá una instancia primero.', true); return; }
     const slug = S.planSlug, kind = S.planKind;
     if (S.busy[slug]) return;
+    perfOpId = slug+'-'+Date.now();
+    perfLog('clic_instalar');
     S.busy[slug] = 1;
     const plan = S.plan;
-    S.plan = null; S.planSlug=''; S.planKind='';
+    const planId = S.planId;
+    S.plan = null; S.planSlug=''; S.planKind=''; S.planId=null; S.planInstance='';
     render();
     try {
-      const res = await invoke('install_mod', { slug, mcVersion:p.version, loader:p.loader.toLowerCase(), instance:inst(), confirmedPlan:plan });
+      perfLog('inicio_invoke_install_mod');
+      const res = await invoke('install_mod', { slug, mcVersion:p.version, loader:p.loader.toLowerCase(), instance, confirmedPlan:plan, planId });
+      perfLog('respuesta_backend');
       const result = (S.results && S.results[kind]) ? S.results[kind].find(r => r.slug === slug) : null;
-      if (res) rememberFile(kind, slug, res, result && result.icon_url);
+      if (res) rememberFile(kind, slug, res, result && result.icon_url, instance);
       toast('Instalado correctamente.');
+      perfLog('boton_instalado');
     } catch(e){ toast('No se pudo instalar: '+e, true); }
     delete S.busy[slug];
-    await refreshFiles(); loadFileMap(); refreshGrid(); render();
+    await refreshKind(kind, instance);
+    perfLog('fin_refreshkind');
   }
 
   function planModal(){
     const pl = S.plan;
     if (!pl) return '';
-    const deps = (pl.dependencies||[]).map(d=>`<div style="display:flex;align-items:center;gap:12px;padding:6px 12px;border-radius:12px;background:rgba(255,255,255,.04)"><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(d.slug)}</span><span class="mu" style="font-size:12px">${esc(d.filename)}</span><span class="pf" style="color:${d.already_installed?'#A9A5B8':'#6EE7B7'}">${d.already_installed?'Ya instalada':'A instalar'}</span></div>`).join('');
+    const pending = (pl.dependencies||[]).filter(d => !d.already_installed);
+    const deps = pending.map(d=>`<div style="display:flex;align-items:center;gap:12px;padding:6px 12px;border-radius:12px;background:rgba(255,255,255,.04)"><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(d.slug)}</span><span class="mu" style="font-size:12px">${esc(d.filename)}</span><span class="pf" style="color:#6EE7B7">A instalar</span></div>`).join('');
     return `<div class="md-back" data-act="plancancel"><div class="md gl" style="width:min(520px,94vw);padding:26px;display:flex;flex-direction:column;gap:14px">
       <h2 style="margin:0">Confirmar instalación</h2>
-      <div class="mu">Se instalarán primero las dependencias obligatorias y después el mod principal.</div>
+      <div class="mu">Se instalarán primero las dependencias obligatorias pendientes y después el mod principal.</div>
       <div style="display:flex;align-items:center;gap:12px;padding:8px 12px;border-radius:12px;background:rgba(255,255,255,.04)"><b style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(pl.slug)}</b><span class="mu" style="font-size:12px">${esc(pl.filename)}</span><span class="pf" style="color:#C4B5FD">Mod principal</span></div>
-      ${(pl.dependencies||[]).length?deps:'<div class="mu">Este mod no tiene dependencias obligatorias.</div>'}
+      ${pending.length?deps:'<div class="mu">Todas las dependencias obligatorias ya están instaladas.</div>'}
       <div style="display:flex;gap:10px;justify-content:flex-end"><button class="sec" style="height:42px" data-act="plancancel">Cancelar</button><button class="ib" style="margin:0;height:42px;padding:0 22px" data-act="planinstall">Instalar</button></div>
     </div></div>`;
   }
@@ -474,46 +656,137 @@ const [mc, sc, pc, ps] = await Promise.all([
   }
 
   // ───────────── Cuenta ─────────────
-  function account(){
+function account(){
     const ok = validName(S.nick);
-    const help = 'En modo offline la skin se aplica con un resource pack automático y solo la ves vos. Con cuenta Microsoft se usa tu skin oficial.';
-    const model = (m,l) => `<button class="chip ${S.skmodel==m?'on':''}" data-act="skinmodel" data-m="${m}">${l}</button>`;
-    return `<h1>Mi cuenta</h1><div style="display:grid;grid-template-columns:1fr 1.3fr;gap:16px;align-items:start"><div class="gl" style="padding:26px;display:flex;flex-direction:column;align-items:center;gap:18px">${skinFace(S.sk,132,S.skins)}<div style="width:100%"><label class="mu" for="nick">Nombre de jugador</label><input id="nick" class="srch" style="width:100%;margin-top:6px" maxlength="16" autocomplete="off" value="${esc(S.nick)}" ${S.ms?'disabled':''}><div id="nm" style="margin-top:8px;font-size:13px;color:${ok?'#6EE7B7':'#FCD34D'}">${ok?'Nombre válido ✓':'Usá de 3 a 16 letras, números o guion bajo.'}</div></div></div><div style="display:flex;flex-direction:column;gap:16px"><div class="gl" style="padding:20px 22px;display:flex;flex-direction:column;gap:10px"><b>Tipo de cuenta</b><div style="color:${S.ms?'#6EE7B7':'#C9C7DD'}">${S.ms?'Cuenta Microsoft vinculada':'Estás jugando en modo offline'}</div><div class="mu">${S.ms?'Podés entrar a servidores premium y usar tu skin oficial.':'En modo offline no podés entrar a servidores que verifican la cuenta.'}</div>${S.ms?'<button class="sec" style="height:44px" data-act="mso">Cerrar sesión</button>':`<button class="ib" style="margin:0;height:44px" ${S.ml?'disabled':''} data-act="ms">${S.ml?'Esperando a Microsoft…':'Iniciar sesión con Microsoft'}</button>`}</div><div class="gl" style="padding:20px 22px;display:flex;flex-direction:column;gap:14px"><b>Skin</b><div class="mu">${help}</div><div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><span class="mu">Modelo:</span>${model('classic','Clásico')}${model('slim','Fino')}</div><div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px">${S.skins.map((u,i)=>`<button class="pc gl ${i==S.sk?'on':''}" style="flex-direction:column;padding:12px" data-act="skin" data-i="${i}">${skinFace(i,56,S.skins)}<span class="mu">Skin ${i+1}</span></button>`).join('')}${S.skins.length===0?`<div class="mu" style="grid-column:1/-1">No hay skins cargadas. Subí una para empezar (máx. 4).</div>`:''}</div><input type="file" id="skinfile" accept="image/png" style="display:none"><div style="display:flex;gap:10px;flex-wrap:wrap"><button class="ib" style="margin:0;height:44px;flex:1;min-width:180px" data-act="skinup" ${S.skins.length>=4?'disabled':''}>${S.skins.length>=4?'Límite de 4 skins alcanzado':'Subir skin (PNG)'}</button><button class="sec" style="height:44px" data-act="skindel" aria-label="Quitar skin del juego">${TRASH}</button></div></div></div></div>`;
-  }
-  function saveSkins(){ try { localStorage.setItem('obsidia.skins', JSON.stringify(S.skins)); localStorage.setItem('obsidia.sk', String(S.sk)); localStorage.setItem('obsidia.skmodel', S.skmodel); } catch(e){} }
+    const p = P[S.p] || {};
+    const modCount = S.content.mods?.length || 0;
+    const ramGb = p.ram || S.defRam || 4;
+    const skinUrl = S.sk >= 0 && S.sk < S.skins.length ? S.skins[S.sk] : null;
+    const modelLabel = S.skmodel === 'slim' ? 'Fino' : 'Clásico';
+    const currentSkinLabel = S.sk >= 0 ? `Skin ${S.sk + 1}` : 'Sin skin';
 
-  // ───────────── Ajustes ─────────────
-  function settings(){
-    return `<h1>Ajustes</h1><div class="row gl"><div><div style="font-weight:600">Memoria RAM por defecto</div><div class="mu">Se usa al crear instancias nuevas. Cada instancia guarda la suya.</div></div><div style="display:flex;align-items:center;gap:14px"><input type="range" id="ram" min="2" max="${Math.max(2,S.totalRam)}" value="${S.defRam}" aria-label="Memoria RAM"><b id="ramv" style="width:60px">${S.defRam} GB</b></div></div><div class="row gl"><div><div style="font-weight:600">Java</div><div class="mu">Automático: Obsidia descarga el Java que pide cada versión. Para usar otro, editá la instancia.</div></div></div>${sw('lite','Modo ligero','Sin animaciones, ideal para PCs modestas')}`;
-  }
+    const skinBig = skinFull(skinUrl, S.skmodel, 8);
+    const previewSkinImg = skinFull(skinUrl, S.skmodel, 5);
 
-  // ───────────── Render ─────────────
-  function render(){
-    document.body.classList.toggle('lite', S.t.lite);
-    accHtml = accCard(S.sk, S.nick, S.ms, S.skins);
-    navHtml = TABS.map(t=>`<button class="${t[0]==S.tab?'on':''}" data-act="go" data-t="${t[0]}">${ic(t[0])}${t[1]}</button>`).join('');
-    let html = { home, profiles, mods, servers, settings, account }[S.tab]();
-    if (S.plan) html += planModal();
-    if (S.np) html += npModal();
-    if (S.msc) html += msModal();
-    Q('#view').innerHTML = html;
+    return `<div class="account-page">
+      <div class="page-head">
+        <div>
+          <h1>Mi cuenta</h1>
+          <p class="page-sub">Tu identidad en Obsidia y en el juego.</p>
+        </div>
+        <div class="save-state"><svg viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg>Guardado automático</div>
+      </div>
+
+      <div class="top">
+        <section class="panel profile" aria-labelledby="player-name">
+          <div class="figure-wrap">
+            <div class="figure-shadow"></div>
+            ${skinBig}
+          </div>
+          <div class="identity">
+            <label class="field-label" for="nick">Nombre de jugador</label>
+            <div class="name-row">
+              <input id="nick" class="js-nick" maxlength="16" autocomplete="off" spellcheck="false" value="${esc(S.nick)}" ${S.ms ? 'disabled' : ''} aria-describedby="nick-help">
+              <button class="pencil" type="button" data-act="nickfocus" aria-label="Editar nombre" ${S.ms ? 'disabled' : ''}><svg viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 013 3L7 19l-4 1 1-4Z"/></svg></button>
+            </div>
+            <div class="valid" id="nick-help"><svg viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg><span class="js-valid">${ok ? 'Nombre válido' : 'Usá de 3 a 16 letras, números o guion bajo.'}</span></div>
+            <div class="badges">
+              <span class="badge ${S.ms ? '' : 'offline'}"><i></i>${S.ms ? 'Cuenta Microsoft' : 'Modo offline'}</span>
+              <span class="badge"><span class="js-current-skin">${currentSkinLabel}</span></span>
+              <span class="badge"><span class="js-model">Modelo ${modelLabel}</span></span>
+            </div>
+            <p class="fine">Este nombre aparece en el juego y en los servidores. Podés cambiarlo cuando quieras.</p>
+            <div class="profile-stats">
+              <div><b>${P[S.p] ? `${esc(p.loader || 'Vanilla')} ${esc(p.version || '—')}` : 'Sin instancia'}</b><span>instancia activa</span></div>
+              <div><b>${modCount}</b><span>mods instalados</span></div>
+              <div><b>${ramGb} GB</b><span>RAM asignada</span></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel account" aria-labelledby="account-title">
+          <div class="panel-head"><h2 id="account-title">Cuenta</h2><span class="badge ${S.ms ? '' : 'offline'}"><i></i>${S.ms ? 'Microsoft' : 'Offline'}</span></div>
+          ${S.ms
+            ? `<h3>Cuenta Microsoft vinculada</h3><p>Tu identidad de Microsoft está conectada a Obsidia.</p>`
+            : `<h3>Estás jugando sin cuenta</h3><p>Tus datos se guardan en esta PC. Vinculá Microsoft para jugar en servidores premium y usar tu skin oficial.</p>`}
+          <ul class="facts">
+            <li class="${S.ms ? 'yes' : 'no'}"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8 12h8"/></svg>Servidores premium</li>
+            <li class="${S.ms ? 'yes' : 'no'}"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8 12h8"/></svg>Skin oficial de Microsoft</li>
+            <li class="yes"><svg viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg>Mundos y mods en esta PC</li>
+          </ul>
+          ${S.ms
+            ? `<button class="btn btn-sec" type="button" data-act="mso">Cerrar sesión</button>`
+            : `<button class="btn btn-primary" type="button" data-act="ms" ${S.ml ? 'disabled' : ''}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5.5 10.5 4v7H3zM12 3.7 21 2v9H12zM3 12.5h7.5v7L3 18zM12 12.5h9v9l-9-1.5z"/></svg>${S.ml ? 'Esperando a Microsoft...' : 'Vincular cuenta de Microsoft'}</button>`}
+          <p class="micro">${S.ms ? 'Tu skin oficial de Microsoft se usa automáticamente en el juego.' : 'No se comparte nada hasta que inicies sesión.'}</p>
+        </section>
+      </div>
+
+      <section class="panel skins" aria-labelledby="skin-title">
+        <div class="panel-head">
+          <div><h2 id="skin-title">Skin</h2><p>Elegí la que se aplica en tu cliente.</p></div>
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+            <div class="seg" role="group" aria-label="Modelo de skin">
+              <button class="chip ${S.skmodel === 'classic' ? 'on' : ''}" data-act="skinmodel" data-m="classic" type="button" aria-pressed="${S.skmodel === 'classic'}">Clásico</button>
+              <button class="chip ${S.skmodel === 'slim' ? 'on' : ''}" data-act="skinmodel" data-m="slim" type="button" aria-pressed="${S.skmodel === 'slim'}">Fino</button>
+            </div>
+            ${S.sk >= 0 ? `<button class="skin-del-bar" type="button" aria-label="Borrar skin activa" data-act="skindel"><svg viewBox="0 0 24 24"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14M10 11v6M14 11v6"/></svg></button>` : ''}
+          </div>
+        </div>
+        <div class="skin-grid">
+          ${S.skins.map((u,i) => {
+            const isSelected = i === S.sk;
+            return `<button class="skin-tile ${isSelected ? 'selected' : ''}" type="button" data-skin="${i}" aria-pressed="${isSelected}" data-act="skin" data-i="${i}">
+              <span class="in-use">${isSelected ? 'En uso' : ''}</span><span class="face">${skinFace(i,68,S.skins)}</span><span class="label">Skin ${i+1}</span></button>`;
+          }).join('')}
+          <button class="skin-tile upload" type="button" data-act="skinup" ${S.skins.length >= 4 ? 'disabled aria-disabled="true" style="opacity:.45;cursor:default"' : ''}><svg viewBox="0 0 24 24"><path d="M12 16V4"/><path d="m7 9 5-5 5 5"/><path d="M4 20h16"/></svg><b>Subir PNG</b><span>64×64 · máximo 4 skins</span></button>
+        </div>
+        <div class="skin-foot">
+          <div class="skin-note"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5v.5"/></svg><span>En modo offline la skin se aplica con un resource pack automático: solo la ves vos. Con cuenta Microsoft se usa tu skin oficial.</span></div>
+          <span class="png-spec">PNG · 64×64</span>
+        </div>
+        <input type="file" id="skinfile" accept="image/png" style="display:none" aria-hidden="true">
+      </section>
+
+      <section class="preview" aria-labelledby="preview-title">
+        <div class="preview-bg"></div>
+        <div class="preview-copy">
+          <h2 id="preview-title">Cómo se ve en el juego</h2>
+          <p>Tu nombre aparece sobre el personaje. ${S.ms ? 'Con cuenta Microsoft se usa tu skin oficial.' : 'En modo offline, los demás jugadores ven la skin por defecto.'}</p>
+          <div class="preview-chips">
+            <span class="js-name">${esc(S.nick || 'Jugador')}</span>
+            <span class="js-current-skin">${currentSkinLabel}</span>
+            <span class="js-model">Modelo ${modelLabel}</span>
+          </div>
+        </div>
+        <div class="preview-figure"><span class="nametag js-name">${esc(S.nick || 'Jugador')}</span><div class="figure-shadow"></div>${previewSkinImg}</div>
+      </section>
+    </div>`;
   }
 
   // ───────────── Lanzar el juego ─────────────
   async function findLoaderVersion(p){
     const inst = await invoke('get_installed_versions').catch(()=>[]);
+    const installed = Array.isArray(inst) ? inst : [];
     const mc = p.version.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const rx = p.loader==='Fabric' ? new RegExp('^fabric-loader-.+-'+mc+'$') : new RegExp('^'+mc+'-forge-');
+    // Si la instancia fija una versión del loader, esa manda; la más nueva es solo respaldo.
+    if (p.loaderVersion){
+      const exact = p.loader==='Fabric'
+        ? `fabric-loader-${p.loaderVersion}-${p.version}`
+        : `${p.version}-forge-${p.loaderVersion}`;
+      if (installed.includes(exact)) return exact;
+    }
     // Orden numérico ("0.16.10" > "0.9.3"); el orden alfabético elegiría el loader equivocado.
-    return (inst||[]).filter(v => rx.test(v)).sort((a,b) => a.localeCompare(b, undefined, { numeric:true })).pop() || null;
+    return installed.filter(v => rx.test(v)).sort((a,b) => a.localeCompare(b, undefined, { numeric:true })).pop() || null;
   }
   async function launchVersionId(p){
     if (!p.loader || p.loader==='Vanilla') return p.version;
     let id = await findLoaderVersion(p);
     if (id) return id;
     S.stage = 'loader'; S.pg = 3; render();
+    /** @type {{ mcVersion: string, loaderVersion?: string }} */
     const installArgs = { mcVersion:p.version };
-    if (p.loaderVersion) installArgs.loader_version = p.loaderVersion;
+    if (p.loaderVersion) installArgs.loaderVersion = p.loaderVersion;
     await invoke(p.loader==='Fabric' ? 'install_fabric' : 'install_forge', installArgs);
     id = await findLoaderVersion(p);
     if (!id) throw new Error('No encontré el loader '+p.loader+' después de instalarlo.');
@@ -539,6 +812,8 @@ const [mc, sc, pc, ps] = await Promise.all([
     const instanceId = inst();
     S.pg = 0; S.stage = 'version'; S.launchErr = ''; S.launchMsg = ''; render();
     let un = null;
+    /** @type {null | (() => void)} */
+    let unClosed = null;
     try {
       un = await listen('launch-progress', ev => {
         const { stage, done, total, instance } = ev.payload || {};
@@ -549,6 +824,15 @@ const [mc, sc, pc, ps] = await Promise.all([
         if (S.tab==='home') render();
       });
     } catch(e){ /* sin eventos: igual se lanza */ }
+    // Registrar antes de lanzar: si el juego cierra rápido, el evento no se pierde.
+    try {
+      unClosed = await listen('minecraft-closed', (ev) => {
+        const payload = ev.payload || {};
+        if (payload.instance && payload.instance !== instanceId) return;
+        S.pg = null; S.launchMsg = ''; render();
+        if (unClosed) { try { unClosed(); } catch(e){} unClosed = null; }
+      });
+    } catch(e){ unClosed = null; }
     try {
       // Solo Vanilla con ID usa launch_instance.
       const useNew = instanceId !== 'legacy' && (!p.loader || p.loader === 'Vanilla');
@@ -563,15 +847,26 @@ const [mc, sc, pc, ps] = await Promise.all([
          ? await invoke('launch_instance', { id:instanceId, server:server||null, username:S.ms ? null : S.nick })
          : await invoke('launch_version', { version:loaderId, username:S.nick, ram:p.ram+'G', javaPath:p.java||null, server:server||null, fullscreen:!!p.fullscreen, instance:instanceId });
       S.pg = 100; S.launchMsg = msg; render();
-      const unlistenClosed = await listen('minecraft-closed', (ev) => { const payload = ev.payload || {}; if (payload.instance && payload.instance !== instanceId) return; S.pg = null; S.launchMsg = ''; render(); if (unlistenClosed) unlistenClosed(); });
     } catch(e){
       S.pg = null; S.launchErr = String(e); render();
+      if (unClosed) { try { unClosed(); } catch(_){} unClosed = null; }
     } finally { if (un) un(); }
   }
 
   // ───────────── Persistencia ─────────────
   async function persistSettings(){
     try { await invoke('save_settings', { settings:{ ram:S.defRam+'G', java_path:null, light_mode:S.t.lite, console:false, username:S.nick } }); } catch(e){ console.error(e); }
+  }
+  function saveSkins() {
+    try {
+      localStorage.setItem('obsidia.skins', JSON.stringify(S.skins));
+      localStorage.setItem('obsidia.sk', String(S.sk));
+      localStorage.setItem('obsidia.skmodel', S.skmodel);
+      return true;
+    } catch(e){
+      toast('No se pudieron guardar las skins: almacenamiento lleno.', true);
+      return false;
+    }
   }
   async function loadProfiles(select){
     // Si profiles.json está dañado se avisa (con la ruta del respaldo) en vez de mostrar una lista vacía sin explicación.
@@ -583,13 +878,7 @@ const [mc, sc, pc, ps] = await Promise.all([
     let i = P.findIndex(x => x.n === select);
     if (i < 0) { try { i = P.findIndex(x => x.n === localStorage.getItem('obsidia.sel')); } catch(e){ i = -1; } }
     S.p = i >= 0 ? i : 0;
-    S.ptextures = {};
-    await Promise.all(P.map(async (p, idx) => {
-      if (p.block) {
-        try { S.ptextures[idx] = await invoke('get_block_texture', { block:p.block, version:p.version }); }
-        catch(e) { S.ptextures[idx] = null; }
-      }
-    }));
+    render();
   }
   function selectProfile(i){
     S.p = i;
@@ -601,60 +890,68 @@ const [mc, sc, pc, ps] = await Promise.all([
   }
   function openEdit(i){
     const p = P[i]; if (!p) return;
+    // Un perfil legacy no tiene id: editarlo crearía otra instancia y dejaría un duplicado.
+    if (!p.id){ toast('Este perfil es legacy. Usá «Migrar» para convertirlo en una instancia editable.', true); return; }
     S.np = true; S.npEdit = i; S.npName = p.n; S.npVersion = p.version; S.npLoader = p.loader || 'Vanilla';
     S.npLoaderVersion = p.loaderVersion || '';
     S.npRam = p.ram; S.npJava = p.java || ''; S.npErr = ''; S.npBusy = false; S.npFullscreen = !!p.fullscreen; S.npBlock = p.block || ''; render();
   }
   async function saveProfileFromModal(){
-    const val = id => { const e = Q(id); return e ? e.value : ''; };
-    const name = val('#np-name').trim() || ('Instancia '+(P.length+1));
-    S.npName = name; S.npVersion = val('#np-version'); S.npLoader = val('#np-loader') || 'Vanilla';
-    S.npRam = +val('#np-ram') || 4; S.npJava = val('#np-java'); S.npFullscreen = !!(Q('#np-fullscreen') && Q('#np-fullscreen').checked); S.npBlock = val('#np-block');
-    // Resolver la versión del loader antes de guardar: única fuente de verdad.
-    let loaderVersion = S.npLoaderVersion || '';
-    if (S.npLoader && S.npLoader !== 'Vanilla'){
-      try { loaderVersion = await invoke('resolve_loader_version_cmd', { loader:S.npLoader, mc_version:S.npVersion }) || ''; }
-      catch(e){ S.npErr = `No se pudo resolver la versión del loader ${S.npLoader}: ${e}`; render(); S.npBusy = false; return; }
-      if (!loaderVersion){ S.npErr = `El loader ${S.npLoader} no tiene versión para ${S.npVersion}`; render(); S.npBusy = false; return; }
-    }
-    const old = S.npEdit >= 0 ? P[S.npEdit] : null;
-    if (P.some((x,i) => x.n === name && i !== S.npEdit)){ S.npErr = 'Ya existe una instancia con ese nombre.'; render(); return; }
+    // Doble clic: la segunda llamada no debe crear otra instancia.
+    if (S.npBusy) return;
     S.npBusy = true;
+    render();
     try {
+      const val = id => { const e = Q(id); return e ? e.value : ''; };
+      const name = val('#np-name').trim() || ('Instancia '+(P.length+1));
+      S.npName = name; S.npVersion = val('#np-version') || S.npVersion || (VERSIONS && VERSIONS[0]) || '1.21.4'; S.npLoader = val('#np-loader') || 'Vanilla';
+      S.npRam = +val('#np-ram') || 4; S.npJava = val('#np-java'); S.npFullscreen = !!(Q('#np-fullscreen') && Q('#np-fullscreen').checked); S.npBlock = val('#np-block');
+      // Resolver la versión del loader antes de guardar: única fuente de verdad.
+      let loaderVersion = S.npLoaderVersion || '';
+      if (S.npLoader && S.npLoader !== 'Vanilla'){
+        try { loaderVersion = await invoke('resolve_loader_version_cmd', { loader:S.npLoader, mcVersion: (S.npVersion || '') }) || ''; }
+        catch(e){ S.npErr = `No se pudo resolver la versión del loader ${S.npLoader}: ${e}`; return; }
+        if (!loaderVersion){ S.npErr = `El loader ${S.npLoader} no tiene versión para ${S.npVersion}`; return; }
+      }
+      const old = S.npEdit >= 0 ? P[S.npEdit] : null;
+      // Defensa extra: un perfil legacy nunca debe pasar por create_instance.
+      if (old && !old.id){ S.npErr = 'Este perfil es legacy. Usá «Migrar» antes de editarlo.'; return; }
+      if (P.some((x,i) => x.n === name && i !== S.npEdit)){ S.npErr = 'Ya existe una instancia con ese nombre.'; return; }
       if (old && old.id) {
         await invoke('update_instance', { id: old.id, profile:{ name, version:S.npVersion, username:S.nick, ram:S.npRam+'G', java_path:S.npJava||null, loader:S.npLoader, loader_version: loaderVersion || null, fullscreen:S.npFullscreen, block:S.npBlock||null, id: old.id } });
       } else {
-        await invoke('create_instance', { profile:{ name, version:S.npVersion, username:S.nick, ram:S.npRam+'G', java_path:S.npJava||null, loader:S.npLoader, loader_version: loaderVersion || null, fullscreen:S.npFullscreen, block:S.npBlock||null, id: (old ? old.id : newId()) || null } });
+        await invoke('create_instance', { profile:{ name, version:S.npVersion, username:S.nick, ram:S.npRam+'G', java_path:S.npJava||null, loader:S.npLoader, loader_version: loaderVersion || null, fullscreen:S.npFullscreen, block:S.npBlock||null, id: newId() } });
       }
       await loadProfiles(name);
       selectProfile(S.p);
       S.np = false; S.npEdit = -1; S.npErr = '';
     } catch(e){ S.npErr = String(e); }
-    S.npBusy = false; render();
+    finally { S.npBusy = false; render(); }
   }
 
   // ───────────── Eventos ─────────────
   // Cerrar el modal de Microsoft también cancela la espera en Rust: así no queda una sesión
   // guardada en segundo plano mientras la interfaz dice "offline".
-  function closeMs(){ invoke('ms_cancel').catch(()=>{}); S.msc = null; render(); }
+  let msCancelled = false;
+  function closeMs(){ msCancelled = true; invoke('ms_cancel').catch(()=>{}); S.msc = null; render(); }
   async function onClick(e){
     const b = e.target.closest('[data-act]');
     if (!b) return;
     const a = b.dataset.act, d = b.dataset;
-    if (a=='go'){ S.tab = d.t; render(); if (d.t==='servers') pingAll(); if (d.t==='mods'){ refreshFiles().then(()=>{ if (S.tab==='mods') doSearch(); }); } }
-    else if (a=='sel'){ selectProfile(+d.i); render(); refreshFiles().then(()=>{ if (S.tab==='home'||S.tab==='profiles') render(); }); }
+    if (a=='go'){ S.tab = d.t; render(); if (d.t==='servers') pingAll(); if (d.t==='mods'){ if (S.content.mods && S.content.mods.length) doSearch(); else syncInventory(inst()).then(()=>{ if (S.tab==='mods') doSearch(); }); } }
+    else if (a=='sel'){ selectProfile(+d.i); render(); syncInventory(inst()).then(()=>{ if (S.tab==='home'||S.tab==='profiles') render(); }).catch(()=>{}); }
     else if (a=='play'){ play(); }
     else if (a=='new'){ openNew(); }
     else if (a=='ped'){ openEdit(+d.i); }
     else if (a=='migrate'){
         const p = P[+d.i];
         if (!p || p.id){ toast('Este perfil ya es una instancia propia.', true); return; }
-        const confirmMsg = `¿Migrar el perfil '${esc(p.n)}' a una instancia independiente?\n\nSe copiarán mods, shaders, resource packs, configuraciones y options.txt desde .minecraft.\n\nLa instalación original de .minecraft no se moverá ni se borrará.\nLos mundos compartidos se conservan para todas las instancias.\n\nEsta acción es por este perfil solamente; no se migra nada automáticamente.`;
+        const confirmMsg = `¿Migrar el perfil '${p.n}' a una instancia independiente?\n\nSe copiarán mods, shaders, resource packs, configuraciones y options.txt desde .minecraft.\n\nLa instalación original de .minecraft no se moverá ni se borrará.\nLos mundos compartidos se conservan para todas las instancias.\n\nEsta acción es por este perfil solamente; no se migra nada automáticamente.`;
         if (!confirm(confirmMsg)) return;
         S.migratingProfile = p.n;
         render();
         try {
-            await invoke('migrate_legacy_profile', { profile_name: p.n });
+            await invoke('migrate_legacy_profile', { profileName: p.n });
             await loadProfiles(p.n);
             selectProfile(S.p);
             toast('Perfil migrado a instancia independiente.');
@@ -669,16 +966,20 @@ const [mc, sc, pc, ps] = await Promise.all([
     else if (a=='npcreate'){ saveProfileFromModal(); }
     else if (a=='npdel'){
       const p = P[S.npEdit];
+      if (!p) return;
+      if (!confirm(`¿Eliminar la instancia '${p.n || p.name}'?\n\nSe borrarán sus mods, configuraciones y archivos de esa instancia. Esta acción no se puede deshacer.`)) return;
       S.npErr = '';
+      S.npBusy = true; render();
       try {
-        if (p && p.id) await invoke('delete_instance', { id:p.id });
-        else if (p) await invoke('delete_profile', { name:p.name || p.n });
+        if (p.id) await invoke('delete_instance', { id:p.id });
+        else await invoke('delete_profile', { name:p.name || p.n });
         await loadProfiles(); S.p = 0; S.np = false; S.npEdit = -1;
       }
       catch(err){ S.npErr = String(err); }
-      render();
+      finally { S.npBusy = false; render(); }
     }
     else if (a=='f'){ S.f = d.c; render(); doSearch(); }
+    else if (a=='retrysearch'){ doSearch(); }
     else if (a=='tg'){ S.t[d.k] = !S.t[d.k]; persistSettings(); render(); }
     else if (a=='seg'){ S.sec = d.s; S.q = ''; render(); doSearch(); }
     else if (a=='ptg'){ const x = S.pstate[+d.i]; if (x){ x.enabled = !x.enabled; S.pstate = [...S.pstate.filter(p=>p.enabled), ...S.pstate.filter(p=>!p.enabled)]; savePacks(); render(); } }
@@ -686,13 +987,13 @@ const [mc, sc, pc, ps] = await Promise.all([
     else if (a=='pdown'){ const i = +d.i; if (i<S.pstate.length-1 && S.pstate[i].enabled && S.pstate[i+1].enabled){ [S.pstate[i+1], S.pstate[i]] = [S.pstate[i], S.pstate[i+1]]; savePacks(); render(); } }
     else if (a=='pauto'){ S.pstate = [...S.pstate].sort((x,y) => (Number(y.enabled)-Number(x.enabled)) || x.name.localeCompare(y.name)); savePacks(); render(); }
     else if (a=='inst'){ doInstall(d.kind, d.slug); }
-    else if (a=='plancancel'){ if (e.target !== b) return; S.plan = null; S.planSlug=''; S.planKind=''; render(); }
+    else if (a=='plancancel'){ if (e.target !== b) return; S.plan = null; S.planSlug=''; S.planKind=''; S.planId=null; S.planInstance=''; render(); }
     else if (a=='planinstall'){ doInstallConfirmed(); }
     else if (a=='fdel'){
       const folder = { mods:'mods', shaders:'shaderpacks', packs:'resourcepacks' }[d.kind];
       try { await invoke('delete_file_in', { folder, name:d.file, instance:inst() }); forgetFile(d.kind, d.file); toast('Eliminado.'); }
       catch(err){ toast('No se pudo eliminar: '+err, true); }
-      await refreshFiles(); loadFileMap(); refreshGrid(); render();
+      await refreshKind(d.kind);
     }
     else if (a=='openmod'){
       const type = { mods:'mod', shaders:'shader', packs:'resourcepack' }[d.kind];
@@ -706,13 +1007,24 @@ const [mc, sc, pc, ps] = await Promise.all([
       const nm = ((Q('#sn')||{}).value || S.ns || '').trim();
       const ad = ((Q('#sa')||{}).value || S.na || '').trim();
       if (!nm || !ad){ toast('Completá el nombre y la dirección.', true); return; }
+      if (/\s/.test(ad)){ toast('La dirección no puede tener espacios.', true); return; }
+      // Guardar primero el nuevo: si falla, el servidor anterior sigue intacto.
       try {
-        if (S.es && S.es !== ad) await invoke('delete_server', { address:S.es });
         await invoke('save_server', { name:nm, address:ad, version:(P[S.p] && P[S.p].version) || null });
-        await loadServers(); S.af = false; S.es = null; S.ns = ''; S.na = ''; render(); pingAll();
-      } catch(err){ toast('No se pudo guardar: '+err, true); }
+      } catch(err){ toast('No se pudo guardar: '+err, true); return; }
+      if (S.es && S.es !== ad){
+        // El nuevo ya está guardado; si falla el borrado, se avisa y quedan ambos.
+        try { await invoke('delete_server', { address:S.es }); }
+        catch(err){ toast('Se guardó el servidor nuevo, pero no se pudo borrar el anterior: '+err, true); }
+      }
+      await loadServers(); S.af = false; S.es = null; S.ns = ''; S.na = ''; render(); pingAll();
     }
-    else if (a=='sdel'){ const s = S.sv[+d.i]; if (s){ await invoke('delete_server', { address:s.a }).catch(()=>{}); S.sv.splice(+d.i,1); render(); } }
+    else if (a=='sdel'){
+      const s = S.sv[+d.i];
+      if (!s) return;
+      try { await invoke('delete_server', { address:s.a }); await loadServers(); render(); }
+      catch(err){ toast('No se pudo eliminar: '+err, true); }
+    }
     else if (a=='sref'){ pingAll(); }
     else if (a=='join'){
       const s = S.sv[+d.i];
@@ -724,23 +1036,31 @@ const [mc, sc, pc, ps] = await Promise.all([
       try {
         await invoke('remove_offline_skin', { instance:inst() });
         if (S.sk >= 0 && S.sk < S.skins.length){ S.skins.splice(S.sk,1); S.sk = S.skins.length ? 0 : -1; saveSkins(); render(); }
-        toast('Skin quitada del juego.');
+        if (S.sk >= 0) await applySkinToGame();
+        else toast('Skin quitada del juego.');
       }
       catch(err){ toast('No se pudo quitar la skin: '+err, true); }
     }
-    else if (a=='skinup'){ const fi = Q('#skinfile'); if (fi) fi.click(); }
+    else if (a=='skinup'){
+      if (S.skins.length >= 4){ toast('Máximo 4 skins', true); return; }
+      const fi = Q('#skinfile'); if (fi) fi.click();
+    }
+    else if (a=='nickfocus'){ const n = Q('#nick'); if (n){ n.focus(); n.select(); } }
     else if (a=='ms'){
-      S.ml = true; render();
+      S.ml = true; msCancelled = false; render();
       try {
         const dc = await invoke('ms_device_code');
         S.msc = dc; render();
         const profile = await invoke('ms_login', { deviceCode:dc.device_code });
-        if (S.msc){ S.ms = true; S.nick = (profile && profile.name) ? profile.name : S.nick; persistSettings(); toast('Sesión de Microsoft iniciada.'); }
-      } catch(err){ if (S.msc) toast('No se pudo iniciar sesión: '+err, true); }
-      S.ml = false; S.msc = null; render();
+        if (!msCancelled && S.msc){ S.ms = true; S.nick = (profile && profile.name) ? profile.name : S.nick; persistSettings(); toast('Sesión de Microsoft iniciada.'); }
+      } catch(err){ if (!msCancelled) toast('No se pudo iniciar sesión: '+err, true); }
+      S.ml = false; S.msc = null; msCancelled = false; render();
     }
     else if (a=='msclose'){ if (e.target !== b) return; closeMs(); }
-    else if (a=='msopen'){ invoke('plugin:opener|open_url', { url:d.url }).catch(() => window.open(d.url, '_blank')); }
+    else if (a=='msopen'){
+      if (!isMicrosoftUrl(d.url)){ toast('Enlace de inicio de sesión no válido.', true); return; }
+      invoke('plugin:opener|open_url', { url:d.url }).catch(() => window.open(d.url, '_blank'));
+    }
     else if (a=='mscopy'){ try { await navigator.clipboard.writeText(d.code); toast('Código copiado.'); } catch(err){} }
     else if (a=='mso'){ invoke('ms_logout').catch(()=>{}); S.ms = false; render(); }
   }
@@ -748,13 +1068,38 @@ const [mc, sc, pc, ps] = await Promise.all([
   function onChange(e){
     if (e.target && e.target.id=='skinfile'){
       const f = e.target.files && e.target.files[0];
-      if (f && S.skins.length < 4){
-        const rd = new FileReader();
-        rd.onload = () => { S.skins.push(String(rd.result)); S.sk = S.skins.length - 1; saveSkins(); render(); applySkinToGame(); };
-        rd.readAsDataURL(f);
-      }
       e.target.value = '';
+      if (!f) return;
+      if (S.skins.length >= 4){ toast('Máximo 4 skins', true); return; }
+      if (f.size > 200 * 1024){ toast('La skin no puede superar los 200 KB.', true); return; }
+      if (f.type && f.type !== 'image/png'){ toast('El archivo debe ser un PNG.', true); return; }
+      const rd = new FileReader();
+      rd.onload = () => {
+        const url = String(rd.result || '');
+        let sig = '';
+        try { sig = atob((url.split(',')[1] || '').slice(0, 12)); } catch(err){}
+        if (sig.slice(0, 8) !== '\x89PNG\r\n\x1a\n'){ toast('El archivo no es un PNG válido.', true); return; }
+        const img = new Image();
+        img.onload = () => {
+          const w = img.naturalWidth, h = img.naturalHeight;
+          if (!((w === 64 && h === 64) || (w === 64 && h === 32))){ toast('La skin debe medir 64×64 o 64×32 píxeles.', true); return; }
+          const prev = S.sk;
+          S.skins.push(url); S.sk = S.skins.length - 1;
+          if (!saveSkins()){ S.skins.pop(); S.sk = prev; render(); return; }
+          render(); applySkinToGame();
+        };
+        img.onerror = () => toast('No se pudo leer la imagen.', true);
+        img.src = url;
+      };
+      rd.onerror = () => toast('No se pudo leer el archivo.', true);
+      rd.readAsDataURL(f);
     }
+    else if (e.target && e.target.id=='np-version') S.npVersion = e.target.value;
+    else if (e.target && e.target.id=='np-loader') S.npLoader = e.target.value;
+    else if (e.target && e.target.id=='np-ram') S.npRam = +e.target.value || 4;
+    else if (e.target && e.target.id=='np-java') S.npJava = e.target.value;
+    else if (e.target && e.target.id=='np-block') S.npBlock = e.target.value;
+    else if (e.target && e.target.id=='np-fullscreen') S.npFullscreen = !!e.target.checked;
   }
   function onInput(e){
     const id = e.target.id;
@@ -762,22 +1107,55 @@ const [mc, sc, pc, ps] = await Promise.all([
     else if (id=='ram'){ S.defRam = +e.target.value; const rv = Q('#ramv'); if (rv) rv.textContent = S.defRam+' GB'; clearTimeout(S.pt); S.pt = setTimeout(persistSettings, 400); }
     else if (id=='nick'){
       S.nick = e.target.value; const acc = Q('#acc'); if (acc) acc.innerHTML = accCard(S.sk, S.nick, S.ms, S.skins);
-      const ok = validName(S.nick); const nm = Q('#nm');
-      if (nm){ nm.textContent = ok ? 'Nombre válido ✓' : 'Usá de 3 a 16 letras, números o guion bajo.'; nm.style.color = ok ? '#6EE7B7' : '#FCD34D'; }
+      const ok = validName(S.nick);
+      document.querySelectorAll('.js-name').forEach(n => { n.textContent = S.nick || 'Jugador'; });
+      document.querySelectorAll('.js-valid').forEach(n => { n.textContent = ok ? 'Nombre válido' : 'Usá de 3 a 16 letras, números o guion bajo.'; n.style.color = ok ? '#6EE7B7' : '#FCD34D'; });
       if (ok){ clearTimeout(S.pt); S.pt = setTimeout(persistSettings, 400); }
     }
+    else if (id=='np-name'){ S.npName = e.target.value; }
     else if (id=='sn'){ S.ns = e.target.value; }
     else if (id=='sa'){ S.na = e.target.value; }
   }
   function onKey(e){
     if ((e.key==='Enter' || e.key===' ') && e.target.matches && e.target.matches('[role=button][data-act]')){ e.preventDefault(); e.target.click(); }
-    if (e.key==='Escape' && S.plan){ S.plan = null; S.planSlug=''; S.planKind=''; render(); }
-    if (e.key==='Escape' && (S.np || S.msc)){ if (S.msc) invoke('ms_cancel').catch(()=>{}); S.np = false; S.msc = null; S.npEdit = -1; render(); }
+    if (e.key==='Escape' && S.plan){ S.plan = null; S.planSlug=''; S.planKind=''; S.planId=null; S.planInstance=''; render(); }
+    if (e.key==='Escape' && (S.np || S.msc)){ if (S.msc){ msCancelled = true; invoke('ms_cancel').catch(()=>{}); } S.np = false; S.msc = null; S.npEdit = -1; render(); }
+  }
+
+  // ───────────── Render ─────────────
+  function render(){
+    const view = Q('#view');
+    if (!view) return;
+    const ae = document.activeElement;
+    const focusId = ae && ae.id ? ae.id : '';
+    const selStart = ae && typeof ae.selectionStart === 'number' ? ae.selectionStart : null;
+    const selEnd = ae && typeof ae.selectionEnd === 'number' ? ae.selectionEnd : null;
+    let html = { home, profiles, mods, servers, settings, account }[S.tab]();
+    if (S.np) html += npModal();
+    if (S.msc) html += msModal();
+    if (S.plan) html += planModal();
+    view.innerHTML = html;
+    paintSkinCanvases(view);
+    S.pendingRender = false;
+    if (focusId){
+      const el = Q('#' + focusId);
+      if (el && typeof el.focus === 'function'){
+        el.focus();
+        if (selStart !== null && typeof el.setSelectionRange === 'function'){
+          try { el.setSelectionRange(selStart, selEnd); } catch(e){}
+        }
+      }
+    }
   }
 
   // ───────────── Arranque ─────────────
   async function init(){
+    render();
     try {
+      let select = null;
+      try { select = localStorage.getItem('obsidia.sel') || null; } catch(e){}
+      await loadProfiles(select);
+      render();
       const [remote, settings, msProfile, totalRam, javas] = await Promise.all([
         invoke('list_versions').catch(()=>[]),
         invoke('get_settings').catch(()=>null),
@@ -795,31 +1173,46 @@ const [mc, sc, pc, ps] = await Promise.all([
       }
       if (msProfile){ S.ms = true; S.nick = msProfile.name || S.nick; }
       try { S.skins = JSON.parse(localStorage.getItem('obsidia.skins') || '[]').slice(0,4); S.sk = Math.min(+localStorage.getItem('obsidia.sk') || (S.skins.length?0:-1), S.skins.length-1); S.skmodel = localStorage.getItem('obsidia.skmodel')==='slim'?'slim':'classic'; } catch(e){}
-      await loadProfiles();
-      try {
-        const preserved = await invoke('get_migration_preserved_saves').catch(()=>[]);
-        if (preserved && preserved.length) toast('Se encontraron mundos antiguos conservados en su ubicacion original.');
-      } catch(e){}
-      await loadServers();
-      loadFileMap();
-      await refreshFiles();
+      render();
+      // Tareas secundarias no bloqueantes.
+      setTimeout(async () => {
+        try {
+          const preserved = await invoke('get_migration_preserved_saves').catch(()=>[]);
+          if (preserved && preserved.length) toast('Se encontraron mundos antiguos conservados en su ubicacion original.');
+        } catch(e){}
+        try { await loadServers(); } catch(e){}
+        try { await syncInventory(inst()); } catch(e){}
+        render();
+      }, 0);
     } catch(e){ console.error(e); }
     render();
   }
 
   onMount(() => {
-    const blockCtx = e => e.preventDefault();
+    // En producción se bloquean menú contextual y recarga; en dev quedan disponibles
+    // para depurar. El menú sí se permite dentro de campos editables.
+    const prod = import.meta.env.PROD;
+    const blockCtx = e => {
+      const t = e.target;
+      const editable = t && t.closest && t.closest('input,textarea,select,[contenteditable=""],[contenteditable="true"]');
+      if (editable) return;
+      e.preventDefault();
+    };
     const blockReload = e => { if (e.key === 'F5' || ((e.ctrlKey || e.metaKey) && (e.key === 'r' || e.key === 'R' || e.key === 'f' || e.key === 'F'))) e.preventDefault(); };
-    document.addEventListener('contextmenu', blockCtx);
-    document.addEventListener('keydown', blockReload, true);
+    if (prod) {
+      document.addEventListener('contextmenu', blockCtx);
+      document.addEventListener('keydown', blockReload, true);
+    }
     document.addEventListener('click', onClick);
     document.addEventListener('change', onChange);
     document.addEventListener('input', onInput);
     document.addEventListener('keydown', onKey);
     init();
     return () => {
-      document.removeEventListener('contextmenu', blockCtx);
-      document.removeEventListener('keydown', blockReload, true);
+      if (prod) {
+        document.removeEventListener('contextmenu', blockCtx);
+        document.removeEventListener('keydown', blockReload, true);
+      }
       document.removeEventListener('click', onClick);
       document.removeEventListener('change', onChange);
       document.removeEventListener('input', onInput);
@@ -830,14 +1223,14 @@ const [mc, sc, pc, ps] = await Promise.all([
 
 <svelte:head>
   <style>
-    :root{--bg:#0B0A10;--tx:#F2F0F7;--mu:#A09CB2;--gl:rgba(255,255,255,.05);--bd:rgba(255,255,255,.09);--v:#8B5CF6;--c:#7DD3FC;color-scheme:dark;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+    :root{--bg:#0B0A10;--tx:#F2F0F7;--mu:#A09CB2;--mut:#A09CB2;--ink:#F2F0F7;--line:rgba(255,255,255,.075);--line-soft:rgba(255,255,255,.045);--panel:#121019;--panel-2:#16131F;--gl:rgba(255,255,255,.05);--bd:rgba(255,255,255,.09);--v:#8B5CF6;--c:#7DD3FC;color-scheme:dark;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
     html{height:100%;scroll-padding-top:env(safe-area-inset-top,0px)}
     *{box-sizing:border-box}
     body{margin:0;height:100%;color:var(--tx);font:14.5px/1.6 Inter,"Segoe UI",system-ui,sans-serif;background:radial-gradient(900px 620px at 8% -10%,rgba(139,92,246,.10),transparent 60%),radial-gradient(820px 560px at 100% 0%,rgba(125,211,252,.07),transparent 60%),var(--bg)}
     button,input,select{font:inherit;color:inherit}button{cursor:pointer}
     #wrap{height:100%;overflow-y:auto;overflow-x:hidden}
     #app{display:flex;min-width:0;width:100%;min-height:100%}
-    aside{width:236px;flex:none;padding:28px 18px 22px;display:flex;flex-direction:column;gap:28px;border-right:1px solid rgba(255,255,255,.045);background:transparent}
+    #app > aside{width:236px;flex:none;padding:28px 18px 22px;display:flex;flex-direction:column;gap:28px;border-right:1px solid rgba(255,255,255,.045);background:transparent;position:sticky;top:0;height:100vh;align-self:flex-start}
     .logo{display:flex;align-items:center;gap:11px;padding:0 10px;font:600 19px/1 Sora,Inter,system-ui,sans-serif;letter-spacing:.2px}
     nav{display:flex;flex-direction:column;gap:2px}
     nav button{display:flex;align-items:center;gap:12px;height:42px;padding:0 12px;border:0;border-radius:11px;background:transparent;color:#A9A5B8;font-size:13.5px;transition:background .15s,color .15s;text-align:left}
@@ -903,7 +1296,7 @@ const [mc, sc, pc, ps] = await Promise.all([
     .edit:hover{background:rgba(255,255,255,.09);border-color:rgba(255,255,255,.18)}
     .newcard{display:flex;align-items:center;justify-content:center;gap:8px;min-height:92px;border-radius:16px;border:1px dashed rgba(255,255,255,.13);background:rgba(255,255,255,.012);color:#9C97AC;font:500 12.5px Inter,system-ui,sans-serif;cursor:pointer;transition:.16s}
     .newcard:hover{color:#D5D0E3;border-color:rgba(167,139,250,.4);background:rgba(167,139,250,.05)}
-    .panel{border:1px solid rgba(255,255,255,.07);border-radius:16px;background:linear-gradient(180deg,rgba(255,255,255,.03),rgba(255,255,255,.01));padding:14px;height:100%;width:600px;justify-self:end}
+    .home .grid > .panel{border:1px solid rgba(255,255,255,.07);border-radius:16px;background:linear-gradient(180deg,rgba(255,255,255,.03),rgba(255,255,255,.01));padding:14px;height:100%;width:600px;justify-self:end}
     .panel .head{margin:0 2px 6px}
     .rows{list-style:none;margin:0;padding:0}
     .rows li{display:flex;align-items:flex-start;gap:11px;padding:11px 2px;border-top:1px solid rgba(255,255,255,.05)}
@@ -1003,6 +1396,185 @@ const [mc, sc, pc, ps] = await Promise.all([
     .np-foot .sec{height:42px;border-radius:12px}
     .np-foot .ib{height:42px;margin:0;padding:0 24px;border-radius:12px}
     @media (max-width:560px){.np-grid2{grid-template-columns:1fr}.np-head{padding:22px 22px 0}.np-body{padding:20px 22px 6px}.np-foot{padding:16px 22px}}
+
+    /* ── Mi cuenta (scoped) ── */
+    .account-page {
+      width: 100%;
+      max-width: 1300px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .account-page > *{flex-shrink:0}
+    .account-page .top {
+      display: grid !important;
+      grid-template-columns: minmax(0, 1.62fr) minmax(340px, .92fr) !important;
+      gap: 16px;
+      width: 100%;
+      align-items: stretch;
+    }
+    @media (max-width: 1280px) {
+      .account-page .top {
+        grid-template-columns: 1fr !important;
+      }
+    }
+    .account-page .page-head{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;margin-bottom:20px;flex-wrap:wrap}
+    .account-page .page-sub{margin-top:5px;font-size:13px;color:var(--mut)}
+    .account-page .save-state{display:inline-flex;align-items:center;gap:7px;font-size:12px;color:#8E899F}
+    .account-page .save-state svg{width:14px;height:14px;stroke:#6EE7B7;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+
+    .account-page .panel{background:var(--panel,#121019);border:1px solid var(--line,rgba(255,255,255,.075));border-radius:18px;width:auto;height:auto;justify-self:stretch}
+
+    /* ── Player card ── */
+    .account-page .profile{position:relative;overflow:hidden;padding:26px 30px;display:flex;gap:30px;align-items:center}
+    .account-page .profile::before{
+      content:"";position:absolute;inset:-40% 35% 10% -25%;pointer-events:none;
+      background:radial-gradient(closest-side,rgba(139,92,246,.16),transparent 72%);
+    }
+    .account-page .figure-wrap{position:relative;width:142px;height:284px;flex:none;display:flex;align-items:flex-end;justify-content:center;z-index:1}
+    .account-page .figure{width:132px;height:264px;filter:drop-shadow(0 22px 24px rgba(0,0,0,.55))}
+    .account-page .figure-shadow{
+      position:absolute;left:50%;bottom:-6px;width:112px;height:18px;transform:translateX(-50%);
+      border-radius:50%;background:radial-gradient(ellipse,rgba(0,0,0,.75),transparent 70%);
+    }
+    .account-page .identity{position:relative;z-index:1;flex:1;min-width:0;display:flex;flex-direction:column;gap:4px}
+    .account-page .field-label{font-size:12px;color:var(--mut);margin-bottom:2px}
+    .account-page .name-row{display:flex;align-items:center;gap:10px;border-bottom:1px solid rgba(255,255,255,.12);padding-bottom:5px;transition:border-color .15s}
+    .account-page .name-row:focus-within{border-color:rgba(167,139,250,.75)}
+    .account-page .name-row input{
+      flex:1;min-width:0;background:none;border:0;outline:none;padding:0;
+      font:600 33px/1.15 Sora,Inter,system-ui,sans-serif;letter-spacing:-.6px;color:var(--ink);
+    }
+    .account-page .pencil{
+      width:32px;height:32px;flex:none;display:grid;place-items:center;border-radius:9px;
+      border:1px solid rgba(255,255,255,.09);background:rgba(255,255,255,.035);color:#B9B4C8;
+      transition:.15s;
+    }
+    .account-page .pencil:hover{color:#fff;background:rgba(255,255,255,.08);border-color:rgba(255,255,255,.18)}
+    .account-page .pencil svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+    .account-page .valid{display:flex;align-items:center;gap:6px;margin-top:7px;font-size:12.5px;color:var(--mint,#6EE7B7);min-height:18px}
+    .account-page .valid svg{width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
+    .account-page .badges{display:flex;flex-wrap:wrap;gap:8px;margin-top:13px}
+    .account-page .badge{display:inline-flex;align-items:center;gap:7px;height:27px;padding:0 11px;border-radius:999px;font-size:11.5px;border:1px solid var(--line,rgba(255,255,255,.075));background:rgba(255,255,255,.04);color:#C9C7DD}
+    .account-page .badge i{width:6px;height:6px;border-radius:50%;background:#86EFAC;flex:none}
+    .account-page .badge.offline{border-color:rgba(252,211,77,.24);background:rgba(252,211,77,.07);color:#FDE68A}
+    .account-page .badge.offline i{background:#FCD34D}
+    .account-page .fine{margin-top:13px;font-size:12px;line-height:1.5;color:#827D93;max-width:44ch}
+    .account-page .profile-stats{display:flex;gap:30px;margin-top:18px;padding-top:15px;border-top:1px solid var(--line-soft,rgba(255,255,255,.045));position:relative;z-index:1}
+    .account-page .profile-stats b{display:block;font-size:13px;font-weight:600;line-height:1.3}
+    .account-page .profile-stats span{display:block;margin-top:2px;font-size:11px;color:var(--dim,#7E798E)}
+
+    /* ── Account card ── */
+    .account-page .account{padding:24px 24px 22px;display:flex;flex-direction:column;gap:12px}
+    .account-page .panel-head{display:flex;align-items:center;justify-content:space-between;gap:14px}
+    .account-page .panel-head h2{font:600 16px/1.25 Sora,Inter,system-ui,sans-serif;letter-spacing:-.1px}
+    .account-page .account h3{font:600 19px/1.3 Sora,Inter,system-ui,sans-serif;letter-spacing:-.25px;margin-top:2px}
+    .account-page .account p{font-size:12.5px;line-height:1.6;color:var(--mut)}
+    .account-page .facts{display:flex;flex-direction:column;gap:9px;margin:4px 0 2px}
+    .account-page .facts li{display:flex;align-items:center;gap:9px;font-size:12.5px;color:#C6C2D4}
+    .account-page .facts svg{width:16px;height:16px;flex:none;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+    .account-page .facts .yes svg{stroke:#6EE7B7}
+    .account-page .facts .no svg{stroke:#6E6980}
+    .account-page .facts .no{color:#8C879C}
+    .account-page .btn{margin-top:auto;display:inline-flex;align-items:center;justify-content:center;gap:9px;height:44px;padding:0 18px;border:0;border-radius:12px;font:600 13px/1 Inter,system-ui,sans-serif;transition:.15s}
+    .account-page .btn svg{width:16px;height:16px;fill:currentColor}
+    .account-page .btn-primary{background:var(--violet-strong,#7C3AED);color:#fff;box-shadow:none;transform:none;filter:none;transition:background .15s,color .15s}
+    .account-page .btn-primary:hover{background:var(--violet,#8B5CF6)}
+    .account-page .btn-sec{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.14);color:#fff}
+    .account-page .btn-sec:hover{background:rgba(255,255,255,.14)}
+    .account-page .micro{margin-top:2px;font-size:11px;color:#777286;text-align:center}
+
+    /* ── Skins ── */
+    .account-page .skins{margin-top:16px;padding:22px 24px 18px}
+    .account-page .skins .panel-head{align-items:flex-start}
+    .account-page .skins .panel-head p{margin-top:4px;font-size:12px;color:var(--mut)}
+    .account-page .seg{display:inline-flex;gap:3px;padding:3px;border-radius:12px;background:rgba(255,255,255,.045);border:1px solid var(--line);flex:none}
+    .account-page .seg button{height:30px;padding:0 15px;border:0;border-radius:9px;background:transparent;color:var(--mut);font-size:12px;font-weight:600;transition:.15s}
+    .account-page .seg button:hover{color:var(--ink)}
+    .account-page .seg button.on{background:#2A2440;color:#fff;box-shadow:inset 0 0 0 1px rgba(167,139,250,.25)}
+    .account-page .skin-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:16px}
+    .account-page .skin-tile{
+      position:relative;height:138px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:7px;
+      border:1px solid var(--line);border-radius:14px;background:var(--panel-2,#16131F);transition:.16s;
+    }
+    .account-page .skin-tile:hover{border-color:rgba(255,255,255,.17);background:#191622}
+    .account-page .skin-tile.selected{border-color:rgba(167,139,250,.65);background:linear-gradient(180deg,rgba(139,92,246,.13),rgba(139,92,246,.035))}
+    .account-page .skin-tile .face{display:block;width:68px;height:68px;overflow:hidden;border-radius:6px;background:#1a1a2e}
+    .account-page .skin-tile .face svg{width:100%;height:100%}
+    .account-page .skin-tile .label{font-size:12px;color:#C9C5D6}
+    .account-page .skin-del-bar{
+      width:36px;height:36px;border-radius:10px;border:1px solid var(--line);background:rgba(255,255,255,.06);color:#C9C7DD;cursor:pointer;transition:.15s;flex:none
+    }
+    .account-page .skin-del-bar:hover{background:#F87171;color:#fff;border-color:transparent}
+    .account-page .skin-del-bar svg{width:16px;height:16px;flex:none;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+    .account-page .in-use{
+      position:absolute;top:8px;right:8px;display:none;align-items:center;gap:4px;height:20px;padding:0 7px;
+      border-radius:999px;background:rgba(139,92,246,.24);border:1px solid rgba(167,139,250,.38);
+      font-size:9.5px;font-weight:600;color:#DDD6FE;letter-spacing:.02em;
+    }
+    .account-page .skin-tile.selected .in-use{display:inline-flex}
+    .account-page .upload{
+      border-style:dashed;border-color:rgba(255,255,255,.15);background:rgba(255,255,255,.014);color:#928DA2;gap:8px;
+    }
+    .account-page .upload:hover{border-color:rgba(167,139,250,.5);background:rgba(139,92,246,.05);color:#D5D0E3}
+    .account-page .upload svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round}
+    .account-page .upload b{font-size:12.5px;font-weight:500;color:#CFCBDA}
+    .account-page .upload span{font-size:10.5px;color:#7C778C}
+    .account-page .skin-foot{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;margin-top:14px;padding-top:14px;border-top:1px solid var(--line-soft)}
+    .account-page .skin-note{display:flex;gap:9px;max-width:74ch;font-size:11.5px;line-height:1.55;color:#858092}
+    .account-page .skin-note svg{width:15px;height:15px;flex:none;margin-top:1px;fill:none;stroke:#8B84A0;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+    .account-page .png-spec{flex:none;font-size:11px;color:#777286;padding-top:1px}
+
+    /* ── In-game preview ── */
+    .account-page .preview{position:relative;margin-top:16px;height:206px;border-radius:18px;overflow:hidden;border:1px solid rgba(255,255,255,.08);background:#0E0B14}
+    .account-page .preview>img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;object-position:center 58%}
+    .account-page .preview-bg{position:absolute;inset:0;background:url('/images/hero.png') center 58%/cover no-repeat}
+    .account-page .preview::after{
+      content:"";position:absolute;inset:0;
+      background:linear-gradient(90deg,rgba(9,8,13,.90) 0%,rgba(9,8,13,.70) 28%,rgba(9,8,13,.18) 58%,rgba(9,8,13,0) 100%),
+                 linear-gradient(0deg,rgba(9,8,13,.42),transparent 52%);
+    }
+    .account-page .preview-copy{position:absolute;z-index:2;left:30px;top:50%;transform:translateY(-50%);max-width:430px}
+    .account-page .preview-copy h2{font:600 20px/1.25 Sora,Inter,system-ui,sans-serif;letter-spacing:-.2px}
+    .account-page .preview-copy p{margin-top:7px;font-size:12.5px;line-height:1.55;color:#B9B4C7;max-width:40ch}
+    .account-page .preview-chips{display:flex;gap:7px;margin-top:13px;flex-wrap:wrap}
+    .account-page .preview-chips span{display:inline-flex;align-items:center;height:25px;padding:0 10px;border-radius:999px;border:1px solid rgba(255,255,255,.12);background:rgba(12,10,18,.42);font-size:11px;color:#D7D3E2;backdrop-filter:blur(6px)}
+    .account-page .preview-figure{position:absolute;z-index:2;right:12%;bottom:0;width:96px;height:192px;display:flex;flex-direction:column;align-items:center;justify-content:flex-end}
+    .account-page .nametag{
+      position:absolute;top:-4px;left:50%;transform:translateX(-50%);padding:2px 8px;border-radius:3px;
+      background:rgba(10,8,16,.55);font:600 12px/1.5 Inter,system-ui,sans-serif;color:#fff;white-space:nowrap;
+      text-shadow:0 1px 2px #000;box-shadow:0 1px 0 rgba(0,0,0,.35);
+    }
+    .account-page .preview-figure .pfigure{width:88px;height:176px;filter:drop-shadow(0 14px 18px rgba(0,0,0,.65))}
+    .account-page .preview-figure .figure-shadow{bottom:2px;width:78px;height:12px}
+
+    /* ── Responsive ── */
+    @media (max-width:1280px){
+      .account-page .account .btn{margin-top:10px}
+    }
+    @media (max-width:980px){
+      .account-page aside{width:76px;padding:24px 12px 18px;align-items:center}
+      .account-page .logo{justify-content:center;padding:0}
+      .account-page .logo span{display:none}
+      .account-page nav a{justify-content:center;width:46px;padding:0}
+      .account-page nav a span{display:none}
+      .account-page .sidebar-account{justify-content:center;padding:8px}
+      .account-page .sidebar-account .who,.account-page .sidebar-account .dot-status{display:none}
+      .account-page main{padding:26px 22px 30px}
+    }
+    @media (max-width:760px){
+      .account-page .profile{flex-direction:column;align-items:flex-start;padding:24px}
+      .account-page .figure-wrap{align-self:center}
+      .account-page .profile-stats{width:100%;gap:20px;flex-wrap:wrap}
+      .account-page .skin-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+      .account-page .skin-foot{flex-direction:column;gap:8px}
+      .account-page .preview{height:auto;min-height:230px}
+      .account-page .preview-copy{position:relative;left:auto;top:auto;transform:none;padding:22px}
+      .account-page .preview-figure{right:6%;height:160px;opacity:.55}
+      .account-page .png-spec{padding-top:0}
+    }
+    @media (prefers-reduced-motion:reduce){.account-page *{transition:none!important}}
+
 </style>
 </svelte:head>
 
@@ -1011,4 +1583,5 @@ const [mc, sc, pc, ps] = await Promise.all([
   <main id="view"></main>
 </div></div>
 <Toast />
+
 

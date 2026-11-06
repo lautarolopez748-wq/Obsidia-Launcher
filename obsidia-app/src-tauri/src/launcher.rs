@@ -146,7 +146,13 @@ struct Progress {
 }
 
 /// Evento `launch-progress` → { stage, done, total, instance }.
-fn progress(app: &AppHandle, stage: &'static str, done: usize, total: usize, instance: Option<&str>) {
+fn progress(
+    app: &AppHandle,
+    stage: &'static str,
+    done: usize,
+    total: usize,
+    instance: Option<&str>,
+) {
     let _ = app.emit(
         "launch-progress",
         Progress {
@@ -1047,7 +1053,9 @@ pub fn launch(
     }
     classpath.push(client_jar);
 
-    download_all(&c, jobs, |d, t| progress(app, "libraries", d, t, instance_id.as_deref()))?;
+    download_all(&c, jobs, |d, t| {
+        progress(app, "libraries", d, t, instance_id.as_deref())
+    })?;
 
     let missing: Vec<String> = classpath
         .iter()
@@ -1106,7 +1114,9 @@ pub fn launch(
             });
         }
     }
-    download_all(&c, asset_jobs, |d, t| progress(app, "assets", d, t, instance_id.as_deref()))?;
+    download_all(&c, asset_jobs, |d, t| {
+        progress(app, "assets", d, t, instance_id.as_deref())
+    })?;
 
     // 5) Natives
     for jar in &native_jars {
@@ -1185,7 +1195,11 @@ pub fn launch(
     // Pantalla completa por instancia: sincronizar options.txt.
     let options_path = game_dir.join("options.txt");
     let current = options::read_options(&options_path)?;
-    let next = options::set_entry(&current, "fullscreen:", if fullscreen { "true" } else { "false" });
+    let next = options::set_entry(
+        &current,
+        "fullscreen:",
+        if fullscreen { "true" } else { "false" },
+    );
     if next != current {
         options::write_options(&options_path, &next)?;
     }
@@ -1286,8 +1300,16 @@ mod tests {
         let c2 = build_command("java", vec!["--version".into()], &gd2);
         assert_eq!(c1.cwd, gd1);
         assert_eq!(c2.cwd, gd2);
-        assert!(c1.args.iter().any(|a| a.contains("--gameDir") && a.contains("inst/A")));
-        assert!(c2.args.iter().any(|a| a.contains("--gameDir") && a.contains("inst/B")));
+        assert!(
+            c1.args
+                .iter()
+                .any(|a| a.contains("--gameDir") && a.contains("inst/A"))
+        );
+        assert!(
+            c2.args
+                .iter()
+                .any(|a| a.contains("--gameDir") && a.contains("inst/B"))
+        );
         assert_ne!(c1, c2);
     }
 
