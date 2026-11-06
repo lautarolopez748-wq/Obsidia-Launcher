@@ -25,6 +25,7 @@
 //! estático por instancia. Instancias distintas usan lock distinto.
 
 use sha1::{Digest, Sha1};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -45,9 +46,12 @@ fn instance_lock(instance_dir: &Path) -> std::sync::Arc<Mutex<()>> {
     static MAP: OnceLock<Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<Mutex<()>>>>> =
         OnceLock::new();
     let map = MAP.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-    let mut guard = map.lock().unwrap();
+    // Bloqueo por directorio físico compartido: canonicalizar para que dos
+    // instancias que apunten al mismo directorio (p. ej. legacy) compartan lock.
+    let key = std::fs::canonicalize(instance_dir).unwrap_or_else(|_| instance_dir.to_path_buf());
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
     guard
-        .entry(instance_dir.to_path_buf())
+        .entry(key)
         .or_insert_with(|| std::sync::Arc::new(Mutex::new(())))
         .clone()
 }
@@ -102,7 +106,7 @@ fn write_journal(instance_dir: &Path, journal: &Journal) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let data = serde_json::to_string_pretty(journal).map_err(|e| e.to_string())?;
+    let data = serde_json::to_string(journal).map_err(|e| e.to_string())?;
     write_atomic(&path, data.as_bytes(), None)
 }
 
@@ -122,7 +126,7 @@ fn journal_remove(instance_dir: &Path, entry: &JournalEntry) -> Result<(), Strin
 #[allow(dead_code)]
 pub fn recover_with_journal(instance_dir: &Path) -> Result<(), String> {
     let lock = instance_lock(instance_dir);
-    let _guard = lock.lock().unwrap();
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     recover_with_journal_inner(instance_dir)
 }
 
@@ -584,7 +588,8 @@ pub fn write_atomic(dest: &Path, bytes: &[u8], expected_sha1: Option<&str>) -> R
     Ok(())
 }
 
-/// Actualización transaccional.
+/// Actualización transaccional. Wrapper de `apply_batch_transactional` con un
+/// solo ítem para no romper llamadas ni tests existentes.
 #[allow(dead_code)]
 pub fn apply_update_transactional(
     dest: &Path,
@@ -595,16 +600,24 @@ pub fn apply_update_transactional(
     subdir: &Path,
     entry: content::ContentEntry,
 ) -> Result<(), String> {
-    let lock = instance_lock(instance_dir);
-    let _guard = lock.lock().unwrap();
-    apply_update_transactional_inner(
-        dest,
-        bytes,
-        expected_sha1,
+    // write_atomic verifica el SHA1 por sí mismo; apply_batch no lo hace
+    // (usa write_atomic_prehashed). Para preservar el comportamiento de
+    // apply_update_transactional, verificamos aquí antes de delegar.
+    if let Some(expected) = expected_sha1
+        && !sha1_hex(bytes).eq_ignore_ascii_case(expected)
+    {
+        return Err("El archivo descargado no coincide con su SHA1: se descartó".to_string());
+    }
+    apply_batch_transactional(
         instance_dir,
         kind,
         subdir,
-        entry,
+        vec![BatchItem {
+            dest: dest.to_path_buf(),
+            bytes: bytes.to_vec(),
+            expected_sha1: expected_sha1.map(String::from),
+            entry,
+        }],
     )
 }
 
@@ -714,13 +727,16 @@ fn apply_update_transactional_inner(
     if let Some(old) = old_entries.iter().find(|e| e.slug == entry.slug)
         && old.filename != entry.filename
     {
-        let old_path = subdir.join(&old.filename);
-        match fs::remove_file(&old_path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                // Conservar journal y propagar error.
-                return Err(format!("No se pudo borrar archivo anterior: {e}"));
+        // Solo borrar el archivo anterior si Obsidia lo administraba.
+        if old.managed_by_obsidia {
+            let old_path = subdir.join(&old.filename);
+            match fs::remove_file(&old_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    // Conservar journal y propagar error.
+                    return Err(format!("No se pudo borrar archivo anterior: {e}"));
+                }
             }
         }
     }
@@ -740,6 +756,274 @@ fn apply_update_transactional_inner(
     Ok(())
 }
 
+/// Operación pendiente de una transacción por lotes.
+pub struct BatchItem {
+    pub dest: PathBuf,
+    pub bytes: Vec<u8>,
+    pub expected_sha1: Option<String>,
+    pub entry: content::ContentEntry,
+}
+
+/// Escribe `bytes` en `dest` de forma atómica, saltando la verificación de SHA1
+/// (el llamador ya calculó `new_hash`). Equivalente a `write_atomic` pero sin
+/// recalcular el hash de los mismos bytes.
+pub fn write_atomic_prehashed(dest: &Path, bytes: &[u8], new_hash: &str) -> Result<(), String> {
+    let _ = new_hash; // El hash ya fue validado por el llamador.
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+
+    let mut tmp = dest.to_path_buf().into_os_string();
+    tmp.push(".part");
+    let tmp = PathBuf::from(tmp);
+    fs::write(&tmp, bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
+
+    // Reemplazo seguro: nunca se borra el válido antes de confirmar el temporal.
+    let backup = dest.with_file_name(format!(
+        "{}.old",
+        dest.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    if dest.exists() {
+        if backup.exists() {
+            fs::remove_file(&backup).map_err(|e| format!("{}: {e}", backup.display()))?;
+        }
+        fs::rename(dest, &backup).map_err(|e| format!("{}: {e}", dest.display()))?;
+    }
+    if let Err(e) = fs::rename(&tmp, dest) {
+        // Restaurar el original si el reemplazo falla.
+        if backup.exists() {
+            fs::rename(&backup, dest)
+                .map_err(|e2| format!("{}: {e}; restauración falló: {e2}", dest.display()))?;
+        }
+        return Err(format!("{}: {e}", dest.display()));
+    }
+    Ok(())
+}
+
+/// Aplica varias actualizaciones transaccionalmente bajo un único lock de
+/// instancia. Toma el lock una vez, recupera el journal una vez, lee el índice
+/// una vez, escribe el journal una vez y escribe el índice una vez.
+pub fn apply_batch_transactional(
+    instance_dir: &Path,
+    kind: &str,
+    subdir: &Path,
+    items: Vec<BatchItem>,
+) -> Result<(), String> {
+    if items.is_empty() {
+        return Ok(());
+    }
+
+    let lock = instance_lock(instance_dir);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+
+    // 1. Recuperar transacciones pendientes antes de modificar (una sola vez).
+    recover_with_journal_inner(instance_dir)?;
+
+    // 2. Leer índice una sola vez.
+    let mut entries = content::read_index(instance_dir, kind)?;
+
+    // 3. Validar todos los nombres de archivo antes de tocar el disco.
+    for item in &items {
+        if !is_safe_filename(&item.entry.filename) {
+            return Err("filename inválido".to_string());
+        }
+        if let Some(old) = entries.iter().find(|e| e.slug == item.entry.slug) {
+            if !is_safe_filename(&old.filename) {
+                return Err("old_filename inválido".to_string());
+            }
+        }
+    }
+
+    // 4. Construir entradas del journal y leer contenido previo de cada dest.
+    let mut journal_entries: Vec<JournalEntry> = Vec::with_capacity(items.len());
+    let mut prev_contents: Vec<Option<Vec<u8>>> = Vec::with_capacity(items.len());
+    let mut new_hashes: Vec<String> = Vec::with_capacity(items.len());
+    let mut old_filenames: Vec<Option<String>> = Vec::with_capacity(items.len());
+
+    for item in &items {
+        let old_content = if item.dest.exists() {
+            Some(fs::read(&item.dest).map_err(|e| e.to_string())?)
+        } else {
+            None
+        };
+        let prev_hash = old_content.as_ref().map(|b| sha1_hex(b));
+        let old_filename = entries
+            .iter()
+            .find(|e| e.slug == item.entry.slug)
+            .map(|e| e.filename.clone());
+        let new_hash = sha1_hex(&item.bytes);
+
+        let journal_entry = JournalEntry {
+            op: "install".to_string(),
+            kind: kind.to_string(),
+            slug: item.entry.slug.clone(),
+            filename: item.entry.filename.clone(),
+            old_filename: old_filename.clone(),
+            version_id: Some(item.entry.version_id.clone()),
+            sha1: item.entry.sha1.clone(),
+            new_hash: Some(new_hash.clone()),
+            prev_hash,
+        };
+
+        journal_entries.push(journal_entry);
+        prev_contents.push(old_content);
+        new_hashes.push(new_hash);
+        old_filenames.push(old_filename);
+    }
+
+    // 5. Escribir journal una sola vez con todas las entradas pendientes.
+    let mut journal = read_journal(instance_dir)?;
+    journal.pending.extend(journal_entries.clone());
+    write_journal(instance_dir, &journal)?;
+
+    // 6. Escribir cada archivo con write_atomic en el orden recibido.
+    //    Si alguno falla, revertir los ya escritos y retirar sus entradas del journal.
+    let mut written: Vec<usize> = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        // Verificar SHA-1 si se proviene uno esperado (no recalcular: usamos new_hashes[i]).
+        if let Some(expected) = &item.expected_sha1
+            && !new_hashes[i].eq_ignore_ascii_case(expected)
+        {
+            // Revertir archivos ya escritos (índices 0..i).
+            for &j in &written {
+                let dest = &items[j].dest;
+                match &prev_contents[j] {
+                    Some(old) => {
+                        let _ = fs::write(dest, old);
+                    }
+                    None => {
+                        let _ = fs::remove_file(dest);
+                    }
+                }
+            }
+            let mut journal = read_journal(instance_dir).unwrap_or_else(|_| Journal::default());
+            // Retirar del journal las entradas de TODOS los ítems del lote
+            // (ninguna debe quedar pendiente ante un fallo).
+            for item in &items {
+                journal.pending.retain(|e| {
+                    !(e.slug == item.entry.slug && e.filename == item.entry.filename)
+                });
+            }
+            let _ = write_journal(instance_dir, &journal);
+            return Err(format!(
+                "El archivo descargado no coincide con su SHA1: se descartó"
+            ));
+        }
+        if let Err(e) = write_atomic_prehashed(&item.dest, &item.bytes, &new_hashes[i]) {
+            // Revertir archivos ya escritos (índices 0..i).
+            for &j in &written {
+                let dest = &items[j].dest;
+                match &prev_contents[j] {
+                    Some(old) => {
+                        let _ = fs::write(dest, old);
+                    }
+                    None => {
+                        let _ = fs::remove_file(dest);
+                    }
+                }
+            }
+            // Retirar del journal las entradas de TODOS los ítems del lote.
+            let mut journal = read_journal(instance_dir).unwrap_or_else(|_| Journal::default());
+            for item in &items {
+                journal.pending.retain(|e| {
+                    !(e.slug == item.entry.slug && e.filename == item.entry.filename)
+                });
+            }
+            let _ = write_journal(instance_dir, &journal);
+            return Err(e);
+        }
+        written.push(i);
+    }
+
+    // 7. Actualizar el índice en memoria y escribirlo una sola vez.
+    for item in items.iter() {
+        let new_entry = item.entry.clone();
+        if let Some(pos) = entries.iter().position(|e| e.slug == new_entry.slug) {
+            entries[pos] = new_entry;
+        } else {
+            entries.push(new_entry);
+        }
+    }
+    if let Err(e) = content::write_index(instance_dir, kind, &entries) {
+        // Restaurar todos los archivos del lote como hace el camino individual.
+        for (i, item) in items.iter().enumerate() {
+            match &prev_contents[i] {
+                Some(old) => {
+                    let _ = fs::write(&item.dest, old);
+                }
+                None => {
+                    let _ = fs::remove_file(&item.dest);
+                }
+            }
+        }
+        return Err(format!("Índice no actualizado, archivos restaurados: {e}"));
+    }
+
+    // 8. Si cambió el filename, borrar el anterior (solo si lo gestiona Obsidia).
+    for (i, item) in items.iter().enumerate() {
+        if let Some(old_name) = &old_filenames[i] {
+            if old_name != &item.entry.filename && item.entry.managed_by_obsidia {
+                let old_path = subdir.join(old_name);
+                if old_path.exists() {
+                    let _ = fs::remove_file(&old_path);
+                }
+            }
+        }
+    }
+
+    // 9. Limpiar respaldos .old conservados por write_atomic.
+    for item in &items {
+        let backup = item
+            .dest
+            .with_file_name(format!(
+                "{}.old",
+                item.dest.file_name().unwrap_or_default().to_string_lossy()
+            ));
+        if backup.exists() {
+            let _ = fs::remove_file(&backup);
+        }
+    }
+
+    // 10. Vaciar el journal (confirmar todas las entradas).
+    let mut journal = read_journal(instance_dir)?;
+    for item in &items {
+        journal
+            .pending
+            .retain(|e| !(e.slug == item.entry.slug && e.filename == item.entry.filename));
+    }
+    write_journal(instance_dir, &journal)?;
+
+    Ok(())
+}
+
+/// Actualiza `icon_url` en el índice de contenido, solo donde esté `None`.
+/// Toma el instance_lock una vez, lee el índice, completa icon_url para los
+/// slugs indicados y escribe el índice con una única escritura atómica.
+/// No usa journal: solo cambia metadatos cosméticos.
+pub fn update_entry_icons(
+    instance_dir: &Path,
+    kind: &str,
+    icons: &HashMap<String, String>,
+) -> Result<(), String> {
+    let lock = instance_lock(instance_dir);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+
+    let mut entries = content::read_index(instance_dir, kind)?;
+    let mut changed = false;
+    for entry in entries.iter_mut() {
+        if entry.icon_url.is_none()
+            && let Some(icon) = icons.get(&entry.slug)
+        {
+            entry.icon_url = Some(icon.clone());
+            changed = true;
+        }
+    }
+    if changed {
+        content::write_index(instance_dir, kind, &entries)?;
+    }
+    Ok(())
+}
+
 /// Eliminación transaccional.
 #[allow(dead_code)]
 pub fn remove_entry_transactional(
@@ -749,7 +1033,7 @@ pub fn remove_entry_transactional(
     slug: &str,
 ) -> Result<(), String> {
     let lock = instance_lock(instance_dir);
-    let _guard = lock.lock().unwrap();
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     remove_entry_transactional_inner(instance_dir, kind, subdir, slug)
 }
 
@@ -789,11 +1073,18 @@ fn remove_entry_transactional_inner(
     content::write_index(instance_dir, kind, &new_entries)?;
     // Si el índice falla, el archivo queda intacto (no se llegó acá).
 
-    // 2. Borrar el archivo.
+    // 2. Borrar el archivo solo si es contenido gestionado por Obsidia.
+    // Los archivos externos (managed_by_obsidia == false) se conservan.
     if let Some(name) = filename {
-        let path = subdir.join(&name);
-        if path.exists() {
-            fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let is_managed = old_entry
+            .as_ref()
+            .map(|e| e.managed_by_obsidia)
+            .unwrap_or(false);
+        if is_managed {
+            let path = subdir.join(&name);
+            if path.exists() {
+                fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            }
         }
     }
 
@@ -967,6 +1258,7 @@ mod tests {
             &dir.join("mods"),
             ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -974,6 +1266,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             },
         )
         .unwrap();
@@ -989,6 +1282,7 @@ mod tests {
             &dir.join("mods"),
             ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v2".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -996,6 +1290,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             },
         )
         .unwrap();
@@ -1029,6 +1324,7 @@ mod tests {
             &dir.join("mods"),
             ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -1036,6 +1332,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             },
         )
         .unwrap();
@@ -1054,6 +1351,7 @@ mod tests {
             &dir.join("mods"),
             ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v2".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -1061,6 +1359,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             },
         );
         assert!(res.is_err());
@@ -1087,6 +1386,7 @@ mod tests {
             &dir.join("mods"),
             ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -1094,6 +1394,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             },
         )
         .unwrap();
@@ -1144,6 +1445,7 @@ mod tests {
             &dir.join("mods"),
             ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -1151,6 +1453,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             },
         )
         .unwrap();
@@ -1201,6 +1504,7 @@ mod tests {
             &dir.join("mods"),
             ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -1208,6 +1512,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             },
         )
         .unwrap();
@@ -1276,6 +1581,7 @@ mod tests {
             &dir.join("mods"),
             ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -1283,6 +1589,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             },
         )
         .unwrap();
@@ -1319,6 +1626,7 @@ mod tests {
             &dir_a.join("mods"),
             ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "va".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -1326,6 +1634,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             },
         )
         .unwrap();
@@ -1339,6 +1648,7 @@ mod tests {
             &dir_b.join("mods"),
             ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "vb".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -1346,6 +1656,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             },
         )
         .unwrap();
@@ -1416,6 +1727,7 @@ mod tests {
             &dir.join("mods"),
             ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -1423,6 +1735,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             },
         )
         .unwrap();
@@ -1472,6 +1785,7 @@ mod tests {
             &dir.join("mods"),
             ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "mod-v1.jar".to_string(),
                 sha1: None,
@@ -1479,6 +1793,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             },
         )
         .unwrap();
@@ -1494,6 +1809,7 @@ mod tests {
             &dir.join("mods"),
             ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v2".to_string(),
                 filename: "mod-v2.jar".to_string(),
                 sha1: None,
@@ -1501,6 +1817,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             },
         )
         .unwrap();
@@ -1566,6 +1883,7 @@ mod tests {
                     &d.join("mods"),
                     ContentEntry {
                         slug: format!("mod{i}"),
+                        project_id: None,
                         version_id: format!("v{i}"),
                         filename: format!("mod{i}.jar"),
                         sha1: None,
@@ -1573,6 +1891,7 @@ mod tests {
                         mc_version: None,
                         icon_url: None,
                         source: "modrinth".to_string(),
+                        managed_by_obsidia: true,
                     },
                 )
                 .unwrap();
@@ -1608,6 +1927,7 @@ mod tests {
             &dir.join("mods"),
             ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -1615,6 +1935,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             },
         )
         .unwrap();
@@ -1661,6 +1982,7 @@ mod tests {
             &dir.join("mods"),
             ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -1668,6 +1990,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             },
         )
         .unwrap();
@@ -1718,6 +2041,7 @@ mod tests {
             &dir.join("mods"),
             ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -1725,6 +2049,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             },
         )
         .unwrap();
@@ -1784,6 +2109,7 @@ mod tests {
             &dir.join("mods"),
             ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -1791,6 +2117,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             },
         )
         .unwrap();
@@ -1847,6 +2174,7 @@ mod tests {
             &dir.join("mods"),
             ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -1854,6 +2182,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             },
         )
         .unwrap();
@@ -1903,6 +2232,7 @@ mod tests {
             &dir.join("mods"),
             ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -1910,6 +2240,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             },
         )
         .unwrap();
@@ -1956,6 +2287,7 @@ mod tests {
             "mods",
             &[crate::content::ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -1963,6 +2295,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             }],
         )
         .unwrap();
@@ -1989,6 +2322,7 @@ mod tests {
             "mods",
             &[crate::content::ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -1996,6 +2330,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             }],
         )
         .unwrap();
@@ -2022,6 +2357,7 @@ mod tests {
             "shaders",
             &[crate::content::ContentEntry {
                 slug: "pack".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "pack.zip".to_string(),
                 sha1: None,
@@ -2029,6 +2365,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             }],
         )
         .unwrap();
@@ -2054,6 +2391,7 @@ mod tests {
             "packs",
             &[crate::content::ContentEntry {
                 slug: "pack".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "pack.zip".to_string(),
                 sha1: None,
@@ -2061,6 +2399,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             }],
         )
         .unwrap();
@@ -2088,6 +2427,7 @@ mod tests {
             "mods",
             &[crate::content::ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -2095,6 +2435,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             }],
         )
         .unwrap();
@@ -2131,6 +2472,7 @@ mod tests {
             &dir.join("mods"),
             ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -2138,6 +2480,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             },
         )
         .unwrap();
@@ -2264,6 +2607,7 @@ mod tests {
             &dir.join("mods"),
             ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -2271,6 +2615,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             },
         )
         .unwrap();
@@ -2323,6 +2668,7 @@ mod tests {
             "mods",
             &[crate::content::ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -2330,6 +2676,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             }],
         )
         .unwrap();
@@ -2361,6 +2708,7 @@ mod tests {
             "mods",
             &[crate::content::ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -2368,6 +2716,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             }],
         )
         .unwrap();
@@ -2406,6 +2755,7 @@ mod tests {
             &dir.join("mods"),
             ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -2413,6 +2763,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             },
         )
         .unwrap();
@@ -2479,6 +2830,7 @@ mod tests {
             &dir.join("mods"),
             ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -2486,6 +2838,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             },
         )
         .unwrap();
@@ -2575,6 +2928,7 @@ mod tests {
             "mods",
             &[crate::content::ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -2582,6 +2936,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             }],
         )
         .unwrap();
@@ -2625,6 +2980,7 @@ mod tests {
             "mods",
             &[crate::content::ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -2632,6 +2988,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             }],
         )
         .unwrap();
@@ -2675,6 +3032,7 @@ mod tests {
             "mods",
             &[crate::content::ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -2682,6 +3040,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             }],
         )
         .unwrap();
@@ -2724,6 +3083,7 @@ mod tests {
             "mods",
             &[crate::content::ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -2731,6 +3091,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             }],
         )
         .unwrap();
@@ -2771,6 +3132,7 @@ mod tests {
             "mods",
             &[crate::content::ContentEntry {
                 slug: "a".to_string(),
+                project_id: None,
                 version_id: "v2".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -2778,6 +3140,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             }],
         )
         .unwrap();
@@ -2807,6 +3170,7 @@ mod tests {
             &[
                 crate::content::ContentEntry {
                     slug: "a".to_string(),
+                    project_id: None,
                     version_id: "v2".to_string(),
                     filename: "mod.jar".to_string(),
                     sha1: None,
@@ -2814,9 +3178,11 @@ mod tests {
                     mc_version: None,
                     icon_url: None,
                     source: "modrinth".to_string(),
+                    managed_by_obsidia: true,
                 },
                 crate::content::ContentEntry {
                     slug: "b".to_string(),
+                    project_id: None,
                     version_id: "v1".to_string(),
                     filename: "bad.jar".to_string(),
                     sha1: None,
@@ -2824,6 +3190,7 @@ mod tests {
                     mc_version: None,
                     icon_url: None,
                     source: "modrinth".to_string(),
+                    managed_by_obsidia: true,
                 },
             ],
         )
@@ -2918,6 +3285,7 @@ mod tests {
             "mods",
             &[crate::content::ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -2925,6 +3293,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             }],
         )
         .unwrap();
@@ -2967,6 +3336,7 @@ mod tests {
             "mods",
             &[crate::content::ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v2".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -2974,6 +3344,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             }],
         )
         .unwrap();
@@ -3017,6 +3388,7 @@ mod tests {
             &dir.join("mods"),
             ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -3024,6 +3396,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             },
         )
         .unwrap();
@@ -3057,6 +3430,7 @@ mod tests {
             &dir.join("mods"),
             ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v3".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -3064,6 +3438,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             },
         )
         .unwrap();
@@ -3093,6 +3468,7 @@ mod tests {
             &dir.join("mods"),
             ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -3100,6 +3476,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             },
         )
         .unwrap();
@@ -3151,6 +3528,7 @@ mod tests {
             &dir.join("mods"),
             ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "mod-v1.jar".to_string(),
                 sha1: None,
@@ -3158,6 +3536,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             },
         )
         .unwrap();
@@ -3225,6 +3604,7 @@ mod tests {
             "mods",
             &[crate::content::ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -3232,6 +3612,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             }],
         )
         .unwrap();
@@ -3304,6 +3685,7 @@ mod tests {
             "mods",
             &[crate::content::ContentEntry {
                 slug: "b".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "bad.jar".to_string(),
                 sha1: None,
@@ -3311,6 +3693,7 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             }],
         )
         .unwrap();
@@ -3359,6 +3742,7 @@ mod tests {
             &dir.join("mods"),
             ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v1".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -3366,6 +3750,7 @@ mod tests {
                 mc_version: None,
                 icon_url: Some("https://example.com/icon.png".to_string()),
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             },
         )
         .unwrap();
@@ -3386,6 +3771,7 @@ mod tests {
             &dir.join("mods"),
             ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v2".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -3393,6 +3779,7 @@ mod tests {
                 mc_version: None,
                 icon_url: Some("https://example.com/icon2.png".to_string()),
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             },
         )
         .unwrap();
@@ -3412,6 +3799,7 @@ mod tests {
             &dir.join("mods"),
             ContentEntry {
                 slug: "mod".to_string(),
+                project_id: None,
                 version_id: "v3".to_string(),
                 filename: "mod.jar".to_string(),
                 sha1: None,
@@ -3419,11 +3807,297 @@ mod tests {
                 mc_version: None,
                 icon_url: None,
                 source: "modrinth".to_string(),
+                managed_by_obsidia: true,
             },
         )
         .unwrap();
         let entries = read_index(&dir, "mods").unwrap();
         assert!(entries[0].icon_url.is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── Tests apply_batch_transactional ──────────────────────────────────
+
+    fn batch_entry(base_dir: &std::path::Path, slug: &str, dest_rel: &str, version_id: &str, content: &[u8]) -> BatchItem {
+        let filename = std::path::Path::new(dest_rel)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        BatchItem {
+            dest: base_dir.join(dest_rel),
+            bytes: content.to_vec(),
+            expected_sha1: None,
+            entry: crate::content::ContentEntry {
+                slug: slug.to_string(),
+                project_id: None,
+                version_id: version_id.to_string(),
+                filename,
+                sha1: None,
+                loader: None,
+                mc_version: None,
+                icon_url: None,
+                source: "modrinth".to_string(),
+                managed_by_obsidia: true,
+            },
+        }
+    }
+
+    #[test]
+    fn apply_batch_transactional_exitoso_3_items() {
+        use crate::content::read_index;
+        let dir = std::env::temp_dir().join(format!("obsidia-fsx-{}-batch-ok", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join(".obsidia")).unwrap();
+        fs::create_dir_all(dir.join("mods")).unwrap();
+
+        let items = vec![
+            batch_entry(&dir, "a", "mods/a.jar", "va", b"contenido-a"),
+            batch_entry(&dir, "b", "mods/b.jar", "vb", b"contenido-b"),
+            batch_entry(&dir, "c", "mods/c.jar", "vc", b"contenido-c"),
+        ];
+
+        apply_batch_transactional(&dir, "mods", &dir.join("mods"), items).unwrap();
+
+        // Índice con 3 entradas.
+        let entries = read_index(&dir, "mods").unwrap();
+        assert_eq!(entries.len(), 3);
+
+        // Archivos escritos correctamente.
+        assert_eq!(fs::read(dir.join("mods").join("a.jar")).unwrap(), b"contenido-a");
+        assert_eq!(fs::read(dir.join("mods").join("b.jar")).unwrap(), b"contenido-b");
+        assert_eq!(fs::read(dir.join("mods").join("c.jar")).unwrap(), b"contenido-c");
+
+        // Journal vacío (confirmado).
+        let journal = read_journal(&dir).unwrap();
+        assert!(journal.pending.is_empty());
+
+        // Sin .part ni .old huérfanos.
+        for e in fs::read_dir(dir.join("mods")).unwrap().flatten() {
+            let path = e.path();
+            let ext = path.extension().and_then(|x| x.to_str());
+            assert_ne!(ext, Some("part"));
+            assert_ne!(ext, Some("old"));
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_batch_transactional_sha1_fallo_2do_item() {
+        use crate::content::read_index;
+        let dir = std::env::temp_dir().join(format!("obsidia-fsx-{}-batch-sha1", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join(".obsidia")).unwrap();
+        fs::create_dir_all(dir.join("mods")).unwrap();
+
+        // Primer item válido, segundo con SHA1 incorrecto.
+        let items = vec![
+            batch_entry(&dir, "a", "mods/a.jar", "va", b"contenido-a"),
+            BatchItem {
+                dest: dir.join("mods").join("b.jar"),
+                bytes: b"corrupto".to_vec(),
+                expected_sha1: Some("0000000000000000000000000000000000000000".to_string()),
+                entry: crate::content::ContentEntry {
+                    slug: "b".to_string(),
+                    project_id: None,
+                    version_id: "vb".to_string(),
+                    filename: "b.jar".to_string(),
+                    sha1: None,
+                    loader: None,
+                    mc_version: None,
+                    icon_url: None,
+                    source: "modrinth".to_string(),
+                    managed_by_obsidia: true,
+                },
+            },
+        ];
+
+        let res = apply_batch_transactional(&dir, "mods", &dir.join("mods"), items);
+        assert!(res.is_err());
+
+        // El 1er item se revierte: no existe ni está en el índice.
+        assert!(!dir.join("mods").join("a.jar").exists());
+        let entries = read_index(&dir, "mods").unwrap();
+        assert!(entries.is_empty());
+
+        // Journal sin pendientes.
+        let journal = read_journal(&dir).unwrap();
+        assert!(journal.pending.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_batch_transactional_indice_corrupto() {
+        use crate::content::{write_index, ContentEntry};
+        let dir = std::env::temp_dir().join(format!("obsidia-fsx-{}-batch-corrupt", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join(".obsidia")).unwrap();
+        fs::create_dir_all(dir.join("mods")).unwrap();
+
+        // Índice válido con entrada previa para a.jar.
+        write_index(
+            &dir,
+            "mods",
+            &[ContentEntry {
+                slug: "a".to_string(),
+                project_id: None,
+                version_id: "v1".to_string(),
+                filename: "a.jar".to_string(),
+                sha1: None,
+                loader: None,
+                mc_version: None,
+                icon_url: None,
+                source: "modrinth".to_string(),
+                managed_by_obsidia: true,
+            }],
+        )
+        .unwrap();
+        // Archivo previo que deba restaurarse si write_index falla.
+        fs::write(dir.join("mods").join("a.jar"), b"original").unwrap();
+
+        // Hacer que write_index falle: .obsidia como archivo (no se puede crear dir dentro).
+        let obsidia_dir = dir.join(".obsidia");
+        let _ = fs::remove_dir_all(&obsidia_dir);
+        fs::write(&obsidia_dir, b"no es un directorio").unwrap();
+
+        let items = vec![batch_entry(&dir, "a", "mods/a.jar", "va", b"contenido-a")];
+
+        let res = apply_batch_transactional(&dir, "mods", &dir.join("mods"), items);
+        assert!(res.is_err());
+
+        // Archivo restaurado al contenido previo (write_index falló, todo se revirtió).
+        assert_eq!(fs::read(dir.join("mods").join("a.jar")).unwrap(), b"original");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_batch_transactional_filename_diferente_borra_previo() {
+        use crate::content::read_index;
+        let dir = std::env::temp_dir().join(format!("obsidia-fsx-{}-batch-fname", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join(".obsidia")).unwrap();
+        fs::create_dir_all(dir.join("mods")).unwrap();
+
+        // Instalar v1 con filename mod-v1.jar.
+        apply_update_transactional(
+            &dir.join("mods").join("mod-v1.jar"),
+            b"v1",
+            None,
+            &dir,
+            "mods",
+            &dir.join("mods"),
+            crate::content::ContentEntry {
+                slug: "mod".to_string(),
+                project_id: None,
+                version_id: "v1".to_string(),
+                filename: "mod-v1.jar".to_string(),
+                sha1: None,
+                loader: None,
+                mc_version: None,
+                icon_url: None,
+                source: "modrinth".to_string(),
+                managed_by_obsidia: true,
+            },
+        )
+        .unwrap();
+        assert!(dir.join("mods").join("mod-v1.jar").exists());
+
+        // Actualizar con filename distinto (mod-v2.jar). El v1 debe borrarse.
+        let items = vec![batch_entry(
+            &dir,
+            "mod",
+            "mods/mod-v2.jar",
+            "v2",
+            b"v2",
+        )];
+
+        apply_batch_transactional(&dir, "mods", &dir.join("mods"), items).unwrap();
+
+        assert!(!dir.join("mods").join("mod-v1.jar").exists());
+        assert!(dir.join("mods").join("mod-v2.jar").exists());
+        let entries = read_index(&dir, "mods").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].filename, "mod-v2.jar");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_entry_icons_no_pisa_existente_y_no_toca_otros_campos() {
+        use crate::content::{read_index, write_index, ContentEntry};
+        let dir = std::env::temp_dir().join(format!(
+            "obsidia-fsx-{}-update-icons",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join(".obsidia")).unwrap();
+        fs::create_dir_all(dir.join("mods")).unwrap();
+
+        // Índice con dos entradas: una ya tiene icon_url, la otra no.
+        write_index(
+            &dir,
+            "mods",
+            &[
+                ContentEntry {
+                    slug: "mod-a".to_string(),
+                    project_id: None,
+                    version_id: "v1".to_string(),
+                    filename: "mod-a.jar".to_string(),
+                    sha1: None,
+                    loader: None,
+                    mc_version: None,
+                    icon_url: Some("https://existing.example.com/icon.png".to_string()),
+                    source: "modrinth".to_string(),
+                    managed_by_obsidia: true,
+                },
+                ContentEntry {
+                    slug: "mod-b".to_string(),
+                    project_id: None,
+                    version_id: "v2".to_string(),
+                    filename: "mod-b.jar".to_string(),
+                    sha1: None,
+                    loader: None,
+                    mc_version: None,
+                    icon_url: None,
+                    source: "modrinth".to_string(),
+                    managed_by_obsidia: true,
+                },
+            ],
+        )
+        .unwrap();
+
+        let mut icons = HashMap::new();
+        icons.insert("mod-a".to_string(), "https://new.example.com/icon-a.png".to_string());
+        icons.insert("mod-b".to_string(), "https://new.example.com/icon-b.png".to_string());
+
+        update_entry_icons(&dir, "mods", &icons).unwrap();
+
+        let entries = read_index(&dir, "mods").unwrap();
+        assert_eq!(entries.len(), 2);
+
+        // mod-a: icon_url NO se pisó (ya tenía uno).
+        let ea = entries.iter().find(|e| e.slug == "mod-a").unwrap();
+        assert_eq!(
+            ea.icon_url.as_deref(),
+            Some("https://existing.example.com/icon.png")
+        );
+        // Otros campos de mod-a intactos.
+        assert_eq!(ea.filename, "mod-a.jar");
+        assert_eq!(ea.version_id, "v1");
+
+        // mod-b: icon_url se completó porque era None.
+        let eb = entries.iter().find(|e| e.slug == "mod-b").unwrap();
+        assert_eq!(
+            eb.icon_url.as_deref(),
+            Some("https://new.example.com/icon-b.png")
+        );
+        // Otros campos de mod-b intactos.
+        assert_eq!(eb.filename, "mod-b.jar");
+        assert_eq!(eb.version_id, "v2");
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -33,27 +33,101 @@ export function skinFace(i, size, skins) {
   const layer = x => `<div style="position:absolute;inset:0;background:url('${url}') -${x}px -${size}px/${bs}px auto no-repeat;image-rendering:pixelated"></div>`;
   return `<div style="position:relative;width:${size}px;height:${size}px;overflow:hidden;border-radius:8px;flex:none;background:#1a1a2e">${layer(size)}${layer(size*5)}</div>`;
 }
+// Cuerpo completo de frente a partir de un PNG 64x64 (o 64x32), en <canvas> con escala entera.
+// Respeta el modelo elegido: brazos de 4 px (clásico) o 3 px (slim).
+export function skinFull(url, model, scale) {
+  const slim = model === 'slim';
+  const aw = slim ? 3 : 4;
+  const w = 8 + aw * 2;
+  const s = Math.max(1, Math.round(+scale || 8));
+  const ok = url && /^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(String(url));
+  return `<canvas class="js-skin" width="${w*s}" height="${32*s}" data-skin="${ok ? url : ''}" data-model="${slim ? 'slim' : 'classic'}" data-scale="${s}" role="img" aria-label="Skin de jugador" style="width:${w*s}px;height:${32*s}px;image-rendering:pixelated;display:block"></canvas>`;
+}
+
+// Pinta los <canvas class="js-skin"> ya insertados en el DOM (los <script> del innerHTML no corren).
+export function paintSkinCanvases(root) {
+  const box = root || document;
+  box.querySelectorAll('canvas.js-skin').forEach(cv => {
+    if (cv.dataset.painted === '1') return;
+    cv.dataset.painted = '1';
+    const s = Math.max(1, Math.round(+cv.dataset.scale || 8));
+    const aw = cv.dataset.model === 'slim' ? 3 : 4;
+    const ctx = cv.getContext('2d');
+    if (!ctx) return;
+    ctx.imageSmoothingEnabled = false;
+    const steve = () => paintSteve(ctx, aw, s);
+    const url = cv.dataset.skin || '';
+    if (!url) { steve(); return; }
+    const img = new Image();
+    img.onload = () => { try { paintSkinImage(ctx, img, aw, s); } catch(e) { steve(); } };
+    img.onerror = steve;
+    img.src = url;
+  });
+}
+
+function paintSkinImage(ctx, img, aw, s) {
+  const short = img.naturalHeight < 64;
+  const put = (sx, sy, dx, dy, sw, sh) => ctx.drawImage(img, sx, sy, sw, sh, dx * s, dy * s, sw * s, sh * s);
+  // Base (frente): piernas, torso, brazos y cabeza.
+  put(4, 20, aw, 20, 4, 12);
+  put(short ? 4 : 20, short ? 20 : 52, aw + 4, 20, 4, 12);
+  put(20, 20, aw, 8, 8, 12);
+  put(44, 20, 0, 8, aw, 12);
+  put(short ? 44 : 36, short ? 20 : 52, aw + 8, 8, aw, 12);
+  put(8, 8, aw, 0, 8, 8);
+  if (short) return; // 64x32: sin capas exteriores ni mitad inferior.
+  // Capas exteriores (overlay) sobre cada parte.
+  put(4, 36, aw, 20, 4, 12);
+  put(4, 52, aw + 4, 20, 4, 12);
+  put(20, 36, aw, 8, 8, 12);
+  put(44, 36, 0, 8, aw, 12);
+  put(52, 52, aw + 8, 8, aw, 12);
+  put(40, 8, aw, 0, 8, 8);
+}
+
+function paintSteve(ctx, aw, s) {
+  const r = (x, y, w, h, c) => { ctx.fillStyle = c; ctx.fillRect(x * s, y * s, w * s, h * s); };
+  const skin = '#E0A97B', hair = '#3B2A1E', shirt = '#00A8A8', pants = '#3B3B8F', shoe = '#373737';
+  r(aw, 20, 4, 9, pants); r(aw, 29, 4, 3, shoe);
+  r(aw + 4, 20, 4, 9, pants); r(aw + 4, 29, 4, 3, shoe);
+  r(aw, 8, 8, 12, shirt);
+  r(0, 8, aw, 12, skin);
+  r(aw + 8, 8, aw, 12, skin);
+  r(aw, 0, 8, 8, skin);
+  r(aw, 0, 8, 3, hair);
+  r(aw, 3, 1, 2, hair); r(aw + 7, 3, 1, 2, hair);
+  r(aw + 1, 4, 2, 1, '#fff'); r(aw + 5, 4, 2, 1, '#fff');
+  r(aw + 2, 4, 1, 1, '#3B5BDB'); r(aw + 5, 4, 1, 1, '#3B5BDB');
+  r(aw + 3, 6, 2, 1, '#B5835A');
+}
 
 export function accCard(sk, nick, ms, skins) {
   return `${skinFace(sk, 40, skins)}<div class="who"><b>${esc(nick) || 'Jugador'}</b><span>${ms ? 'Cuenta Microsoft' : 'Cuenta offline'}</span></div><i class="status" aria-hidden="true"></i>`;
 }
 
-export function modCard(m, busy, installedFile) {
-  const inst = installedFile;
-  return `<div class="mc gl"><div style="display:flex;align-items:center;gap:12px"><div class="mi" style="background:${m[3]}"></div><b>${esc(m[0])}</b></div><div class="mu" style="line-height:1.5">${esc(m[1])}</div><div style="display:flex;gap:10px;margin-top:auto"><button class="ib ${inst?'in':''}" style="flex:1;margin:0" ${inst||busy?'disabled':''} data-act="inst" data-kind="mods" data-slug="${esc(m[4])}">${busy?'Instalando.':inst?'Instalado V':'Instalar'}</button>${inst?trb('mods',inst,38):''}</div></div>`;
+// Solo URLs https: se usan dentro de CSS `url("...")`, así que se rechaza cualquier otro esquema.
+/** @param {any} src */
+export function safeImageUrl(src) {
+  const s = String(src ?? '').trim();
+  if (!/^https:\/\//i.test(s)) return '';
+  try { return encodeURI(s).replace(/'/g, '%27').replace(/&/g, '%26'); } catch(e){ return ''; }
 }
 
 export function resCard(kind, r, busy, installedFile) {
   const inst = installedFile;
-  const bg = (src, grad) => src
-    ? `background-image:url(${esc(src)}),${grad};background-size:cover;background-position:center`
-    : `background:${grad}`;
+  /** @param {any} src @param {string} grad */
+  const bg = (src, grad) => {
+    const safe = safeImageUrl(src);
+    return safe
+      ? `background-image:url("${safe}"),${grad};background-size:cover;background-position:center`
+      : `background:${grad}`;
+  };
   const modGrad = 'linear-gradient(135deg,#8B5CF6,#22D3EE)';
   const shaderGrad = 'linear-gradient(135deg,#FBBF24,#F472B6)';
   const packGrad = 'repeating-linear-gradient(90deg,rgba(0,0,0,.14) 0 8px,transparent 8px 16px),linear-gradient(135deg,#34D399,#22D3EE)';
   const thumb = kind === 'mods'
-    ? `<div style="display:flex;align-items:center;gap:12px"><div class="mi" style="${bg(r.icon_url, modGrad)}"></div><b>${esc(r.title)}</b></div>`
-    : `<div style="position:relative;height:176px;border-radius:14px;overflow:hidden;${bg(r.icon_url, kind === 'packs' ? packGrad : shaderGrad)}"><div style="position:absolute;left:0;right:0;bottom:0;padding:14px;background:linear-gradient(transparent,rgba(10,8,20,.9))"><b style="font-size:17px;line-height:1.3">${esc(r.title)}</b></div></div>`;
+    ? `<div style="display:flex;align-items:center;gap:12px"><div class="mi" style='${bg(r.icon_url, modGrad)}'></div><b>${esc(r.title)}</b></div>`
+    : `<div style='position:relative;height:176px;border-radius:14px;overflow:hidden;${bg(r.icon_url, kind === 'packs' ? packGrad : shaderGrad)}'><div style="position:absolute;left:0;right:0;bottom:0;padding:14px;background:linear-gradient(transparent,rgba(10,8,20,.9))"><b style="font-size:17px;line-height:1.3">${esc(r.title)}</b></div></div>`;
   return `<div class="mc gl">${thumb}<div class="mu" style="line-height:1.5">${esc(r.description)}</div><div class="mu" style="font-size:12px">${(r.downloads || 0).toLocaleString('es-AR')} descargas</div><div style="display:flex;gap:10px;margin-top:auto"><button class="ib ${inst ? 'in' : ''}" style="flex:1;margin:0" ${inst || busy ? 'disabled' : ''} data-act="inst" data-kind="${kind}" data-slug="${esc(r.slug)}">${busy ? 'Instalando…' : inst ? 'Instalado ✓' : 'Instalar'}</button>${inst ? trb(kind, inst, 38) : ''}<button class="sec" style="height:38px;padding:0 14px" data-act="openmod" data-kind="${kind}" data-slug="${esc(r.slug)}">Ver</button></div></div>`;
 }
 

@@ -166,9 +166,7 @@ pub fn write_options(path: &Path, data: &str) -> Result<(), String> {
     }
 
     let had_original = path.exists();
-    if had_original
-        && let Err(e) = fs::rename(path, &backup)
-    {
+    if had_original && let Err(e) = fs::rename(path, &backup) {
         let _ = fs::remove_file(&tmp);
         return Err(format!("{}: {e}", path.display()));
     }
