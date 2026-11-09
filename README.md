@@ -7,11 +7,11 @@ Obsidia es un launcher de escritorio para **Minecraft Java Edition**, diseñado 
 El objetivo es ofrecer una experiencia sencilla y organizada: crear distintas instancias de Minecraft, personalizarlas y administrar su contenido sin tener que gestionar manualmente cada instalación.
 
 <p align="center">
-  ![Platform](https://img.shields.io/badge/platform-Windows-0078D6?logo=windows&logoColor=white)
-  ![Tauri](https://img.shields.io/badge/Tauri-2-FFC131?logo=tauri&logoColor=white)
-  ![Rust](https://img.shields.io/badge/backend-Rust-DEA584?logo=rust&logoColor=white)
-  ![Svelte](https://img.shields.io/badge/frontend-Svelte-FF3E00?logo=svelte&logoColor=white)
-  ![Status](https://img.shields.io/badge/status-in%20development-orange)
+  <img alt="Platform" src="https://img.shields.io/badge/platform-Windows-0078D6?logo=windows&amp;logoColor=white">
+  <img alt="Tauri" src="https://img.shields.io/badge/Tauri-2-FFC131?logo=tauri&amp;logoColor=white">
+  <img alt="Rust" src="https://img.shields.io/badge/backend-Rust-DEA584?logo=rust&amp;logoColor=white">
+  <img alt="Svelte" src="https://img.shields.io/badge/frontend-Svelte-FF3E00?logo=svelte&amp;logoColor=white">
+  <img alt="Status" src="https://img.shields.io/badge/status-in%20development-orange">
 </p>
 
 ---
