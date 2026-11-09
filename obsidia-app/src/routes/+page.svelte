@@ -28,7 +28,7 @@ import { ic, TABS, G, TRASH, LOADERS, RAMS, STG, LBL, esc, norm, validName, norm
     np:false, npEdit:-1, npName:'', npVersion:'', npLoader:'Vanilla', npLoaderVersion:'', npRam:4, npJava:'', npErr:'', npBusy:false, npFullscreen:false, npBlock:'',
     javas:[],
     plan:null, planSlug:'', planKind:'', planId:null, planInstance:'', pendingRender:false,
-    progress:{}, prePlans:{}, updateCheckTs:{}, prePlanPending:[]
+    progress:{}, prePlans:[], updateCheckTs:{}, prePlanPending:[]
   };
 
   // ───────────── Utilidades ─────────────
@@ -37,6 +37,13 @@ import { ic, TABS, G, TRASH, LOADERS, RAMS, STG, LBL, esc, norm, validName, norm
   // Los perfiles viejos (sin id) usan el token explícito "legacy" (.minecraft).
   const inst = () => (P[S.p] && P[S.p].id) || 'legacy';
   const newId = () => 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  // Clave de progreso que separa el mismo slug entre distintas instancias.
+  /** @param {string} slug @param {string} instance @param {any[]} [deps] */
+  function progressClear(slug, instance, deps){
+    delete S.progress[`${slug}|${instance}`];
+    if (deps) for (const d of deps) if (d && d.slug) delete S.progress[`${d.slug}|${instance}`];
+    if (S.tab === 'mods') refreshGrid();
+  }
   // Categorías tal como las nombra Modrinth (facet `categories`).
   const CAT = { 'Optimización':'optimization', 'Gráficos':'graphics', 'Utilidades':'utility' };
   // La clave vieja de localStorage se conserva para no perder los mapas ya guardados.
@@ -330,7 +337,7 @@ import { ic, TABS, G, TRASH, LOADERS, RAMS, STG, LBL, esc, norm, validName, norm
         ? `<div class="gl" style="padding:16px 18px;display:flex;align-items:center;gap:12px;flex-wrap:wrap"><span class="mu">No se pudo buscar: ${esc(err)}</span><button class="sec" style="height:38px;padding:0 16px" data-act="retrysearch">Reintentar</button></div>`
         : `<div class="mu">${S.searching?'Buscando en Modrinth…':'Cargando…'}</div>`;
     } else {
-      h += res.length ? res.map(r => resCard(kind, r, S.busy[r.slug], installedFile(kind, r.slug) || findFile(kind, r.slug, r.title), S.progress[r.slug])).join('') : '<div class="mu">No hay resultados en Modrinth.</div>';
+      h += res.length ? res.map(r => resCard(kind, r, S.busy[r.slug], installedFile(kind, r.slug) || findFile(kind, r.slug, r.title), S.progress[`${r.slug}|${inst()}`])).join('') : '<div class="mu">No hay resultados en Modrinth.</div>';
     }
     return h;
   }
@@ -561,11 +568,13 @@ async function savePacks(){
           S.planId = null;
           toast('No se pudo planear la instalación: '+e, true);
           delete S.busy[slug];
-          refreshGrid(); render();
+          progressClear(slug, instance);
+          render();
           return;
         }
       }
-      if (!S.busy[slug] || !result) { delete S.busy[slug]; refreshGrid(); render(); return; }
+      progressClear(slug, instance);
+      if (!S.busy[slug] || !result) { delete S.busy[slug]; render(); return; }
       const plan = result.plan;
       const planId = result.plan_id;
       const pending = (plan.dependencies||[]).filter(d => !d.already_installed);
@@ -576,11 +585,15 @@ async function savePacks(){
           perfLog('respuesta_backend');
           const result2 = (S.results && S.results[kind]) ? S.results[kind].find(r => r.slug === slug) : null;
           if (res) rememberFile(kind, slug, res, result2 && result2.icon_url, instance);
+          // Asegurar que S.filemap[kind][slug] quede actualizado inmediatamente en memoria
+          if (!S.filemap[kind]) S.filemap[kind] = {};
+          S.filemap[kind][slug] = { file: res, icon: result2 && result2.icon_url };
           toast('Instalado correctamente.');
           perfLog('boton_instalado');
         } catch(e){ toast('No se pudo instalar: '+e, true); }
         delete S.busy[slug];
         await refreshKind(kind, instance);
+        progressClear(slug, instance, plan.dependencies);
         perfLog('fin_refreshkind');
         return;
       }
@@ -589,9 +602,6 @@ async function savePacks(){
       S.planSlug = slug;
       S.planKind = kind;
       S.planInstance = instance;
-      delete S.busy[slug];
-      refreshGrid(); render();
-      return;
       delete S.busy[slug];
       refreshGrid(); render();
       return;
@@ -613,6 +623,7 @@ async function savePacks(){
     } catch(e){ toast('No se pudo instalar: '+e, true); }
     delete S.busy[slug];
     await refreshKind(kind, instance);
+    progressClear(slug, instance);
     perfLog('fin_refreshkind');
   }
 
@@ -637,11 +648,15 @@ async function savePacks(){
       perfLog('respuesta_backend');
       const result = (S.results && S.results[kind]) ? S.results[kind].find(r => r.slug === slug) : null;
       if (res) rememberFile(kind, slug, res, result && result.icon_url, instance);
+      // Asegurar que S.filemap[kind][slug] quede actualizado inmediatamente en memoria
+      if (!S.filemap[kind]) S.filemap[kind] = {};
+      S.filemap[kind][slug] = { file: res, icon: result && result.icon_url };
       toast('Instalado correctamente.');
       perfLog('boton_instalado');
     } catch(e){ toast('No se pudo instalar: '+e, true); }
     delete S.busy[slug];
     await refreshKind(kind, instance);
+    progressClear(slug, instance, plan.dependencies);
     perfLog('fin_refreshkind');
   }
 
@@ -991,7 +1006,6 @@ function account(){
     else if (a=='npdel'){
       const p = P[S.npEdit];
       if (!p) return;
-      if (!confirm(`¿Eliminar la instancia '${p.n || p.name}'?\n\nSe borrarán sus mods, configuraciones y archivos de esa instancia. Esta acción no se puede deshacer.`)) return;
       S.npErr = '';
       S.npBusy = true; render();
       try {
@@ -1011,7 +1025,7 @@ function account(){
     else if (a=='pdown'){ const i = +d.i; if (i<S.pstate.length-1 && S.pstate[i].enabled && S.pstate[i+1].enabled){ [S.pstate[i+1], S.pstate[i]] = [S.pstate[i], S.pstate[i+1]]; savePacks(); render(); } }
     else if (a=='pauto'){ S.pstate = [...S.pstate].sort((x,y) => (Number(y.enabled)-Number(x.enabled)) || x.name.localeCompare(y.name)); savePacks(); render(); }
     else if (a=='inst'){ doInstall(d.kind, d.slug); }
-    else if (a=='plancancel'){ if (e.target !== b) return; S.plan = null; S.planSlug=''; S.planKind=''; S.planId=null; S.planInstance=''; render(); }
+    else if (a=='plancancel'){ if (e.target !== b) return; const cslug = S.planSlug; const cinst = S.planInstance || inst(); S.plan = null; S.planSlug=''; S.planKind=''; S.planId=null; S.planInstance=''; progressClear(cslug, cinst); render(); }
     else if (a=='planinstall'){ doInstallConfirmed(); }
     else if (a=='fdel'){
       const folder = { mods:'mods', shaders:'shaderpacks', packs:'resourcepacks' }[d.kind];
@@ -1181,26 +1195,34 @@ function account(){
       let select = null;
       try { select = localStorage.getItem('obsidia.sel') || null; } catch(e){}
       await loadProfiles(select);
-      render();
-      const [remote, settings, msProfile, totalRam, javas] = await Promise.all([
-        invoke('list_versions').catch(()=>[]),
-        invoke('get_settings').catch(()=>null),
-        invoke('ms_get_profile').catch(()=>null),
-        invoke('get_total_ram').catch(()=>16),
-        invoke('detect_javas').catch(()=>[])
-      ]);
-      const installed = await invoke('get_installed_versions').catch(()=>[]);
-      VERSIONS = [...new Set([...(remote||[]), ...(installed||[]).filter(v => /^\d/.test(v) && !/forge|fabric/.test(v))])];
-      S.totalRam = totalRam || 16; S.javas = javas || [];
-      if (settings){
-        S.defRam = Math.min(normRam(settings.ram), S.totalRam);
-        S.t.lite = !!settings.light_mode;
-        S.nick = settings.username || S.nick;
-      }
-      if (msProfile){ S.ms = true; S.nick = msProfile.name || S.nick; }
-      try { S.skins = JSON.parse(localStorage.getItem('obsidia.skins') || '[]').slice(0,4); S.sk = Math.min(+localStorage.getItem('obsidia.sk') || (S.skins.length?0:-1), S.skins.length-1); S.skmodel = localStorage.getItem('obsidia.skmodel')==='slim'?'slim':'classic'; } catch(e){}
-      render();
-      // Tareas secundarias no bloqueantes.
+      render(); // UI con perfiles en cuanto llegan
+
+      // Datos secundarios sin bloquear el primer render: se cargan en paralelo
+      // y actualizan la UI cuando terminan.
+      (async () => {
+        try {
+          const [remote, settings, msProfile, totalRam, javas] = await Promise.all([
+            invoke('list_versions').catch(()=>[]),
+            invoke('get_settings').catch(()=>null),
+            invoke('ms_get_profile').catch(()=>null),
+            invoke('get_total_ram').catch(()=>16),
+            invoke('detect_javas').catch(()=>[])
+          ]);
+          const installed = await invoke('get_installed_versions').catch(()=>[]);
+          VERSIONS = [...new Set([...(remote||[]), ...(installed||[]).filter(v => /^\d/.test(v) && !/forge|fabric/.test(v))])];
+          S.totalRam = totalRam || 16; S.javas = javas || [];
+          if (settings){
+            S.defRam = Math.min(normRam(settings.ram), S.totalRam);
+            S.t.lite = !!settings.light_mode;
+            S.nick = settings.username || S.nick;
+          }
+          if (msProfile){ S.ms = true; S.nick = msProfile.name || S.nick; }
+          try { S.skins = JSON.parse(localStorage.getItem('obsidia.skins') || '[]').slice(0,4); S.sk = Math.min(+localStorage.getItem('obsidia.sk') || (S.skins.length?0:-1), S.skins.length-1); S.skmodel = localStorage.getItem('obsidia.skmodel')==='slim'?'slim':'classic'; } catch(e){}
+          render();
+        } catch(e){ console.error(e); }
+      })();
+
+      // Tareas terciarias no bloqueantes.
       setTimeout(async () => {
         try {
           const preserved = await invoke('get_migration_preserved_saves').catch(()=>[]);
@@ -1232,6 +1254,7 @@ function account(){
         if (S.tab === 'mods') refreshGrid();
       }
     } catch(e){ /* pre-plan opcional: no bloquear */ }
+    finally { if (!S.busy[slug]) delete S.progress[key]; if (S.tab === 'mods') refreshGrid(); }
   }
 
   function onPrePlanMouseOver(e){
@@ -1244,6 +1267,13 @@ function account(){
   }
 
   function onPrePlanMouseOut(){
+    if (prePlanTimer) { clearTimeout(prePlanTimer); prePlanTimer = null; }
+  }
+
+  // Al pulsar el mouse se cancela el temporizador de pre-planificación para
+  // que refreshGrid() no reconstruya la grilla entre el mousedown y el click,
+  // lo que perdería el evento de clic del botón presionado.
+  function onPrePlanMouseDown(){
     if (prePlanTimer) { clearTimeout(prePlanTimer); prePlanTimer = null; }
   }
 
@@ -1270,12 +1300,13 @@ function account(){
     listen('install-progress', ev => {
       const { stage, slug, instance, done, total } = ev.payload || {};
       if (!slug) return;
-      S.progress[slug] = { stage, done, total };
+      S.progress[`${slug}|${instance}`] = { stage, done, total };
       if (S.tab === 'mods') refreshGrid();
     }).then(u => { progressUn = u; }).catch(() => { progressUn = null; });
     // Pre-planificación al pasar el mouse sobre botones "Instalar" de mods.
     document.addEventListener('mouseover', onPrePlanMouseOver);
     document.addEventListener('mouseout', onPrePlanMouseOut);
+    document.addEventListener('mousedown', onPrePlanMouseDown);
     document.addEventListener('focusin', onPrePlanMouseOver);
     init();
     return () => {
@@ -1289,6 +1320,7 @@ function account(){
       document.removeEventListener('keydown', onKey);
       document.removeEventListener('mouseover', onPrePlanMouseOver);
       document.removeEventListener('mouseout', onPrePlanMouseOut);
+      document.removeEventListener('mousedown', onPrePlanMouseDown);
       document.removeEventListener('focusin', onPrePlanMouseOver);
       if (prePlanTimer) clearTimeout(prePlanTimer);
       if (progressUn) { try { progressUn(); } catch(e){} progressUn = null; }

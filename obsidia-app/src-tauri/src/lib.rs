@@ -25,7 +25,7 @@ use std::fs;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{OnceLock, Mutex};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static MIGRATION_PRESERVED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
@@ -1237,6 +1237,20 @@ fn detect_javas(paths: tauri::State<'_, Paths>) -> Result<Vec<JavaInfo>, String>
     Ok(detect_javas_in(&paths))
 }
 
+/// Consulta la versión de un java con timeout de 5 s para no bloquear el arranque
+/// si el ejecutable está colgado.
+fn java_version_timed(path: &Path) -> String {
+    let path = path.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(java_version(&path));
+    });
+    match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(v) => v,
+        Err(_) => String::new(),
+    }
+}
+
 fn detect_javas_in(paths: &Paths) -> Vec<JavaInfo> {
     let mut found: Vec<PathBuf> = Vec::new();
     // known minecraft runtimes
@@ -1308,13 +1322,24 @@ fn detect_javas_in(paths: &Paths) -> Vec<JavaInfo> {
             unique.push(p);
         }
     }
-    let mut infos = Vec::new();
-    for p in unique {
-        infos.push(JavaInfo {
-            path: p.to_string_lossy().to_string(),
-            version: java_version(&p),
-        });
-    }
+
+    // Consultas de versión en paralelo con scope, cada una con timeout de 5 s.
+    let mut infos: Vec<JavaInfo> = Vec::with_capacity(unique.len());
+    std::thread::scope(|s| {
+        let mut handles: Vec<_> = Vec::new();
+        for p in unique {
+            let p2 = p.clone();
+            handles.push(s.spawn(move || JavaInfo {
+                path: p2.to_string_lossy().to_string(),
+                version: java_version_timed(&p2),
+            }));
+        }
+        for h in handles {
+            if let Ok(info) = h.join() {
+                infos.push(info);
+            }
+        }
+    });
     infos
 }
 
@@ -1347,11 +1372,51 @@ async fn launch_version(
         return Err(format!("La instancia {} ya está en ejecución", instance));
     }
 
-    let paths = paths.inner().clone();
+    let result = launch_version_inner(
+        app,
+        paths.inner().clone(),
+        lock_key.clone(),
+        version,
+        username,
+        ram,
+        java_path,
+        server,
+        fullscreen,
+        instance,
+    )
+    .await;
+
+    // Si falló (cualquier error previo o durante el spawn), liberar la reserva.
+    if result.is_err() {
+        running.release(&lock_key);
+    }
+
+    result
+}
+
+/// Cuerpo de `launch_version` sin `tauri::State`. Todas las fallas devuelven
+/// `Err` y el wrapper libera la reserva de `RunningInstances`.
+async fn launch_version_inner(
+    app: tauri::AppHandle,
+    paths: Paths,
+    lock_key: String,
+    version: String,
+    username: String,
+    ram: Option<String>,
+    java_path: Option<String>,
+    server: Option<String>,
+    fullscreen: Option<bool>,
+    instance: String,
+) -> Result<String, String> {
     let gd = paths.instance_dir(&instance)?;
     if let Ok(InstanceRef::Instance(_)) = InstanceRef::parse(&instance) {
         paths.ensure_saves_link(&gd)?;
     }
+    // Recuperar journal antes de descargar versiones, librerías o assets.
+    // Se ejecuta en hilo de bloqueo (todo esto corre dentro de spawn_blocking).
+    fsx::recover_with_journal(&gd)
+        .map_err(|e| format!("La instancia {} no se pudo recuperar: {}", instance, e))?;
+
     let player = match auth::player().await? {
         Some(p) => p,
         None => launcher::offline_player(&username)?,
@@ -1365,7 +1430,6 @@ async fn launch_version(
     };
     let app_for_spawn = app.clone();
     let lock_key_spawn = lock_key.clone();
-    let lock_key_cleanup = lock_key.clone();
     let lock_key_close = lock_key.clone();
 
     let result = tauri::async_runtime::spawn_blocking(move || {
@@ -1396,11 +1460,6 @@ async fn launch_version(
     })
     .await
     .map_err(|e| e.to_string())?;
-
-    // Si falló, quitar de running.
-    if result.is_err() {
-        running.release(&lock_key_cleanup);
-    }
 
     result
 }
@@ -1443,12 +1502,10 @@ async fn launch_instance_inner(
         paths.ensure_saves_link(&instance_dir)?;
     }
 
-    // No lanzar si la instancia tiene una transacción de contenido pendiente.
-    // La instancia legacy (.minecraft) no se recupera aquí.
-    if !is_legacy_instance(&id) {
-        fsx::recover_with_journal(&instance_dir)
-            .map_err(|e| format!("La instancia {} no está recuperada: {}", id, e))?;
-    }
+    // Recuperar journal antes de descargar versiones, librerías o assets.
+    // También se ejecuta en instancias legacy (.minecraft).
+    fsx::recover_with_journal(&instance_dir)
+        .map_err(|e| format!("La instancia {} no se pudo recuperar: {}", id, e))?;
     // Leer el perfil y resolver versión, RAM, Java y fullscreen del backend.
     let profiles = read_json_list::<Profile>(&paths.profiles_file())?;
     let profile = profiles
@@ -1746,12 +1803,21 @@ fn install_forge(
 
 /// Comando Tauri: resuelve la versión del loader para un par (loader, versión de MC).
 /// Usado por el frontend antes de guardar un perfil o lanzar el juego.
+///
+/// `resolve_loader_version` usa `reqwest::blocking` (red síncrona), por lo que se
+/// ejecuta en `spawn_blocking` para no bloquear el worker async de Tauri ni
+/// provocar el panic "Cannot drop a runtime in a context where blocking is not
+/// allowed".
 #[tauri::command]
 async fn resolve_loader_version_cmd(
     loader: String,
     mc_version: String,
 ) -> Result<Option<String>, String> {
-    loader_version::resolve_loader_version(&loader, &mc_version)
+    tokio::task::spawn_blocking(move || {
+        loader_version::resolve_loader_version(&loader, &mc_version)
+    })
+    .await
+    .map_err(|e| format!("Error resolviendo versión del loader: {e}"))?
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -2513,6 +2579,11 @@ async fn collect_candidates(
 fn installed_mods(instance_root: &Path) -> Result<Vec<dependencies::InstalledMod>, String> {
     Ok(content::read_index(instance_root, "mods")?
         .into_iter()
+        .filter(|e| {
+            // Filtrar entradas cuyo archivo ya no existe en disco
+            let file_path = instance_root.join("mods").join(&e.filename);
+            file_path.is_file()
+        })
         .map(|e| dependencies::InstalledMod {
             slug: e.slug,
             project_id: e.project_id,
@@ -2867,9 +2938,9 @@ async fn install_mod(
                 &dep_instance,
             )
             .await?;
-            Ok::<(String, String, Option<String>, Vec<u8>), String>(
-                (dep_slug, filename, sha1, bytes),
-            )
+            Ok::<(String, String, Option<String>, Vec<u8>), String>((
+                dep_slug, filename, sha1, bytes,
+            ))
         });
     }
 
@@ -2890,9 +2961,12 @@ async fn install_mod(
             &root_instance,
         )
         .await?;
-        Ok::<(String, String, Option<String>, Vec<u8>), String>(
-            (slug_dl, root_filename.clone(), root_sha1.clone(), bytes),
-        )
+        Ok::<(String, String, Option<String>, Vec<u8>), String>((
+            slug_dl,
+            root_filename.clone(),
+            root_sha1.clone(),
+            bytes,
+        ))
     });
 
     // Esperar a que todas las descargas terminen. Si alguna falla, no se
@@ -2975,13 +3049,9 @@ async fn install_mod(
     let mods_dir_batch = mods_dir.clone();
     install_progress(&app, "applying", &slug, &instance, 0, 1);
     spawn_blocking_result(move || {
-        fsx::apply_batch_transactional(
-            &instance_root_batch,
-            "mods",
-            &mods_dir_batch,
-            batch_items,
-        )
-    }).await?;
+        fsx::apply_batch_transactional(&instance_root_batch, "mods", &mods_dir_batch, batch_items)
+    })
+    .await?;
     install_progress(&app, "applying", &slug, &instance, 1, 1);
 
     // Iconos en segundo plano: no bloquea el retorno de install_mod.
@@ -2990,10 +3060,7 @@ async fn install_mod(
     let client_icon = client.clone();
     let instance_root_icon = instance_root.clone();
     let slug_icon_root = slug.clone();
-    let dep_slugs_icon: Vec<String> = deps_to_download
-        .iter()
-        .map(|d| d.slug.clone())
-        .collect();
+    let dep_slugs_icon: Vec<String> = deps_to_download.iter().map(|d| d.slug.clone()).collect();
     let all_icon_slugs: Vec<String> = std::iter::once(slug_icon_root.clone())
         .chain(dep_slugs_icon.into_iter())
         .collect();
@@ -3005,12 +3072,9 @@ async fn install_mod(
                     let instance_root_icon_c1 = instance_root_icon.clone();
                     let icons_c1 = icons.clone();
                     if let Err(e) = spawn_blocking_result(move || {
-                        fsx::update_entry_icons(
-                            &instance_root_icon_c1,
-                            "mods",
-                            &icons_c1,
-                        )
-                    }).await
+                        fsx::update_entry_icons(&instance_root_icon_c1, "mods", &icons_c1)
+                    })
+                    .await
                     {
                         log_performance(&format!(
                             "[install_mod] {} icono_batch_error: {}",
@@ -3103,7 +3167,7 @@ async fn install_mod(
         .0
         .clone();
 
-    Ok(format!("Mod instalado: {filename}"))
+    Ok(filename)
 }
 
 #[tauri::command]
@@ -3208,15 +3272,8 @@ async fn download_project_file(
         _ => return Err("Nombre de archivo sospechoso".to_string()),
     }
 
-    let (bytes, _dl_sha1) = download_with_progress(
-        &client,
-        &file_url,
-        None,
-        app,
-        slug,
-        instance,
-    )
-    .await?;
+    let (bytes, _dl_sha1) =
+        download_with_progress(&client, &file_url, None, app, slug, instance).await?;
 
     let sha1 = file
         .get("hashes")
@@ -3266,7 +3323,8 @@ async fn download_project_file(
                 entry,
             }],
         )
-    }).await?;
+    })
+    .await?;
     install_progress(app, "applying", slug, instance, 1, 1);
 
     // Ícono en segundo plano: no bloquea el retorno de download_project_file.
@@ -3287,15 +3345,18 @@ async fn download_project_file(
                             &kind_for_index_icon,
                             &icons_c1,
                         )
-                    }).await;
+                    })
+                    .await;
                     log_performance(&format!(
                         "[download_project_file] {} icono_batch_ok: {:?}",
-                        slug_icon, t_icon.elapsed()
+                        slug_icon,
+                        t_icon.elapsed()
                     ));
                 } else {
                     log_performance(&format!(
                         "[download_project_file] {} icono_batch_sin_iconos: {:?}",
-                        slug_icon, t_icon.elapsed()
+                        slug_icon,
+                        t_icon.elapsed()
                     ));
                 }
             }
@@ -3349,16 +3410,14 @@ fn get_block_texture(
 fn get_total_ram() -> Result<u64, String> {
     #[cfg(windows)]
     {
-        if let Ok(out) = new_cmd("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory",
-            ])
-            .output()
-        {
-            let text = String::from_utf8_lossy(&out.stdout);
-            if let Ok(bytes) = text.trim().parse::<u64>() {
+        unsafe {
+            let mut mem: windows_sys::Win32::System::SystemInformation::MEMORYSTATUSEX =
+                std::mem::zeroed();
+            mem.dwLength = std::mem::size_of::<
+                windows_sys::Win32::System::SystemInformation::MEMORYSTATUSEX,
+            >() as u32;
+            if windows_sys::Win32::System::SystemInformation::GlobalMemoryStatusEx(&mut mem) != 0 {
+                let bytes = mem.ullTotalPhys;
                 let gb = (bytes + 512 * 1024 * 1024) / (1024 * 1024 * 1024);
                 return Ok(gb.max(2));
             }
@@ -3748,6 +3807,8 @@ mod tests {
         let a = paths.instance_dir("A").unwrap();
         fs::create_dir_all(a.join("mods")).unwrap();
         fs::create_dir_all(a.join(".obsidia")).unwrap();
+        // Crear el archivo físico para que la entrada sea válida
+        fs::write(a.join("mods").join("lib.jar"), b"contenido").unwrap();
         content::write_index(
             &a,
             "mods",
@@ -3774,6 +3835,51 @@ mod tests {
             fs::read_to_string(a.join(".obsidia").join("mods.json")).unwrap(),
             before
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn installed_mods_filtra_entradas_sin_archivo() {
+        let (root, paths) = temp_paths("inst-filtro");
+        let a = paths.instance_dir("A").unwrap();
+        fs::create_dir_all(a.join("mods")).unwrap();
+        fs::create_dir_all(a.join(".obsidia")).unwrap();
+        // Una entrada con archivo existente y otra sin archivo
+        fs::write(a.join("mods").join("existe.jar"), b"contenido").unwrap();
+        content::write_index(
+            &a,
+            "mods",
+            &[
+                content::ContentEntry {
+                    slug: "existe".to_string(),
+                    project_id: None,
+                    version_id: "v1".to_string(),
+                    filename: "existe.jar".to_string(),
+                    sha1: None,
+                    loader: None,
+                    mc_version: None,
+                    icon_url: None,
+                    source: "modrinth".to_string(),
+                    managed_by_obsidia: true,
+                },
+                content::ContentEntry {
+                    slug: "no_existe".to_string(),
+                    project_id: None,
+                    version_id: "v2".to_string(),
+                    filename: "no_existe.jar".to_string(),
+                    sha1: None,
+                    loader: None,
+                    mc_version: None,
+                    icon_url: None,
+                    source: "modrinth".to_string(),
+                    managed_by_obsidia: true,
+                },
+            ],
+        )
+        .unwrap();
+        let got = installed_mods(&a).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].slug, "existe");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -5727,5 +5833,148 @@ mod tests {
 
         let _ = fs::remove_dir_all(&root);
     }
-}
 
+    // ───────── RunningInstances: liberación de reservas ─────────
+
+    #[test]
+    fn running_reserve_ok_future_keeps_reserva() {
+        let ri = launcher::RunningInstances::default();
+        assert!(ri.reserve("A"));
+        // Camino Ok: la reserva se mantiene activa.
+        assert!(ri.is_running("A"));
+        ri.release("A");
+        assert!(!ri.is_running("A"));
+    }
+
+    #[test]
+    fn running_reserve_err_future_libera_reserva() {
+        let ri = launcher::RunningInstances::default();
+        assert!(ri.reserve("A"));
+        // Camino Err: se libera la reserva aunque el futuro falló.
+        ri.release("A");
+        assert!(!ri.is_running("A"));
+        // La clave queda disponible para una nueva reserva.
+        assert!(ri.reserve("A"));
+        ri.release("A");
+    }
+
+    #[test]
+    fn running_reserve_segunda_falla_mientras_reservada() {
+        let ri = launcher::RunningInstances::default();
+        assert!(ri.reserve("A"));
+        // Segunda reserva de la misma clave debe fallar.
+        assert!(!ri.reserve("A"));
+        assert!(ri.is_running("A"));
+        ri.release("A");
+        // Tras liberar, se puede reservar de nuevo.
+        assert!(ri.reserve("A"));
+        ri.release("A");
+    }
+
+    #[test]
+    fn running_mutex_envenenado_no_bloquea_reserva() {
+        let ri = std::sync::Arc::new(launcher::RunningInstances::default());
+        let ri_hilo = std::sync::Arc::clone(&ri);
+        // Envenenar el mutex: hacer panic mientras se tiene el lock.
+        let resultado = std::thread::spawn(move || {
+            let guard = ri_hilo.0.lock().unwrap();
+            drop(guard);
+            panic!("mutex envenenado");
+        })
+        .join();
+        assert!(resultado.is_err(), "el hilo debió hacer panic");
+
+        // Aun así se puede reservar, consultar estado, actualizar PID y liberar
+        // (recuperación por into_inner).
+        assert!(ri.reserve("B"));
+        assert!(ri.is_running("B"));
+        ri.set_pid("B", 1234);
+        assert!(ri.is_running("B"));
+        assert!(ri.release_if_matches("B", 1234));
+        assert!(!ri.is_running("B"));
+
+        // Liberar mediante release (método incondicional) también después del
+        // envenenamiento del mutex.
+        assert!(ri.reserve("C"));
+        ri.set_pid("C", 5678);
+        assert!(ri.is_running("C"));
+        ri.release("C");
+        assert!(!ri.is_running("C"));
+    }
+
+    // ───────── fsx::recover_with_journal en instancias legacy ─────────
+
+    #[test]
+    fn recover_legacy_sin_obsidia_no_crea_archivos() {
+        use crate::fsx;
+        let dir = tmp_dir("legacy-sin-obsidia");
+        let inst_dir = dir.join("legacy");
+        fs::create_dir_all(&inst_dir).unwrap();
+
+        let antes = fs::read_dir(&inst_dir).unwrap().count();
+        let res = fsx::recover_with_journal(&inst_dir);
+        assert!(res.is_ok());
+        // No debe haber creado archivos ni carpetas extra.
+        let despues = fs::read_dir(&inst_dir).unwrap().count();
+        assert_eq!(antes, despues);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_legacy_con_journal_pendiente() {
+        use crate::fsx;
+        let dir = tmp_dir("legacy-pendiente");
+        let inst_dir = dir.join("legacy");
+        fs::create_dir_all(inst_dir.join(".obsidia")).unwrap();
+        // Journal con una entrada pendiente de install.
+        let je = fsx::JournalEntry {
+            op: "install".to_string(),
+            kind: "mods".to_string(),
+            slug: "mod-prueba".to_string(),
+            filename: "mod-prueba.jar".to_string(),
+            old_filename: None,
+            version_id: Some("v1".to_string()),
+            sha1: None,
+            new_hash: None,
+            prev_hash: None,
+        };
+        let journal = fsx::Journal { pending: vec![je] };
+        let journal_json = serde_json::to_string_pretty(&journal).unwrap();
+        fs::write(inst_dir.join(".obsidia").join("journal.json"), journal_json).unwrap();
+        assert!(!fsx::read_journal(&inst_dir).unwrap().pending.is_empty());
+
+        let res = fsx::recover_with_journal(&inst_dir);
+        assert!(res.is_ok());
+        let journal = fsx::read_journal(&inst_dir).unwrap();
+        assert!(
+            journal.pending.is_empty(),
+            "el journal debe quedar vacía tras recuperar"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_error_impedir_lanzamiento_y_deja_reserva_disponible() {
+        use crate::fsx;
+        let ri = launcher::RunningInstances::default();
+        let dir = tmp_dir("legacy-error-recover");
+        let inst_dir = dir.join("legacy");
+        fs::create_dir_all(inst_dir.join(".obsidia")).unwrap();
+        // Journal corrupto: la recuperación debe fallar.
+        fs::write(inst_dir.join(".obsidia").join("journal.json"), "{ corrupto").unwrap();
+
+        let res = fsx::recover_with_journal(&inst_dir);
+        assert!(
+            res.is_err(),
+            "la recuperación debe fallar con journal corrupto"
+        );
+
+        // Aun así, RunningInstances debe permitir reservar la instancia.
+        let lock_key = "legacy:.minecraft".to_string();
+        assert!(ri.reserve(&lock_key));
+        assert!(ri.is_running(&lock_key));
+        ri.release(&lock_key);
+        assert!(!ri.is_running(&lock_key));
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

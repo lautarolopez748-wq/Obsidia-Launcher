@@ -120,6 +120,37 @@ fn visit(
         return Err(incompatible_msg(slug, mc_version, loader));
     }
 
+    // Si la dependencia requiere una versión específica diferente a la
+    // resuelta, verificar si esa versión ya está instalada y compatible
+    // con el perfil actual. Si no, abortar con error claro.
+    if let Some(required_v) = required_version {
+        if meta.version_id != required_v {
+            let installed_ok = installed.iter().any(|e| {
+                let meta_identity = meta.project_id.as_deref().unwrap_or(slug);
+                let installed_identity = e.project_id.as_deref().unwrap_or(&e.slug);
+                installed_identity == meta_identity
+                    && e.version_id == required_v
+                    && e.mc_version.as_ref().map_or(false, |v| v == mc_version)
+                    && e.loader.as_ref().map_or(false, |v| v == loader)
+            });
+            if installed_ok {
+                plan.push(DependencyPlan {
+                    slug: slug.to_string(),
+                    project_id: meta.project_id.clone(),
+                    version_id: required_v.to_string(),
+                    filename: meta.filename.clone(),
+                    already_installed: true,
+                });
+                visited.remove(slug);
+                return Ok(());
+            }
+            return Err(format!(
+                "La dependencia {slug} requiere la versión {required_v}, pero la versión compatible resuelta es {}. Instalá esa dependencia manualmente.",
+                meta.version_id
+            ));
+        }
+    }
+
     for dep in &meta.dependencies {
         if dep.dependency_type != "required" {
             continue;
@@ -545,5 +576,146 @@ mod tests {
         let mut changed_root = plan.clone();
         changed_root.version_id = "v-main-2".to_string();
         assert!(!plan_matches(&plan, &changed_root));
+    }
+
+    #[test]
+    fn version_requerida_no_instalada_es_error() {
+        let c = candidates(vec![
+            (
+                "main",
+                VersionMetadata {
+                    project_id: None,
+                    version_id: "v-main".to_string(),
+                    filename: "main.jar".to_string(),
+                    game_versions: vec![MC.to_string()],
+                    loaders: vec![LOADER.to_string()],
+                    dependencies: vec![DependencyMetadata {
+                        project_id: "lib".to_string(),
+                        dependency_type: "required".to_string(),
+                        version_id: Some("v-old".to_string()),
+                    }],
+                    file_url: None,
+                    file_sha1: None,
+                },
+            ),
+            ("lib", meta("v-lib", "lib.jar", &[])),
+        ]);
+        let err = resolve_dependencies("main", &c, MC, LOADER, &[]).unwrap_err();
+        assert!(
+            err.contains("requiere la versión v-old"),
+            "error inesperado: {err}"
+        );
+        assert!(err.contains("v-lib"), "error inesperado: {err}");
+    }
+
+    #[test]
+    fn version_requerida_igual_a_resuelta_es_ok() {
+        let c = candidates(vec![
+            (
+                "main",
+                VersionMetadata {
+                    project_id: None,
+                    version_id: "v-main".to_string(),
+                    filename: "main.jar".to_string(),
+                    game_versions: vec![MC.to_string()],
+                    loaders: vec![LOADER.to_string()],
+                    dependencies: vec![DependencyMetadata {
+                        project_id: "lib".to_string(),
+                        dependency_type: "required".to_string(),
+                        version_id: Some("v-lib".to_string()),
+                    }],
+                    file_url: None,
+                    file_sha1: None,
+                },
+            ),
+            ("lib", meta("v-lib", "lib.jar", &[])),
+        ]);
+        let plan = resolve_dependencies("main", &c, MC, LOADER, &[]).unwrap();
+        assert_eq!(plan[0].slug, "lib");
+        assert_eq!(plan[0].version_id, "v-lib");
+        assert!(!plan[0].already_installed);
+    }
+
+    #[test]
+    fn version_requerida_instalada_y_compatible_ya_instalada() {
+        let c = candidates(vec![
+            (
+                "main",
+                VersionMetadata {
+                    project_id: None,
+                    version_id: "v-main".to_string(),
+                    filename: "main.jar".to_string(),
+                    game_versions: vec![MC.to_string()],
+                    loaders: vec![LOADER.to_string()],
+                    dependencies: vec![DependencyMetadata {
+                        project_id: "lib".to_string(),
+                        dependency_type: "required".to_string(),
+                        version_id: Some("v-old".to_string()),
+                    }],
+                    file_url: None,
+                    file_sha1: None,
+                },
+            ),
+            (
+                "lib",
+                VersionMetadata {
+                    project_id: None,
+                    version_id: "v-lib".to_string(),
+                    filename: "lib.jar".to_string(),
+                    game_versions: vec![MC.to_string()],
+                    loaders: vec![LOADER.to_string()],
+                    dependencies: vec![],
+                    file_url: None,
+                    file_sha1: None,
+                },
+            ),
+        ]);
+        let installed = vec![InstalledMod {
+            slug: "lib".to_string(),
+            project_id: None,
+            version_id: "v-old".to_string(),
+            mc_version: Some(MC.to_string()),
+            loader: Some(LOADER.to_string()),
+        }];
+        let plan = resolve_dependencies("main", &c, MC, LOADER, &installed).unwrap();
+        assert_eq!(plan[0].slug, "lib");
+        assert_eq!(plan[0].version_id, "v-old");
+        assert!(plan[0].already_installed);
+    }
+
+    #[test]
+    fn version_requerida_instalada_sin_mc_version_es_error() {
+        let c = candidates(vec![
+            (
+                "main",
+                VersionMetadata {
+                    project_id: None,
+                    version_id: "v-main".to_string(),
+                    filename: "main.jar".to_string(),
+                    game_versions: vec![MC.to_string()],
+                    loaders: vec![LOADER.to_string()],
+                    dependencies: vec![DependencyMetadata {
+                        project_id: "lib".to_string(),
+                        dependency_type: "required".to_string(),
+                        version_id: Some("v-old".to_string()),
+                    }],
+                    file_url: None,
+                    file_sha1: None,
+                },
+            ),
+            ("lib", meta("v-lib", "lib.jar", &[])),
+        ]);
+        let installed = vec![InstalledMod {
+            slug: "lib".to_string(),
+            project_id: None,
+            version_id: "v-old".to_string(),
+            mc_version: None,
+            loader: Some(LOADER.to_string()),
+        }];
+        let err = resolve_dependencies("main", &c, MC, LOADER, &installed).unwrap_err();
+        assert!(
+            err.contains("requiere la versión v-old"),
+            "error inesperado: {err}"
+        );
     }
 }

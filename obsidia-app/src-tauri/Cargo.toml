@@ -31,6 +31,8 @@ md5 = "0.7"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 tokio = { version = "1", features = ["time", "rt-multi-thread", "macros", "sync"] }
 futures-util = "0.3"
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation", "Win32_Foundation"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

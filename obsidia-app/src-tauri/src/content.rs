@@ -280,8 +280,7 @@ static UPDATE_CACHE: std::sync::OnceLock<
     std::sync::Mutex<HashMap<String, (bool, std::time::Instant)>>,
 > = std::sync::OnceLock::new();
 
-fn update_cache()
--> &'static std::sync::Mutex<HashMap<String, (bool, std::time::Instant)>> {
+fn update_cache() -> &'static std::sync::Mutex<HashMap<String, (bool, std::time::Instant)>> {
     UPDATE_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
@@ -1131,7 +1130,7 @@ mod tests {
         let resultados = map_batch_updates(&indexed, &to_query, &response);
 
         let mapa: HashMap<usize, bool> = resultados.into_iter().collect();
-        assert_eq!(mapa[&0], true);  // a: id diferente → actualización
+        assert_eq!(mapa[&0], true); // a: id diferente → actualización
         assert_eq!(mapa[&1], false); // b: id igual → sin actualización
         assert_eq!(mapa[&2], false); // c: local → sin actualización
         assert_eq!(mapa[&3], false); // d: sin sha → sin actualización

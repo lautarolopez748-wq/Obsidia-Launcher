@@ -131,12 +131,12 @@ export function resCard(kind, r, busy, installedFile, progress) {
   let btnLabel = 'Instalar';
   let btnDisabled = false;
   if (progress){
-    if (progress.stage === 'resolving'){ btnLabel = 'Resolviendo dependencias…'; btnDisabled = true; }
+    if (progress.stage === 'resolving'){ btnLabel = 'Instalar'; btnDisabled = true; }
     else if (progress.stage === 'downloading'){
       const pct = progress.total > 0 ? Math.round(100 * progress.done / progress.total) : 0;
       btnLabel = `Descargando ${pct} %`; btnDisabled = true;
     }
-    else if (progress.stage === 'applying'){ btnLabel = 'Instalando…'; btnDisabled = true; }
+    else if (progress.stage === 'applying'){ btnLabel = 'Instalar'; btnDisabled = true; }
   }
   if (btnDisabled || busy){ btnDisabled = true; }
   if (inst){ btnLabel = 'Instalado ✓'; }
@@ -144,5 +144,5 @@ export function resCard(kind, r, busy, installedFile, progress) {
 }
 
 export function irisBanner(busy) {
-  return `<div class="gl" style="grid-column:1/-1;display:flex;justify-content:space-between;align-items:center;gap:16px;padding:16px 20px;border-color:rgba(251,191,36,.45)"><div><b>Los shaders necesitan Iris Shaders</b><div class="mu">Instalalo en este perfil (necesita Fabric) para poder activarlos.</div></div><button class="ib" style="margin:0;padding:0 22px" ${busy?'disabled':''} data-act="inst" data-kind="mods" data-slug="iris">${busy?'Instalando…':'Instalar Iris'}</button></div>`;
+  return `<div class="gl" style="grid-column:1/-1;display:flex;justify-content:space-between;align-items:center;gap:16px;padding:16px 20px;border-color:rgba(251,191,36,.45)"><div><b>Los shaders necesitan Iris Shaders</b><div class="mu">Instalalo en este perfil (necesita Fabric) para poder activarlos.</div></div><button class="ib" style="margin:0;padding:0 22px" ${busy?'disabled':''} data-act="inst" data-kind="mods" data-slug="iris">Instalar Iris</button></div>`;
 }

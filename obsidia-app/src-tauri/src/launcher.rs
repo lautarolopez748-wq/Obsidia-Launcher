@@ -34,7 +34,7 @@ impl RunningInstances {
     /// Intenta reservar una instancia. Devuelve `true` si la reserva se hizo,
     /// `false` si ya estaba en ejecución.
     pub fn reserve(&self, id: &str) -> bool {
-        let mut guard = self.0.lock().unwrap();
+        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if guard.contains_key(id) {
             return false;
         }
@@ -44,9 +44,8 @@ impl RunningInstances {
 
     /// Registrar el PID real de una instancia ya reservada.
     pub fn set_pid(&self, id: &str, pid: u32) {
-        if let Ok(mut guard) = self.0.lock()
-            && let Some(entry) = guard.get_mut(id)
-        {
+        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = guard.get_mut(id) {
             *entry = pid;
         }
     }
@@ -54,10 +53,11 @@ impl RunningInstances {
     /// Liberar la reserva de una instancia si el PID coincide.
     /// Devuelve `true` si liberó, `false` si el PID era de otro proceso.
     pub fn release_if_matches(&self, id: &str, pid: u32) -> bool {
-        if let Ok(mut guard) = self.0.lock()
-            && let Some(&existing) = guard.get(id)
-            && (existing == pid || existing == 0)
-        {
+        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(&existing) = guard.get(id) else {
+            return false;
+        };
+        if existing == pid || existing == 0 {
             guard.remove(id);
             return true;
         }
@@ -66,15 +66,17 @@ impl RunningInstances {
 
     /// Liberar la reserva incondicionalmente (para errores de lanzamiento).
     pub fn release(&self, id: &str) {
-        if let Ok(mut guard) = self.0.lock() {
-            guard.remove(id);
-        }
+        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        guard.remove(id);
     }
 
     /// Verificar si una instancia está en ejecución.
     #[allow(dead_code)]
     pub fn is_running(&self, id: &str) -> bool {
-        self.0.lock().unwrap().contains_key(id)
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(id)
     }
 }
 

@@ -800,9 +800,66 @@ pub fn write_atomic_prehashed(dest: &Path, bytes: &[u8], new_hash: &str) -> Resu
     Ok(())
 }
 
+/// Restaura un archivo a su contenido previo y verifica que la restauración
+/// haya tenido éxito. Si `prev` es `None`, el archivo no existía previamente,
+/// así que se elimina y se verifica que ya no exista.
+/// Devuelve un error si la restauración no pudo verificarse.
+fn restaurar_y_verificar(dest: &Path, prev: &Option<Vec<u8>>) -> Result<(), String> {
+    match prev {
+        Some(old) => {
+            fs::write(dest, old).map_err(|e| format!("restaurar archivo: {e}"))?;
+            let actual = fs::read(dest).map_err(|e| format!("leer tras restaurar: {e}"))?;
+            if actual != *old {
+                return Err("restauración falló: contenido no coincide tras escribir".to_string());
+            }
+        }
+        None => {
+            if dest.exists() {
+                fs::remove_file(dest).map_err(|e| format!("eliminar archivo: {e}"))?;
+            }
+            if dest.exists() {
+                return Err("restauración falló: archivo no se pudo eliminar".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Retira del journal las entradas de los ítems cuyos índices están en
+/// `indices_revertidos` (revertidos con éxito) o que nunca se tocaron
+/// (`indices_escritos` no los contiene). Las entradas de ítems que se
+/// escribieron pero cuyo rollback falló (están en `indices_escritos` pero no
+/// en `indices_revertidos`) se conservan en el journal para recuperación
+/// posterior.
+fn retirar_entradas_journal(
+    instance_dir: &Path,
+    items: &[BatchItem],
+    indices_revertidos: &std::collections::HashSet<usize>,
+    indices_escritos: &std::collections::HashSet<usize>,
+) -> Result<(), String> {
+    let mut journal = read_journal(instance_dir).unwrap_or_else(|_| Journal::default());
+    for (i, item) in items.iter().enumerate() {
+        // Retirar si: se revirtió con éxito O nunca se escribió (falló antes
+        // de tocar el archivo). Conservar solo si se escribió y el rollback
+        // falló (estado dudoso).
+        if indices_revertidos.contains(&i) || !indices_escritos.contains(&i) {
+            journal
+                .pending
+                .retain(|e| !(e.slug == item.entry.slug && e.filename == item.entry.filename));
+        }
+    }
+    write_journal(instance_dir, &journal)?;
+    Ok(())
+}
+
 /// Aplica varias actualizaciones transaccionalmente bajo un único lock de
 /// instancia. Toma el lock una vez, recupera el journal una vez, lee el índice
 /// una vez, escribe el journal una vez y escribe el índice una vez.
+///
+/// Todas las validaciones (SHA1, nombres de archivo) se hacen ANTES de tocar
+/// el disco o escribir el journal. Si falla una escritura, se hace rollback
+/// verificado de cada archivo modificado y se conserva el journal para las
+/// entradas cuyo estado no se pueda confirmar.
 pub fn apply_batch_transactional(
     instance_dir: &Path,
     kind: &str,
@@ -835,6 +892,7 @@ pub fn apply_batch_transactional(
     }
 
     // 4. Construir entradas del journal y leer contenido previo de cada dest.
+    //    También calcular new_hash para cada ítem.
     let mut journal_entries: Vec<JournalEntry> = Vec::with_capacity(items.len());
     let mut prev_contents: Vec<Option<Vec<u8>>> = Vec::with_capacity(items.len());
     let mut new_hashes: Vec<String> = Vec::with_capacity(items.len());
@@ -847,16 +905,24 @@ pub fn apply_batch_transactional(
             None
         };
         let prev_hash = old_content.as_ref().map(|b| sha1_hex(b));
-        let old_filename = entries
+        let old_entry = entries
             .iter()
             .find(|e| e.slug == item.entry.slug)
-            .map(|e| e.filename.clone());
+            .or_else(|| {
+                item.entry.project_id.as_ref().and_then(|pid| {
+                    entries
+                        .iter()
+                        .find(|e| e.project_id.as_deref() == Some(pid) && e.slug != item.entry.slug)
+                })
+            });
+        let old_filename = old_entry.map(|e| e.filename.clone());
+        let old_slug = old_entry.map(|e| e.slug.clone());
         let new_hash = sha1_hex(&item.bytes);
 
         let journal_entry = JournalEntry {
             op: "install".to_string(),
             kind: kind.to_string(),
-            slug: item.entry.slug.clone(),
+            slug: old_slug.clone().unwrap_or_else(|| item.entry.slug.clone()),
             filename: item.entry.filename.clone(),
             old_filename: old_filename.clone(),
             version_id: Some(item.entry.version_id.clone()),
@@ -871,120 +937,141 @@ pub fn apply_batch_transactional(
         old_filenames.push(old_filename);
     }
 
-    // 5. Escribir journal una sola vez con todas las entradas pendientes.
-    let mut journal = read_journal(instance_dir)?;
-    journal.pending.extend(journal_entries.clone());
-    write_journal(instance_dir, &journal)?;
-
-    // 6. Escribir cada archivo con write_atomic en el orden recibido.
-    //    Si alguno falla, revertir los ya escritos y retirar sus entradas del journal.
-    let mut written: Vec<usize> = Vec::new();
+    // 5. VALIDAR SHA1 de todos los ítems ANTES de tocar el disco o escribir el journal.
+    //    Si algún expected_sha1 no coincide con el new_hash calculado, devolver
+    //    error sin modificar nada.
     for (i, item) in items.iter().enumerate() {
-        // Verificar SHA-1 si se proviene uno esperado (no recalcular: usamos new_hashes[i]).
         if let Some(expected) = &item.expected_sha1
             && !new_hashes[i].eq_ignore_ascii_case(expected)
         {
-            // Revertir archivos ya escritos (índices 0..i).
-            for &j in &written {
-                let dest = &items[j].dest;
-                match &prev_contents[j] {
-                    Some(old) => {
-                        let _ = fs::write(dest, old);
-                    }
-                    None => {
-                        let _ = fs::remove_file(dest);
-                    }
-                }
-            }
-            let mut journal = read_journal(instance_dir).unwrap_or_else(|_| Journal::default());
-            // Retirar del journal las entradas de TODOS los ítems del lote
-            // (ninguna debe quedar pendiente ante un fallo).
-            for item in &items {
-                journal.pending.retain(|e| {
-                    !(e.slug == item.entry.slug && e.filename == item.entry.filename)
-                });
-            }
-            let _ = write_journal(instance_dir, &journal);
             return Err(format!(
                 "El archivo descargado no coincide con su SHA1: se descartó"
             ));
         }
+    }
+
+    // 6. Escribir journal una sola vez con todas las entradas pendientes.
+    let mut journal = read_journal(instance_dir)?;
+    journal.pending.extend(journal_entries.clone());
+    write_journal(instance_dir, &journal)?;
+
+    // 7. Escribir cada archivo con write_atomic_prehashed en el orden recibido.
+    //    Si alguno falla, hacer rollback verificado de los ya escritos.
+    let mut written: Vec<usize> = Vec::new();
+    for (i, item) in items.iter().enumerate() {
         if let Err(e) = write_atomic_prehashed(&item.dest, &item.bytes, &new_hashes[i]) {
-            // Revertir archivos ya escritos (índices 0..i).
+            // Rollback verificado de archivos ya escritos (0..i).
+            let mut revertidos: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            let mut _rollback_fallo = false;
             for &j in &written {
-                let dest = &items[j].dest;
-                match &prev_contents[j] {
-                    Some(old) => {
-                        let _ = fs::write(dest, old);
+                match restaurar_y_verificar(&items[j].dest, &prev_contents[j]) {
+                    Ok(()) => {
+                        revertidos.insert(j);
                     }
-                    None => {
-                        let _ = fs::remove_file(dest);
+                    Err(_restore_e) => {
+                        _rollback_fallo = true;
                     }
                 }
             }
-            // Retirar del journal las entradas de TODOS los ítems del lote.
-            let mut journal = read_journal(instance_dir).unwrap_or_else(|_| Journal::default());
-            for item in &items {
-                journal.pending.retain(|e| {
-                    !(e.slug == item.entry.slug && e.filename == item.entry.filename)
-                });
-            }
-            let _ = write_journal(instance_dir, &journal);
-            return Err(e);
+            // Retirar del journal solo las entradas de ítems revertidos con éxito
+            // o que nunca se escribieron. Las entradas de ítems cuyo rollback
+            // falló se conservan para recuperación posterior.
+            let escritos: std::collections::HashSet<usize> = written.iter().copied().collect();
+            retirar_entradas_journal(instance_dir, &items, &revertidos, &escritos)?;
+            return Err(format!(
+                "Fallo escribiendo archivo {}: {}",
+                item.entry.slug, e
+            ));
         }
         written.push(i);
     }
 
-    // 7. Actualizar el índice en memoria y escribirlo una sola vez.
+    // 8. Actualizar el índice en memoria y escribirlo una sola vez.
     for item in items.iter() {
         let new_entry = item.entry.clone();
-        if let Some(pos) = entries.iter().position(|e| e.slug == new_entry.slug) {
-            entries[pos] = new_entry;
-        } else {
-            entries.push(new_entry);
+        let insert_pos = entries
+            .iter()
+            .position(|e| e.slug == new_entry.slug)
+            .or_else(|| {
+                new_entry.project_id.as_ref().and_then(|pid| {
+                    entries.iter().position(|e| {
+                        e.project_id.as_deref() == Some(pid) && e.slug != new_entry.slug
+                    })
+                })
+            });
+        match insert_pos {
+            Some(pos) => entries[pos] = new_entry,
+            None => entries.push(new_entry),
         }
     }
     if let Err(e) = content::write_index(instance_dir, kind, &entries) {
-        // Restaurar todos los archivos del lote como hace el camino individual.
-        for (i, item) in items.iter().enumerate() {
-            match &prev_contents[i] {
-                Some(old) => {
-                    let _ = fs::write(&item.dest, old);
+        // Rollback verificado de TODOS los archivos escritos.
+        let mut revertidos: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut rollback_fallo = false;
+        for i in 0..items.len() {
+            match restaurar_y_verificar(&items[i].dest, &prev_contents[i]) {
+                Ok(()) => {
+                    revertidos.insert(i);
                 }
-                None => {
-                    let _ = fs::remove_file(&item.dest);
+                Err(_restore_e) => {
+                    rollback_fallo = true;
                 }
             }
         }
-        return Err(format!("Índice no actualizado, archivos restaurados: {e}"));
+        // Retirar del journal solo las entradas de ítems revertidos con éxito
+        // o que nunca se tocaron. Las entradas de ítems cuyo rollback falló se
+        // conservan para recuperación posterior.
+        let todos_escritos: std::collections::HashSet<usize> = (0..items.len()).collect();
+        if rollback_fallo {
+            return Err(format!(
+                "Índice no actualizado ({e}); rollback incompleto, journal conservado"
+            ));
+        }
+        retirar_entradas_journal(instance_dir, &items, &revertidos, &todos_escritos)?;
+        return Err(format!("Índice no actualizado ({e}); archivos restaurados"));
     }
 
-    // 8. Si cambió el filename, borrar el anterior (solo si lo gestiona Obsidia).
+    // 9. Si cambió el filename, borrar el anterior (solo si lo gestiona Obsidia).
+    //    Se usa el valor anterior de managed_by_obsidia, no el nuevo.
     for (i, item) in items.iter().enumerate() {
         if let Some(old_name) = &old_filenames[i] {
-            if old_name != &item.entry.filename && item.entry.managed_by_obsidia {
-                let old_path = subdir.join(old_name);
-                if old_path.exists() {
-                    let _ = fs::remove_file(&old_path);
+            if old_name != &item.entry.filename {
+                let old_managed = entries
+                    .iter()
+                    .find(|e| e.slug == item.entry.slug)
+                    .map(|e| e.managed_by_obsidia)
+                    .unwrap_or(false);
+                if old_managed {
+                    let old_path = subdir.join(old_name);
+                    if old_path.exists() {
+                        match fs::remove_file(&old_path) {
+                            Ok(()) => {}
+                            Err(e) => {
+                                return Err(format!(
+                                    "No se pudo borrar archivo anterior {}: {}",
+                                    old_path.display(),
+                                    e
+                                ));
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
-    // 9. Limpiar respaldos .old conservados por write_atomic.
+    // 10. Limpiar respaldos .old conservados por write_atomic.
     for item in &items {
-        let backup = item
-            .dest
-            .with_file_name(format!(
-                "{}.old",
-                item.dest.file_name().unwrap_or_default().to_string_lossy()
-            ));
+        let backup = item.dest.with_file_name(format!(
+            "{}.old",
+            item.dest.file_name().unwrap_or_default().to_string_lossy()
+        ));
         if backup.exists() {
             let _ = fs::remove_file(&backup);
         }
     }
 
-    // 10. Vaciar el journal (confirmar todas las entradas).
+    // 11. Vaciar el journal (confirmar todas las entradas).
     let mut journal = read_journal(instance_dir)?;
     for item in &items {
         journal
@@ -3819,7 +3906,13 @@ mod tests {
 
     // ── Tests apply_batch_transactional ──────────────────────────────────
 
-    fn batch_entry(base_dir: &std::path::Path, slug: &str, dest_rel: &str, version_id: &str, content: &[u8]) -> BatchItem {
+    fn batch_entry(
+        base_dir: &std::path::Path,
+        slug: &str,
+        dest_rel: &str,
+        version_id: &str,
+        content: &[u8],
+    ) -> BatchItem {
         let filename = std::path::Path::new(dest_rel)
             .file_name()
             .unwrap()
@@ -3865,9 +3958,18 @@ mod tests {
         assert_eq!(entries.len(), 3);
 
         // Archivos escritos correctamente.
-        assert_eq!(fs::read(dir.join("mods").join("a.jar")).unwrap(), b"contenido-a");
-        assert_eq!(fs::read(dir.join("mods").join("b.jar")).unwrap(), b"contenido-b");
-        assert_eq!(fs::read(dir.join("mods").join("c.jar")).unwrap(), b"contenido-c");
+        assert_eq!(
+            fs::read(dir.join("mods").join("a.jar")).unwrap(),
+            b"contenido-a"
+        );
+        assert_eq!(
+            fs::read(dir.join("mods").join("b.jar")).unwrap(),
+            b"contenido-b"
+        );
+        assert_eq!(
+            fs::read(dir.join("mods").join("c.jar")).unwrap(),
+            b"contenido-c"
+        );
 
         // Journal vacío (confirmado).
         let journal = read_journal(&dir).unwrap();
@@ -3887,7 +3989,8 @@ mod tests {
     #[test]
     fn apply_batch_transactional_sha1_fallo_2do_item() {
         use crate::content::read_index;
-        let dir = std::env::temp_dir().join(format!("obsidia-fsx-{}-batch-sha1", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("obsidia-fsx-{}-batch-sha1", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join(".obsidia")).unwrap();
         fs::create_dir_all(dir.join("mods")).unwrap();
@@ -3931,8 +4034,9 @@ mod tests {
 
     #[test]
     fn apply_batch_transactional_indice_corrupto() {
-        use crate::content::{write_index, ContentEntry};
-        let dir = std::env::temp_dir().join(format!("obsidia-fsx-{}-batch-corrupt", std::process::id()));
+        use crate::content::{ContentEntry, read_index, write_index};
+        let dir =
+            std::env::temp_dir().join(format!("obsidia-fsx-{}-batch-corrupt", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join(".obsidia")).unwrap();
         fs::create_dir_all(dir.join("mods")).unwrap();
@@ -3958,10 +4062,10 @@ mod tests {
         // Archivo previo que deba restaurarse si write_index falla.
         fs::write(dir.join("mods").join("a.jar"), b"original").unwrap();
 
-        // Hacer que write_index falle: .obsidia como archivo (no se puede crear dir dentro).
-        let obsidia_dir = dir.join(".obsidia");
-        let _ = fs::remove_dir_all(&obsidia_dir);
-        fs::write(&obsidia_dir, b"no es un directorio").unwrap();
+        // Hacer que write_index falle: crear .obsidia/mods.json.part como
+        // directorio (write_atomic intenta escribir ahí el archivo temporal).
+        let part_dir = dir.join(".obsidia").join("mods.json.part");
+        fs::create_dir_all(&part_dir).unwrap();
 
         let items = vec![batch_entry(&dir, "a", "mods/a.jar", "va", b"contenido-a")];
 
@@ -3969,7 +4073,123 @@ mod tests {
         assert!(res.is_err());
 
         // Archivo restaurado al contenido previo (write_index falló, todo se revirtió).
-        assert_eq!(fs::read(dir.join("mods").join("a.jar")).unwrap(), b"original");
+        assert_eq!(
+            fs::read(dir.join("mods").join("a.jar")).unwrap(),
+            b"original"
+        );
+
+        // Journal debe estar vacío (entrada retirada tras revertir con éxito).
+        let journal = read_journal(&dir).unwrap();
+        assert!(journal.pending.is_empty());
+
+        // Recuperación posterior debe funcionar correctamente.
+        recover_with_journal(&dir).unwrap();
+        let entries = read_index(&dir, "mods").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].filename, "a.jar");
+        assert_eq!(
+            fs::read(dir.join("mods").join("a.jar")).unwrap(),
+            b"original"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_batch_transactional_sha1_fallo_2do_item_tres_items() {
+        use crate::content::read_index;
+        let dir =
+            std::env::temp_dir().join(format!("obsidia-fsx-{}-batch-sha1-3", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join(".obsidia")).unwrap();
+        fs::create_dir_all(dir.join("mods")).unwrap();
+
+        // Lote de 3 items: el 2do tiene SHA1 inválido.
+        let items = vec![
+            batch_entry(&dir, "a", "mods/a.jar", "va", b"contenido-a"),
+            BatchItem {
+                dest: dir.join("mods").join("b.jar"),
+                bytes: b"corrupto".to_vec(),
+                expected_sha1: Some("0000000000000000000000000000000000000000".to_string()),
+                entry: crate::content::ContentEntry {
+                    slug: "b".to_string(),
+                    project_id: None,
+                    version_id: "vb".to_string(),
+                    filename: "b.jar".to_string(),
+                    sha1: None,
+                    loader: None,
+                    mc_version: None,
+                    icon_url: None,
+                    source: "modrinth".to_string(),
+                    managed_by_obsidia: true,
+                },
+            },
+            batch_entry(&dir, "c", "mods/c.jar", "vc", b"contenido-c"),
+        ];
+
+        let res = apply_batch_transactional(&dir, "mods", &dir.join("mods"), items);
+        assert!(res.is_err());
+
+        // Ninguno de los 3 archivos se escribió.
+        assert!(!dir.join("mods").join("a.jar").exists());
+        assert!(!dir.join("mods").join("b.jar").exists());
+        assert!(!dir.join("mods").join("c.jar").exists());
+
+        // Índice vacío.
+        let entries = read_index(&dir, "mods").unwrap();
+        assert!(entries.is_empty());
+
+        // Journal sin pendientes (SHA1 falló antes de escribir journal).
+        let journal = read_journal(&dir).unwrap();
+        assert!(journal.pending.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "Prueba de archivo bloqueado durante rollback en Windows; requiere condiciones específicas del SO"]
+    fn apply_batch_transactional_archivo_bloqueado_rollback() {
+        use crate::content::{ContentEntry, write_index};
+        let dir =
+            std::env::temp_dir().join(format!("obsidia-fsx-{}-batch-locked", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join(".obsidia")).unwrap();
+        fs::create_dir_all(dir.join("mods")).unwrap();
+
+        // Índice válido con entrada previa para a.jar.
+        write_index(
+            &dir,
+            "mods",
+            &[ContentEntry {
+                slug: "a".to_string(),
+                project_id: None,
+                version_id: "v1".to_string(),
+                filename: "a.jar".to_string(),
+                sha1: None,
+                loader: None,
+                mc_version: None,
+                icon_url: None,
+                source: "modrinth".to_string(),
+                managed_by_obsidia: true,
+            }],
+        )
+        .unwrap();
+        fs::write(dir.join("mods").join("a.jar"), b"original").unwrap();
+
+        // Hacer que write_index falle: .obsidia/mods.json.part como directorio.
+        let part_dir = dir.join(".obsidia").join("mods.json.part");
+        fs::create_dir_all(&part_dir).unwrap();
+
+        let items = vec![batch_entry(&dir, "a", "mods/a.jar", "va", b"contenido-a")];
+
+        let res = apply_batch_transactional(&dir, "mods", &dir.join("mods"), items);
+        assert!(res.is_err());
+
+        // Archivo restaurado al contenido previo.
+        assert_eq!(
+            fs::read(dir.join("mods").join("a.jar")).unwrap(),
+            b"original"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -3977,7 +4197,8 @@ mod tests {
     #[test]
     fn apply_batch_transactional_filename_diferente_borra_previo() {
         use crate::content::read_index;
-        let dir = std::env::temp_dir().join(format!("obsidia-fsx-{}-batch-fname", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("obsidia-fsx-{}-batch-fname", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join(".obsidia")).unwrap();
         fs::create_dir_all(dir.join("mods")).unwrap();
@@ -4007,13 +4228,7 @@ mod tests {
         assert!(dir.join("mods").join("mod-v1.jar").exists());
 
         // Actualizar con filename distinto (mod-v2.jar). El v1 debe borrarse.
-        let items = vec![batch_entry(
-            &dir,
-            "mod",
-            "mods/mod-v2.jar",
-            "v2",
-            b"v2",
-        )];
+        let items = vec![batch_entry(&dir, "mod", "mods/mod-v2.jar", "v2", b"v2")];
 
         apply_batch_transactional(&dir, "mods", &dir.join("mods"), items).unwrap();
 
@@ -4028,11 +4243,9 @@ mod tests {
 
     #[test]
     fn update_entry_icons_no_pisa_existente_y_no_toca_otros_campos() {
-        use crate::content::{read_index, write_index, ContentEntry};
-        let dir = std::env::temp_dir().join(format!(
-            "obsidia-fsx-{}-update-icons",
-            std::process::id()
-        ));
+        use crate::content::{ContentEntry, read_index, write_index};
+        let dir =
+            std::env::temp_dir().join(format!("obsidia-fsx-{}-update-icons", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join(".obsidia")).unwrap();
         fs::create_dir_all(dir.join("mods")).unwrap();
@@ -4071,8 +4284,14 @@ mod tests {
         .unwrap();
 
         let mut icons = HashMap::new();
-        icons.insert("mod-a".to_string(), "https://new.example.com/icon-a.png".to_string());
-        icons.insert("mod-b".to_string(), "https://new.example.com/icon-b.png".to_string());
+        icons.insert(
+            "mod-a".to_string(),
+            "https://new.example.com/icon-a.png".to_string(),
+        );
+        icons.insert(
+            "mod-b".to_string(),
+            "https://new.example.com/icon-b.png".to_string(),
+        );
 
         update_entry_icons(&dir, "mods", &icons).unwrap();
 
