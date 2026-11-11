@@ -72,6 +72,7 @@ fn index_filename(kind: &str) -> &'static str {
         "mods" => "mods.json",
         "shaders" => "shaders.json",
         "packs" => "packs.json",
+        "modpacks" => "modpacks.json",
         _ => "content.json",
     }
 }

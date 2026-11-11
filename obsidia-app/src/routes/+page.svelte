@@ -4,8 +4,13 @@
   import { onMount } from "svelte";
 import Sidebar from "$lib/components/Sidebar.svelte";
 import Toast from "$lib/components/Toast.svelte";
+import SkinEditorOverlay from "$lib/skin-editor/SkinEditorOverlay.svelte";
+// Etapa 2: puente del editor con el almacén real del lanzador.
+import { readSkinsDataUrls, slotIdAt, slotIndexOfId, metaAppend, metaRemoveAt } from "$lib/skin-editor/launcher-store";
 
-import { ic, TABS, G, TRASH, LOADERS, RAMS, STG, LBL, esc, norm, validName, normRam, skinFace, skinFull, paintSkinCanvases, accCard, trb, resCard, irisBanner, safeImageUrl } from "$lib/utils.js";
+import { ic, TABS, G, TRASH, LOADERS, RAMS, STG, LBL, esc, norm, validName, normRam, skinFace, paintSkinCanvases, accCard, trb, resCard, modCard, irisBanner, safeImageUrl } from "$lib/utils.js";
+// Figuras 3D de «Mi cuenta»: ambas capas de la skin, Classic/Slim.
+import { skinFigureMarkup, paintSkinFigures } from "$lib/skin-figure";
 
   // ───────────── Estado ─────────────
   let P = [];
@@ -13,23 +18,26 @@ import { ic, TABS, G, TRASH, LOADERS, RAMS, STG, LBL, esc, norm, validName, norm
   let accHtml = '';
   let VERSIONS = [];
   let S = {
-    tab:'home', p:0, sec:'mods', q:'', f:'Todos',
+    tab:'home', p:0, sec:'mods', q:'', f:'Todos', subtab:'explore',
     pg:null, stage:'version', launchErr:'', launchMsg:'',
     defRam:4, totalRam:16, t:{ lite:false },
     nick:'Jugador', ms:false, ml:false, msc:null,
     skins:[], sk:-1, skmodel:'classic',
-    pstate:[], filemap:{ mods:{}, shaders:{}, packs:{} },
-    files:{ mods:[], shaders:[], packs:[] },
-    content:{ mods:[], shaders:[], packs:[] },
-    contentIcons:{ mods:{}, shaders:{}, packs:{} },
+    pstate:[], filemap:{ mods:{}, shaders:{}, packs:{}, modpacks:{} },
+    files:{ mods:[], shaders:[], packs:[], modpacks:[] },
+    content:{ mods:[], shaders:[], packs:[], modpacks:[] },
+    contentIcons:{ mods:{}, shaders:{}, packs:{}, modpacks:{} },
     migratingContent:false, migratedInstance:'', migratingProfile:'', inv:{}, invLoading:{}, searchCache:{}, searchPending:{},
-    results:{ mods:null, shaders:null, packs:null }, searching:false, searchErr:{ mods:'', shaders:'', packs:'' }, searchSeq:0, busy:{},
+    results:{ mods:null, shaders:null, packs:null, modpacks:null }, searching:false, searchErr:{ mods:'', shaders:'', packs:'', modpacks:'' }, searchSeq:0, busy:{},
     sv:[], af:false, rf:false, es:null, ns:'', na:'',
     np:false, npEdit:-1, npName:'', npVersion:'', npLoader:'Vanilla', npLoaderVersion:'', npRam:4, npJava:'', npErr:'', npBusy:false, npFullscreen:false, npBlock:'',
     javas:[],
     plan:null, planSlug:'', planKind:'', planId:null, planInstance:'', pendingRender:false,
     progress:{}, prePlans:[], updateCheckTs:{}, prePlanPending:[]
   };
+
+  // Editor de skins (pantalla superpuesta, fuera del innerHTML de #view).
+  let editorOpen = false;
 
   // ───────────── Utilidades ─────────────
   const Q = s => document.querySelector(s);
@@ -78,8 +86,8 @@ import { ic, TABS, G, TRASH, LOADERS, RAMS, STG, LBL, esc, norm, validName, norm
     if (changed) saveFileMap(kind, map, instance);
   }
   function loadFileMap(){
-    S.filemap = { mods:{}, shaders:{}, packs:{} };
-    for (const kind of ['mods','shaders','packs']) S.filemap[kind] = fileMap(kind);
+    S.filemap = { mods:{}, shaders:{}, packs:{}, modpacks:{} };
+    for (const kind of ['mods','shaders','packs','modpacks']) S.filemap[kind] = fileMap(kind);
   }
   // Un archivo instalado puede llamarse distinto al slug: primero el mapa guardado en la
   // instalación y después una coincidencia por palabras del slug o del título.
@@ -87,7 +95,7 @@ import { ic, TABS, G, TRASH, LOADERS, RAMS, STG, LBL, esc, norm, validName, norm
     const map = (S.filemap && S.filemap[kind]) ? S.filemap[kind] : {};
     const entry = map && map[slug];
     const file = entry && (entry.file || entry);
-    if (file && (S.files[kind] || []).includes(file)) return file;
+    if (file) return file;
     return null;
   };
 
@@ -136,8 +144,14 @@ import { ic, TABS, G, TRASH, LOADERS, RAMS, STG, LBL, esc, norm, validName, norm
         if (!v || !v.icon) continue;
         if (matchesInstalled(file, slug, '')) return v.icon;
       }
-      const hit = (S.results && S.results[kind] ? S.results[kind] : []).find(r => matchesInstalled(file, r.slug, r.title));
-      if (hit && hit.icon_url) return hit.icon_url;
+    }
+    const hitIn = r => r && (kind === 'modpacks' && file === r.slug || matchesInstalled(file, r.slug, r.title)) && r.icon_url;
+    const rs = (S.results && S.results[kind]) || null;
+    if (rs) { const hit = rs.find(hitIn); if (hit) return hit.icon_url; }
+    if (S.searchCache) for (const v of Object.values(S.searchCache)) {
+      if (!v || !v.res) continue;
+      const hit = v.res.find(hitIn);
+      if (hit) return hit.icon_url;
     }
     return '';
   }
@@ -162,7 +176,7 @@ import { ic, TABS, G, TRASH, LOADERS, RAMS, STG, LBL, esc, norm, validName, norm
   }
 
   const sw = (k,l,d) => `<div class="row gl"><div><div style="font-weight:600">${l}</div><div class="mu">${d}</div></div><button class="sw" role="switch" aria-label="${l}" aria-checked="${S.t[k]}" data-act="tg" data-k="${k}"></button></div>`;
-  const seg = () => `<div class="seg">${[['mods','Mods'],['shaders','Shaders'],['packs','Resource packs']].map(s=>`<button class="${S.sec==s[0]?'on':''}" data-act="seg" data-s="${s[0]}">${s[1]}</button>`).join('')}</div>`;
+  const seg = () => `<div class="seg">${[['mods','Mods'],['shaders','Shaders'],['packs','Resource packs'],['modpacks','Modpacks']].map(s=>`<button class="${S.sec==s[0]?'on':''}" data-act="seg" data-s="${s[0]}">${s[1]}</button>`).join('')}</div>`;
 
   // ───────────── Skins ─────────────
   // Cara por defecto (Steve).
@@ -317,14 +331,27 @@ import { ic, TABS, G, TRASH, LOADERS, RAMS, STG, LBL, esc, norm, validName, norm
 
   // ───────────── Mods / shaders / resource packs ─────────────
   function installedList(kind){
-    const files = S.files[kind];
-    if (!files.length) return '';
-    const names = { mods:'Mods instalados', shaders:'Shaders instalados', packs:'Resource packs instalados' };
+    const files = S.files[kind] || [];
+    // El backend escribe los archivos del modpack bajo el índice "mods", así
+    // que S.files.modpacks puede quedar vacío. Usar filemap como respaldo para
+    // que el apartado "Instalados" refleje los modpacks instalados.
+    const effectiveFiles = kind === 'modpacks' && !files.length
+      ? Object.keys(S.filemap.modpacks || {})
+      : files;
+    if (!effectiveFiles.length) return '';
+    const names = { mods:'Mods instalados', shaders:'Shaders instalados', packs:'Resource packs instalados', modpacks:'Modpacks instalados' };
     const grad = kind==='mods' ? 'linear-gradient(135deg,#8B5CF6,#22D3EE)' : kind==='shaders' ? 'linear-gradient(135deg,#FBBF24,#F472B6)' : 'repeating-linear-gradient(90deg,rgba(0,0,0,.14) 0 8px,transparent 8px 16px),linear-gradient(135deg,#34D399,#22D3EE)';
-    return `<div class="gl" style="grid-column:1/-1;padding:18px 20px;display:flex;flex-direction:column;gap:8px"><b>${names[kind]}</b>${files.map(f=>{
-      const icon = safeImageUrl(iconFor(kind, f));
+    return `<div class="gl" style="grid-column:1/-1;padding:18px 20px;display:flex;flex-direction:column;gap:8px"><b>${names[kind]}</b>${effectiveFiles.map(f=>{
+      // Para modpacks, f es el slug: resolver el filename real desde el índice
+      // para que delete_file_in reciba el nombre físico del archivo.
+      let realFile = f;
+      if (kind === 'modpacks') {
+        const entry = (S.content.mods || []).find(e => e.slug === f);
+        if (entry) realFile = entry.filename;
+      }
+      const icon = safeImageUrl(iconFor(kind, realFile));
       const bg = icon ? `background-image:url("${icon}"),${grad};background-size:cover;background-position:center` : `background:${grad}`;
-      return `<div style="display:flex;align-items:center;gap:12px;padding:6px 12px;border-radius:12px;background:rgba(255,255,255,.04)"><div class="mi" style='${bg}'></div><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(f)}</span>${trb(kind,f,34)}</div>`;
+      return `<div style="display:flex;align-items:center;gap:12px;padding:6px 12px;border-radius:12px;background:rgba(255,255,255,.04)"><div class="mi" style='${bg}'></div><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(f)}</span>${trb(kind, kind==='modpacks' ? f : realFile, 34)}</div>`;
     }).join('')}</div>`;
   }
   function grid(){
@@ -337,7 +364,8 @@ import { ic, TABS, G, TRASH, LOADERS, RAMS, STG, LBL, esc, norm, validName, norm
         ? `<div class="gl" style="padding:16px 18px;display:flex;align-items:center;gap:12px;flex-wrap:wrap"><span class="mu">No se pudo buscar: ${esc(err)}</span><button class="sec" style="height:38px;padding:0 16px" data-act="retrysearch">Reintentar</button></div>`
         : `<div class="mu">${S.searching?'Buscando en Modrinth…':'Cargando…'}</div>`;
     } else {
-      h += res.length ? res.map(r => resCard(kind, r, S.busy[r.slug], installedFile(kind, r.slug) || findFile(kind, r.slug, r.title), S.progress[`${r.slug}|${inst()}`])).join('') : '<div class="mu">No hay resultados en Modrinth.</div>';
+      const cardFn = kind==='mods' || kind==='modpacks' ? modCard : resCard;
+      h += res.length ? res.map(r => cardFn(kind, r, S.busy[r.slug], installedFile(kind, r.slug) || findFile(kind, r.slug, r.title), S.progress[`${r.slug}|${inst()}`])).join('') : '<div class="mu">No hay resultados en Modrinth.</div>';
     }
     return h;
   }
@@ -351,8 +379,9 @@ import { ic, TABS, G, TRASH, LOADERS, RAMS, STG, LBL, esc, norm, validName, norm
   }
   function mods(){
     const p = P[S.p];
-    const ph = { mods:'Buscar en Modrinth…', shaders:'Buscar shaders…', packs:'Buscar resource packs…' }[S.sec];
-    return `<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap"><h1>Mods</h1><div class="gl" style="padding:9px 16px;color:#C9C7DD;font-size:14px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%">Instancia: ${p?esc(p.n)+' · '+esc(p.loader||'Vanilla'):'—'}</div></div>${seg()}${S.sec==='packs'?packsPanel():''}${installedList(S.sec)}<input id="q" class="srch" aria-label="${ph}" placeholder="${ph}" value="${esc(S.q)}">${S.sec==='mods'&&!S.q.trim()?`<div class="chips">${['Todos','Optimización','Gráficos','Utilidades'].map(c=>`<button class="chip ${c==S.f?'on':''}" data-act="f" data-c="${c}">${c}</button>`).join('')}</div>`:''}<div class="g3" id="grid">${grid()}</div>`;
+    const ph = { mods:'Buscar mods en Modrinth', shaders:'Buscar shaders en Modrinth', packs:'Buscar resource packs en Modrinth', modpacks:'Buscar modpacks en Modrinth' }[S.sec];
+    const tabLabel = S.sec === 'modpacks' ? 'Modpacks' : 'Mods';
+    return `<div class="mods-page"><div class="top"><h1>${tabLabel}</h1><div class="inst"><i></i>Instancia: <b>${p?esc(p.n):'—'}</b>${p?' · '+esc(p.loader||'Vanilla'):''}</div></div><div class="mods-bar"><div class="seg" role="group" aria-label="Tipo de contenido" id="kind">${[['mods','Mods'],['shaders','Shaders'],['packs','Resource packs'],['modpacks','Modpacks']].map(s=>`<button class="${S.sec==s[0]?'on':''}" data-act="seg" data-s="${s[0]}">${s[1]}</button>`).join('')}</div><div class="tabs" style="margin-top:10px"><button class="${S.subtab==='explore'?'on':''}" data-act="stab" data-v="explore">Explorar</button><button class="${S.subtab==='installed'?'on':''}" data-act="stab" data-v="installed">Instalados</button></div></div>${S.subtab==='explore'?`<div class="tools"><input id="q" class="srch" aria-label="${ph}" placeholder="${ph}" value="${esc(S.q)}"></div>${S.sec==='mods'&&!S.q.trim()?`<div class="chips">${['Todos','Optimización','Gráficos','Utilidades'].map(c=>`<button class="chip ${c==S.f?'on':''}" data-act="f" data-c="${c}">${c}</button>`).join('')}</div>`:''}<div class="${(S.sec==='mods'||S.sec==='modpacks')?'cgrid':'g3'}" id="grid">${grid()}</div>`:`<div class="list">${installedList(S.sec)}</div>`}</div>`;
   }
 
   async function migrateContentMaps(){
@@ -387,20 +416,22 @@ async function loadInventory(instance){
     if (S.inv[instance]) return S.inv[instance];
     if (S.invLoading[instance]) return await S.invLoading[instance];
     const promise = (async () => {
-      const [mc, sc, pc, ps] = await Promise.all([
+      const [mc, sc, pc, mp, ps] = await Promise.all([
         invoke('list_content', { instance, kind:'mods' }).catch(()=>null),
         invoke('list_content', { instance, kind:'shaders' }).catch(()=>null),
         invoke('list_content', { instance, kind:'packs' }).catch(()=>null),
+        invoke('list_content', { instance, kind:'modpacks' }).catch(()=>null),
         invoke('get_resourcepack_state', { instance }).catch(()=>[])
       ]);
       let m = (mc && Array.isArray(mc) && mc.length) ? mc.map(x=>x.file) : null;
       let sh = (sc && Array.isArray(sc) && sc.length) ? sc.map(x=>x.file) : null;
       let r = (pc && Array.isArray(pc) && pc.length) ? pc.map(x=>x.file) : null;
+      let mpk = (mp && Array.isArray(mp) && mp.length) ? mp.map(x=>x.file) : null;
       if (m === null) m = await invoke('list_installed_mods', { instance }).catch(()=>[]);
       if (sh === null) sh = await invoke('list_shaderpacks', { instance }).catch(()=>[]);
       if (r === null) r = await invoke('list_resourcepacks', { instance }).catch(()=>[]);
-      const inv = { files:{ mods:m||[], shaders:sh||[], packs:r||[] }, content:{ mods:mc||[], shaders:sc||[], packs:pc||[] }, icons:{ mods:{}, shaders:{}, packs:{} }, pstate: ps||[] };
-      for (const kind of ['mods','shaders','packs']) { const arr = inv.content[kind] || []; const map = {}; for (const e of arr) if (e && e.file) map[e.file] = e.icon || ''; inv.icons[kind] = map; }
+      const inv = { files:{ mods:m||[], shaders:sh||[], packs:r||[], modpacks:mpk||[] }, content:{ mods:mc||[], shaders:sc||[], packs:pc||[], modpacks:mp||[] }, icons:{ mods:{}, shaders:{}, packs:{}, modpacks:{} }, pstate: ps||[] };
+      for (const kind of ['mods','shaders','packs','modpacks']) { const arr = inv.content[kind] || []; const map = {}; for (const e of arr) if (e && e.file) map[e.file] = e.icon || ''; inv.icons[kind] = map; }
       S.inv[instance] = inv;
       delete S.invLoading[instance];
       return inv;
@@ -416,6 +447,9 @@ async function loadInventory(instance){
   /** @param {string} kind @param {string} [instance] */
   async function refreshKind(kind, instance){
     const target = instance || inst();
+    if (!S.files[kind]) S.files[kind] = [];
+    if (!S.content[kind]) S.content[kind] = [];
+    if (!S.contentIcons[kind]) S.contentIcons[kind] = {};
     const r = await invoke('list_content', { instance: target, kind }).catch(()=>null);
     if (Array.isArray(r)) {
       S.files[kind] = r.map(x=>x.file);
@@ -480,14 +514,14 @@ async function savePacks(){
     await refreshKind('packs');
   }
 
-  async function doSearch(){
+  async function doSearch(retried = false){
     const kind = S.sec, q = S.q.trim(), my = ++S.searchSeq;
     const cat = (kind==='mods' && !q && S.f !== 'Todos') ? (CAT[S.f] || null) : null;
     const text = q;
     S.searchErr[kind] = '';
     const p = P[S.p];
     const ver = (p && p.version) || null;
-    const lod = (kind==='mods' && p && p.loader && p.loader !== 'Vanilla') ? p.loader : null;
+    const lod = ((kind==='mods' || kind==='modpacks') && p && p.loader && p.loader !== 'Vanilla') ? p.loader : null;
     const key = [kind, text, cat||'', ver||'', lod||'', inst()].join('|');
     const cached = S.searchCache[key];
     if (cached) {
@@ -502,15 +536,23 @@ async function savePacks(){
     // Evitar solicitudes duplicadas simultáneas.
     if (S.searchPending[key]) {
       try { await S.searchPending[key]; } catch(e){}
+      // La respuesta en vuelo puede haberse descartado si se salió y volvió a
+      // entrar mientras cargaba. Reintentar una vez: la respuesta ya está en
+      // caché, así que no se repite la consulta de red.
+      if (!retried) return doSearch(true);
       return;
     }
     // Caché fresca: no consultar de nuevo.
     if (cached && (Date.now() - cached.ts) < 300000) return;
-    const cmd = { mods:'search_mods', shaders:'search_shaders', packs:'search_resourcepacks' }[kind];
+    const cmd = { mods:'search_mods', shaders:'search_shaders', packs:'search_resourcepacks', modpacks:'search_modpacks' }[kind];
     let promise = (async () => {
       let res;
       try {
-        res = await invoke(cmd, { query:text, category: cat, version: ver, loader: lod });
+        if (kind === 'modpacks') {
+          res = await invoke(cmd, { query:text, version: ver, loader: lod });
+        } else {
+          res = await invoke(cmd, { query:text, category: cat, version: ver, loader: lod });
+        }
       } catch(e){
         if (my !== S.searchSeq) return;
         // No cachear el error: así "Reintentar" vuelve a consultar de verdad.
@@ -520,9 +562,26 @@ async function savePacks(){
         refreshGrid();
         return;
       }
-      if (my !== S.searchSeq) return;
-      const arr = Array.isArray(res) ? res : [];
+      let arr = Array.isArray(res) ? res : [];
+      // Modpacks: priorizar los compatibles con la instancia actual (versión y loader).
+      if (kind === 'modpacks') {
+        const p = P[S.p];
+        const mc = (p && p.version || '').trim();
+        const loader = (p && p.loader || 'Vanilla').toLowerCase();
+        arr = arr.slice().sort((a, b) => {
+          const score = r => {
+            let s = 0;
+            if (mc && Array.isArray(r.versions) && r.versions.includes(mc)) s += 2;
+            if (loader !== 'vanilla' && Array.isArray(r.loaders) && r.loaders.some(l => String(l).toLowerCase() === loader)) s += 1;
+            return s;
+          };
+          return score(b) - score(a);
+        });
+      }
       S.searchCache[key] = { res: arr, ts: Date.now() };
+      // Si llegó tarde, otra búsqueda manda en la UI: el resultado queda en
+      // caché y la llamada que lo esperaba lo aplica al reintentar.
+      if (my !== S.searchSeq) return;
       S.results[kind] = arr;
       S.searching = false;
       refreshGrid();
@@ -544,6 +603,66 @@ async function savePacks(){
   async function doInstall(kind, slug){
     const instance = inst();
     const p = P[S.p];
+    // Modpacks: instalar en la instancia seleccionada, sin crear otra.
+    if (kind==='modpacks'){
+      if (S.busy[slug]) return;
+      if (!p){ toast('Creá una instancia primero.', true); return; }
+      const r = (S.results && S.results.modpacks) ? S.results.modpacks.find(x => x.slug === slug) : null;
+      if (!r){ toast('Modpack no encontrado.', true); return; }
+      // Pre-chequeo contra las versiones del proyecto: evita descargar si el
+      // modpack no soporta ni la versión de Minecraft ni el loader de la instancia.
+      const mc = (p.version || '').trim();
+      const loader = p.loader || 'Vanilla';
+      const pname = p.n || instance;
+      if (mc && Array.isArray(r.versions) && r.versions.length && !r.versions.includes(mc)){
+        toast(`El modpack no tiene ninguna versión para Minecraft ${mc}. La instancia «${pname}» no se modificó.`, true);
+        return;
+      }
+      if (loader !== 'Vanilla' && Array.isArray(r.loaders) && r.loaders.length &&
+          !r.loaders.some(l => String(l).toLowerCase() === loader.toLowerCase())){
+        toast(`El modpack no es compatible con ${loader}. La instancia «${pname}» no se modificó.`, true);
+        return;
+      }
+      perfOpId = slug+'-'+Date.now();
+      perfLog('clic_instalar');
+      S.busy[slug] = 1; refreshGrid();
+      try {
+        // Guardar los mods presentes antes de instalar, para saber cuáles trae el modpack.
+        const modsBefore = new Set(S.files.mods || []);
+        // Tauri v2 espera camelCase: los nombres snake_case se rechazan antes de ejecutar el comando.
+        await invoke('install_modpack_into_instance', {
+          projectSlug: r.slug,
+          instanceId: instance,
+          selectedOptionals: []
+        });
+        perfLog('respuesta_backend');
+        toast(`Modpack instalado en «${pname}».`);
+        // Registrar como instalado para que el botón pase a "Instalado ✓".
+        if (!S.filemap.modpacks) S.filemap.modpacks = {};
+        S.filemap.modpacks[r.slug] = { file: r.slug, icon: r.icon_url || '' };
+        saveFileMap('modpacks', S.filemap.modpacks, instance);
+        if (!S.files.modpacks) S.files.modpacks = [];
+        if (!S.files.modpacks.includes(r.slug)) S.files.modpacks.push(r.slug);
+        await refreshKind('modpacks', instance);
+        await refreshKind('mods', instance);
+        // Guardar los mods que trajo el modpack, para borrarlos al desinstalarlo.
+        const newMods = (S.files.mods || []).filter(f => !modsBefore.has(f));
+        if (newMods.length) {
+          const key = 'obsidia.modpack-files.' + instance;
+          let map = {}; try { map = JSON.parse(localStorage.getItem(key) || '{}'); } catch(e){}
+          map[r.slug] = [...new Set([...(map[r.slug] || []), ...newMods])];
+          try { localStorage.setItem(key, JSON.stringify(map)); } catch(e){}
+        }
+      } catch(e){
+        const msg = String(e);
+        toast(msg.startsWith('El modpack') ? msg : 'No se pudo instalar el modpack: '+msg, true);
+      }
+      delete S.busy[slug];
+      progressClear(slug, instance);
+      refreshGrid();
+      perfLog('fin_refreshkind');
+      return;
+    }
     // Mods: plan previo sin descargas + confirmación explícita.
     if (kind==='mods'){
       if (S.busy[slug] || S.plan) return;
@@ -704,8 +823,8 @@ function account(){
     const modelLabel = S.skmodel === 'slim' ? 'Fino' : 'Clásico';
     const currentSkinLabel = S.sk >= 0 ? `Skin ${S.sk + 1}` : 'Sin skin';
 
-    const skinBig = skinFull(skinUrl, S.skmodel, 8);
-    const previewSkinImg = skinFull(skinUrl, S.skmodel, 5);
+    const skinBig = skinFigureMarkup(skinUrl, S.skmodel, 8);
+    const previewSkinImg = skinFigureMarkup(skinUrl, S.skmodel, 5);
 
     return `<div class="account-page">
       <div class="page-head">
@@ -768,6 +887,7 @@ function account(){
               <button class="chip ${S.skmodel === 'classic' ? 'on' : ''}" data-act="skinmodel" data-m="classic" type="button" aria-pressed="${S.skmodel === 'classic'}">Clásico</button>
               <button class="chip ${S.skmodel === 'slim' ? 'on' : ''}" data-act="skinmodel" data-m="slim" type="button" aria-pressed="${S.skmodel === 'slim'}">Fino</button>
             </div>
+            <button class="chip" type="button" data-act="skinedit">Editar skin</button>
             ${S.sk >= 0 ? `<button class="skin-del-bar" type="button" aria-label="Borrar skin activa" data-act="skindel"><svg viewBox="0 0 24 24"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14M10 11v6M14 11v6"/></svg></button>` : ''}
           </div>
         </div>
@@ -893,6 +1013,20 @@ function account(){
   }
 
   // ───────────── Persistencia ─────────────
+  // Tras guardar desde el editor (Etapa 2): marca el slot nuevo como activo,
+  // sincroniza el modelo, persiste y aplica por la ruta existente (con su
+  // aviso si hay sesión Microsoft: la skin queda guardada pero el juego usa
+  // la oficial). Relee el almacén porque el editor lo escribió directo.
+  async function onEditorSave(info){
+    const i = slotIndexOfId(info.skinId);
+    if (i < 0) { render(); return; }
+    S.skins = readSkinsDataUrls();
+    S.sk = i;
+    S.skmodel = info.model === 'slim' ? 'slim' : 'classic';
+    saveSkins();
+    render();
+    await applySkinToGame();
+  }
   async function persistSettings(){
     try { await invoke('save_settings', { settings:{ ram:S.defRam+'G', java_path:null, light_mode:S.t.lite, console:false, username:S.nick } }); } catch(e){ console.error(e); }
   }
@@ -1019,7 +1153,8 @@ function account(){
     else if (a=='f'){ S.f = d.c; render(); doSearch(); }
     else if (a=='retrysearch'){ doSearch(); }
     else if (a=='tg'){ S.t[d.k] = !S.t[d.k]; persistSettings(); render(); }
-    else if (a=='seg'){ S.sec = d.s; S.q = ''; render(); doSearch(); }
+    else if (a=='seg'){ S.sec = d.s; S.q = ''; S.subtab = 'explore'; render(); doSearch(); }
+    else if (a=='stab'){ S.subtab = d.v; render(); }
     else if (a=='ptg'){ const x = S.pstate[+d.i]; if (x){ x.enabled = !x.enabled; S.pstate = [...S.pstate.filter(p=>p.enabled), ...S.pstate.filter(p=>!p.enabled)]; savePacks(); render(); } }
     else if (a=='pup'){ const i = +d.i; if (i>0 && S.pstate[i].enabled && S.pstate[i-1].enabled){ [S.pstate[i-1], S.pstate[i]] = [S.pstate[i], S.pstate[i-1]]; savePacks(); render(); } }
     else if (a=='pdown'){ const i = +d.i; if (i<S.pstate.length-1 && S.pstate[i].enabled && S.pstate[i+1].enabled){ [S.pstate[i+1], S.pstate[i]] = [S.pstate[i], S.pstate[i+1]]; savePacks(); render(); } }
@@ -1028,13 +1163,37 @@ function account(){
     else if (a=='plancancel'){ if (e.target !== b) return; const cslug = S.planSlug; const cinst = S.planInstance || inst(); S.plan = null; S.planSlug=''; S.planKind=''; S.planId=null; S.planInstance=''; progressClear(cslug, cinst); render(); }
     else if (a=='planinstall'){ doInstallConfirmed(); }
     else if (a=='fdel'){
+      // Modpacks: borrar también los mods que instaló el modpack.
+      if (d.kind === 'modpacks') {
+        const key = 'obsidia.modpack-files.' + inst();
+        let map = {}; try { map = JSON.parse(localStorage.getItem(key) || '{}'); } catch(e){}
+        const mods = Array.isArray(map[d.file]) ? map[d.file] : [];
+        let failed = 0;
+        for (const mf of mods) {
+          try { await invoke('delete_file_in', { folder:'mods', name:mf, instance:inst() }); }
+          catch(e){ failed++; }
+        }
+        delete map[d.file];
+        try { localStorage.setItem(key, JSON.stringify(map)); } catch(e){}
+        forgetFile('modpacks', d.file);
+        toast(failed ? `Modpack eliminado; ${failed} mod(s) no se pudieron borrar.` : 'Modpack y sus mods eliminados.');
+        await refreshKind('modpacks');
+        await refreshKind('mods');
+        return;
+      }
       const folder = { mods:'mods', shaders:'shaderpacks', packs:'resourcepacks' }[d.kind];
       try { await invoke('delete_file_in', { folder, name:d.file, instance:inst() }); forgetFile(d.kind, d.file); toast('Eliminado.'); }
-      catch(err){ toast('No se pudo eliminar: '+err, true); }
+      catch(err){
+        const e = String(err);
+        // Si el archivo ya no existe (os error 2), no es crítico: limpiamos igual.
+        if (e.includes('error 2') || e.includes('no se encontró')) { forgetFile(d.kind, d.file); }
+        else { toast('No se pudo eliminar: '+err, true); }
+      }
       await refreshKind(d.kind);
+      await refreshKind('mods');
     }
     else if (a=='openmod'){
-      const type = { mods:'mod', shaders:'shader', packs:'resourcepack' }[d.kind];
+      const type = { mods:'mod', shaders:'shader', packs:'resourcepack', modpacks:'modpack' }[d.kind];
       const url = `https://modrinth.com/${type}/${encodeURIComponent(d.slug)}`;
       invoke('plugin:opener|open_url', { url }).catch(() => window.open(url, '_blank'));
     }
@@ -1073,7 +1232,7 @@ function account(){
     else if (a=='skindel'){
       try {
         await invoke('remove_offline_skin', { instance:inst() });
-        if (S.sk >= 0 && S.sk < S.skins.length){ S.skins.splice(S.sk,1); S.sk = S.skins.length ? 0 : -1; saveSkins(); render(); }
+        if (S.sk >= 0 && S.sk < S.skins.length){ S.skins.splice(S.sk,1); metaRemoveAt(S.sk); S.sk = S.skins.length ? 0 : -1; saveSkins(); render(); }
         if (S.sk >= 0) await applySkinToGame();
         else toast('Skin quitada del juego.');
       }
@@ -1083,6 +1242,7 @@ function account(){
       if (S.skins.length >= 4){ toast('Máximo 4 skins', true); return; }
       const fi = Q('#skinfile'); if (fi) fi.click();
     }
+    else if (a=='skinedit'){ editorOpen = true; }
     else if (a=='nickfocus'){ const n = Q('#nick'); if (n){ n.focus(); n.select(); } }
     else if (a=='ms'){
       S.ml = true; msCancelled = false; render();
@@ -1124,6 +1284,7 @@ function account(){
           const prev = S.sk;
           S.skins.push(url); S.sk = S.skins.length - 1;
           if (!saveSkins()){ S.skins.pop(); S.sk = prev; render(); return; }
+          metaAppend(S.skmodel);
           render(); applySkinToGame();
         };
         img.onerror = () => toast('No se pudo leer la imagen.', true);
@@ -1176,6 +1337,7 @@ function account(){
     if (S.plan) html += planModal();
     view.innerHTML = html;
     paintSkinCanvases(view);
+    paintSkinFigures(view);
     S.pendingRender = false;
     if (focusId){
       const el = Q('#' + focusId);
@@ -1540,9 +1702,15 @@ function account(){
     }
     .account-page .figure-wrap{position:relative;width:142px;height:284px;flex:none;display:flex;align-items:flex-end;justify-content:center;z-index:1}
     .account-page .figure{width:132px;height:264px;filter:drop-shadow(0 22px 24px rgba(0,0,0,.55))}
+    /* Figura 3D: se dibuja por delante de la sombra del suelo. */
+    .account-page .figure-wrap img.js-figure{position:relative;z-index:1;width:132px;height:264px;margin-bottom:12px;display:block;opacity:0;transition:opacity .18s;filter:drop-shadow(0 12px 14px rgba(0,0,0,.6))}
+    .account-page .figure-wrap img.js-figure.ready{opacity:1}
+    /* Respaldo plano (sin skin válida): también por delante de la sombra. */
+    .account-page .figure-wrap > canvas.js-skin{position:relative;z-index:1;margin-bottom:12px}
     .account-page .figure-shadow{
-      position:absolute;left:50%;bottom:-6px;width:112px;height:18px;transform:translateX(-50%);
-      border-radius:50%;background:radial-gradient(ellipse,rgba(0,0,0,.75),transparent 70%);
+      position:absolute;left:50%;bottom:4px;width:124px;height:20px;transform:translateX(-50%);z-index:0;
+      border-radius:50%;background:radial-gradient(ellipse,rgba(0,0,0,.85),rgba(0,0,0,.45) 42%,transparent 74%);
+      filter:blur(2px);pointer-events:none;
     }
     .account-page .identity{position:relative;z-index:1;flex:1;min-width:0;display:flex;flex-direction:column;gap:4px}
     .account-page .field-label{font-size:12px;color:var(--mut);margin-bottom:2px}
@@ -1653,7 +1821,19 @@ function account(){
       text-shadow:0 1px 2px #000;box-shadow:0 1px 0 rgba(0,0,0,.35);
     }
     .account-page .preview-figure .pfigure{width:88px;height:176px;filter:drop-shadow(0 14px 18px rgba(0,0,0,.65))}
-    .account-page .preview-figure .figure-shadow{bottom:2px;width:78px;height:12px}
+    .account-page .preview-figure img.js-figure{position:relative;z-index:1;width:80px;height:160px;margin-bottom:8px;display:block;opacity:0;transition:opacity .18s;filter:drop-shadow(0 8px 10px rgba(0,0,0,.5))}
+    .account-page .preview-figure img.js-figure.ready{opacity:1}
+    .account-page .preview-figure > canvas.js-skin{position:relative;z-index:1;margin-bottom:8px}
+    .account-page .preview-figure .figure-shadow{bottom:4px;width:84px;height:14px;filter:blur(2px)}
+
+    /* ── Mods / Modpacks tarjetas compactas ── */
+    .g3{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:16px}
+
+    /* ── Mods / Modpacks pestañas Explorar/Instalados ── */
+    .tabs{display:flex;gap:0;border-bottom:1px solid var(--line)}
+    .tabs button{position:relative;height:40px;padding:0 2px;border:0;background:transparent;color:var(--mu);font-weight:600;font-size:14px}
+    .tabs button.on{color:#fff}
+    .tabs button.on::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:2px;border-radius:2px;background:linear-gradient(90deg,#A78BFA,#7DD3FC)}
 
     /* ── Responsive ── */
     @media (max-width:1280px){
@@ -1682,6 +1862,50 @@ function account(){
     }
     @media (prefers-reduced-motion:reduce){.account-page *{transition:none!important}}
 
+    /* ── Mods (maqueta aprobada) ── */
+    .mods-page{display:flex;flex-direction:column;gap:18px}
+    .mods-page .top{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
+    .mods-page .inst{display:inline-flex;align-items:center;gap:9px;height:36px;padding:0 14px;border-radius:999px;border:1px solid var(--line);background:rgba(255,255,255,.03);font-size:13px;color:#D5D1E3;max-width:100%}
+    .mods-page .inst i{width:7px;height:7px;border-radius:50%;background:#86EFAC;flex:none}
+    .mods-page .inst b{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .mods-page .mods-bar{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap}
+    .mods-page .seg{display:inline-flex;gap:3px;padding:3px;border-radius:12px;background:rgba(255,255,255,.045);border:1px solid var(--line)}
+    .mods-page .seg button{height:34px;padding:0 16px;border:0;border-radius:9px;background:transparent;color:var(--mu);font-weight:600;font-size:13px}
+    .mods-page .seg button:hover{color:var(--tx)}
+    .mods-page .seg button.on{background:#2A2440;color:#fff;box-shadow:inset 0 0 0 1px rgba(167,139,250,.28)}
+    .mods-page .tabs{gap:22px}
+    .mods-page .tools{display:flex;gap:10px;flex-wrap:wrap;position:sticky;top:0;z-index:5;padding:10px 0;background:linear-gradient(var(--bg) 70%,transparent)}
+    .mods-page .srch{flex:1;min-width:200px;height:46px;padding:0 16px 0 44px;border-radius:13px;border:1px solid rgba(255,255,255,.11);outline:none;background:rgba(255,255,255,.05) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='18' height='18' viewBox='0 0 24 24' fill='none' stroke='%23A09CB2' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='11' cy='11' r='7'/%3E%3Cpath d='m20 20-3.5-3.5'/%3E%3C/svg%3E") 15px center no-repeat}
+    .mods-page .srch:focus{border-color:rgba(125,211,252,.55);box-shadow:0 0 0 3px rgba(125,211,252,.12)}
+    .mods-page .chips{display:flex;gap:8px;flex-wrap:wrap}
+    .mods-page .chip{height:32px;padding:0 14px;border-radius:999px;border:1px solid var(--line);background:rgba(255,255,255,.03);color:#C9C7DD;font-size:12.5px}
+    .mods-page .chip:hover{border-color:rgba(255,255,255,.18)}
+    .mods-page .chip.on{color:#fff;background:rgba(139,92,246,.18);border-color:rgba(139,92,246,.55)}
+    .mods-page .cgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(238px,1fr));align-items:start;gap:14px}
+    .mods-page .card{display:flex;flex-direction:column;gap:14px;padding:16px;border-radius:16px;border:1px solid var(--line);background:linear-gradient(180deg,rgba(255,255,255,.035),rgba(255,255,255,.012));transition:border-color .15s;width:100%;min-width:0}
+    .mods-page .card:hover{border-color:rgba(255,255,255,.14)}
+    .mods-page .head{display:flex;gap:14px;align-items:flex-start;justify-content:flex-start;margin-bottom:0;width:100%}
+    .mods-page .head>div{flex:1;min-width:0}
+    .mods-page .ico{width:60px;height:60px;flex:none;border-radius:15px;display:grid;place-items:center;font:700 22px Sora,sans-serif;color:#B9B5C9;background:#1D1B27;box-shadow:inset 0 0 0 1px rgba(255,255,255,.08)}
+    .mods-page .ico img{width:100%;height:100%;object-fit:contain;display:block}
+    .mods-page .head h3{margin:0;font:600 15.5px/1.25 Sora,Inter,sans-serif;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .mods-page .by{font-size:12px;color:var(--mu);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .mods-page .desc{color:#BDB9CC;font-size:13px;line-height:1.5;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;width:100%;min-height:39px}
+    .mods-page .meta{display:flex;gap:7px;flex-wrap:wrap;align-items:center;font-size:12px;color:var(--mu)}
+    .mods-page .cgrid:has(.tag) .meta{height:80px;overflow:hidden;align-content:flex-start}
+    .mods-page .meta .tag:nth-child(n+5){display:none}
+    .mods-page .cgrid:has(.tag) .meta>span:not(.tag){flex:0 0 100%}
+    .mods-page .tag{padding:2px 9px;border-radius:999px;background:rgba(255,255,255,.06);color:#CFCBDC}
+    .mods-page .foot{display:flex;gap:8px;margin-top:auto}
+    .mods-page .foot .ib{flex:1;margin-top:0}
+    .mods-page .foot .btn:first-child{flex:1}
+    .mods-page .btn{height:38px;padding:0 18px;border:0;border-radius:11px;background:#7C3AED;color:#fff;font-weight:600;font-size:13px;transition:background .15s}
+    .mods-page .btn:hover{background:#8B5CF6}
+    .mods-page .btn.sec{background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.13)}
+    .mods-page .btn.sec:hover{background:rgba(255,255,255,.12)}
+    .mods-page .btn.done{background:rgba(134,239,172,.1);color:#BBF7D0;border:1px solid rgba(134,239,172,.25);cursor:default}
+    .mods-page .btn:disabled{opacity:.75;cursor:default}
+
 </style>
 </svelte:head>
 
@@ -1690,5 +1914,13 @@ function account(){
   <main id="view"></main>
 </div></div>
 <Toast />
+
+{#if editorOpen}
+  <SkinEditorOverlay
+    initialSkinId={S.sk >= 0 ? slotIdAt(S.sk) : null}
+    onEditorSave={onEditorSave}
+    onclose={() => (editorOpen = false)}
+  />
+{/if}
 
 

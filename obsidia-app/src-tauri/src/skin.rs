@@ -8,8 +8,10 @@
 //! la última entrada es la que gana. Por eso ObsidiaSkin se agrega al final.
 
 use base64::Engine;
+use serde_json::{Value, json};
 use std::fs;
-use std::path::Path;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 use crate::options;
 
@@ -69,48 +71,246 @@ pub fn normalize_model(model: &str) -> Result<&'static str, String> {
 
 // ─────────────────────────────── pack.mcmeta ───────────────────────────────────
 
-/// `pack_format` según la versión. `None` (o una versión desconocida) → 4, el más
-/// compatible: junto con `supported_formats` las versiones nuevas lo aceptan igual.
-pub fn pack_format_for(version: Option<&str>) -> u32 {
-    let Some(v) = version else { return 4 };
-    let mut parts = v.trim().split('.');
-    let major: u32 = match parts.next().and_then(|p| p.parse().ok()) {
-        Some(n) => n,
-        None => return 4,
-    };
-    let minor: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
-    let patch: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
-    match (major, minor) {
-        (1, 0..=8) => 1,
-        (1, 9..=10) => 2,
-        (1, 11..=12) => 3,
-        (1, 13..=14) => 4,
-        (1, 15) => 5,
-        (1, 16) if patch <= 1 => 5,
-        (1, 16) => 6,
-        (1, 17) => 7,
-        (1, 18) => 8,
-        (1, 19) if patch <= 2 => 9,
-        (1, 19) if patch == 3 => 12,
-        (1, 19) => 13,
-        (1, 20) if patch <= 1 => 15,
-        (1, 20) if patch == 2 => 18,
-        (1, 20) if patch <= 4 => 22,
-        (1, 20) => 32,
-        (1, 21) if patch >= 4 => 46,
-        (1, 21) if patch >= 2 => 42,
-        (1, 21) => 34,
-        _ => 34,
+/// Formato de recursos de un paquete: `major.minor`.
+///
+/// Los formatos < 65 usan la metadata legacy (`pack_format` + `supported_formats`).
+/// Desde 65 Minecraft exige `min_format`/`max_format` y rechaza los campos viejos.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResourceFormat {
+    major: u32,
+    minor: u32,
+}
+
+impl ResourceFormat {
+    const fn legacy(major: u32) -> Self {
+        Self { major, minor: 0 }
+    }
+
+    const fn modern(major: u32, minor: u32) -> Self {
+        Self { major, minor }
+    }
+
+    fn is_legacy(self) -> bool {
+        self.major < 65
+    }
+
+    /// Mojang acepta un entero cuando el minor es 0 y un par `[major, minor]`
+    /// cuando hay minor. Misma semántica que `PackFormat` de Minecraft.
+    fn as_json(self) -> Value {
+        if self.minor == 0 {
+            json!(self.major)
+        } else {
+            json!([self.major, self.minor])
+        }
     }
 }
 
-/// JSON de `pack.mcmeta`. `supported_formats` hace que 1.20.2+ acepte el pack sin
-/// importar el `pack_format`; las versiones viejas solo miran `pack_format`.
+/// Toma el prefijo numérico de un componente ("9-pre1" → 9).
+fn numeric_prefix(value: &str) -> Option<u32> {
+    let digits: String = value.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
+}
+
+/// Fallback fiable cuando el JAR del cliente todavía no existe.
+///
+/// `None` (sin versión) usa el formato legacy 4. Las versiones modernas nunca
+/// vuelven a 34: 1.21.9+ usa la metadata nueva.
+fn resource_format_for(version: Option<&str>) -> ResourceFormat {
+    let Some(v) = version else {
+        return ResourceFormat::legacy(4);
+    };
+    let mut parts = v.trim().split('.');
+    let Some(major) = parts.next().and_then(numeric_prefix) else {
+        return ResourceFormat::legacy(4);
+    };
+    let minor = parts.next().and_then(numeric_prefix).unwrap_or(0);
+    let patch = parts.next().and_then(numeric_prefix).unwrap_or(0);
+    match (major, minor) {
+        (1, 0..=8) => ResourceFormat::legacy(1),
+        (1, 9..=10) => ResourceFormat::legacy(2),
+        (1, 11..=12) => ResourceFormat::legacy(3),
+        (1, 13..=14) => ResourceFormat::legacy(4),
+        (1, 15) => ResourceFormat::legacy(5),
+        (1, 16) if patch <= 1 => ResourceFormat::legacy(5),
+        (1, 16) => ResourceFormat::legacy(6),
+        (1, 17) => ResourceFormat::legacy(7),
+        (1, 18) => ResourceFormat::legacy(8),
+        (1, 19) if patch <= 2 => ResourceFormat::legacy(9),
+        (1, 19) if patch == 3 => ResourceFormat::legacy(12),
+        (1, 19) => ResourceFormat::legacy(13),
+        (1, 20) if patch <= 1 => ResourceFormat::legacy(15),
+        (1, 20) if patch == 2 => ResourceFormat::legacy(18),
+        (1, 20) if patch <= 4 => ResourceFormat::legacy(22),
+        (1, 20) => ResourceFormat::legacy(32),
+        (1, 21) => match patch {
+            0..=1 => ResourceFormat::legacy(34),
+            2..=3 => ResourceFormat::legacy(42),
+            4 => ResourceFormat::legacy(46),
+            5 => ResourceFormat::legacy(55),
+            6 => ResourceFormat::legacy(63),
+            7..=8 => ResourceFormat::legacy(64),
+            9..=10 => ResourceFormat::modern(69, 0),
+            11 => ResourceFormat::modern(75, 0),
+            // Versión 1.21.x posterior a la última conocida: mantener formato moderno.
+            _ => ResourceFormat::modern(75, 0),
+        },
+        (1, m) if m > 21 => ResourceFormat::modern(75, 0),
+        (26, 1) => ResourceFormat::modern(84, 0),
+        (26, 2) => ResourceFormat::modern(88, 0),
+        (26, 3) => ResourceFormat::modern(97, 1),
+        (26, m) if m > 3 => ResourceFormat::modern(97, 1),
+        (m, _) if m > 26 => ResourceFormat::modern(97, 1),
+        _ => ResourceFormat::legacy(4),
+    }
+}
+
+/// `pack_format` legacy o major moderno. Para el JSON completo usar `pack_meta_json`.
+#[allow(dead_code)]
+pub fn pack_format_for(version: Option<&str>) -> u32 {
+    resource_format_for(version).major
+}
+
+/// Identificador seguro de versión: un único componente de ruta.
+fn client_version_id(version: &str) -> Option<&str> {
+    let value = version.trim();
+    let mut components = Path::new(value).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(_)), None) => Some(value),
+        _ => None,
+    }
+}
+
+/// Rutas posibles del JAR del cliente. Cubre `.minecraft` como gameDir y también
+/// una instancia en `.minecraft/instances/<id>` (sube hasta la raíz).
+fn version_jar_candidates(mc: &Path, version: &str) -> Vec<PathBuf> {
+    let relative = Path::new("versions")
+        .join(version)
+        .join(format!("{version}.jar"));
+    let mut candidates = Vec::new();
+    let mut current = Some(mc);
+    for _ in 0..3 {
+        let Some(directory) = current else {
+            break;
+        };
+        let candidate = directory.join(&relative);
+        if candidate.is_file() {
+            candidates.push(candidate);
+        }
+        current = directory.parent();
+    }
+    candidates
+}
+
+/// Lee `version.json` en la raíz del JAR y extrae `pack_version`.
+fn parse_pack_version(json_text: &str) -> Option<ResourceFormat> {
+    let root: Value = serde_json::from_str(json_text).ok()?;
+    let pack_version = root.get("pack_version")?;
+
+    if let Some(object) = pack_version.as_object() {
+        if let Some(major) = object.get("resource_major").and_then(Value::as_u64) {
+            let minor = object
+                .get("resource_minor")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            return Some(ResourceFormat {
+                major: u32::try_from(major).ok()?,
+                minor: u32::try_from(minor).ok()?,
+            });
+        }
+        if let Some(resource) = object.get("resource") {
+            return parse_format_value(resource);
+        }
+    }
+
+    // Esquemas viejos: `"pack_version": 15` o `[major, minor]`.
+    parse_format_value(pack_version)
+}
+
+fn parse_format_value(value: &Value) -> Option<ResourceFormat> {
+    if let Some(number) = value.as_u64() {
+        return Some(ResourceFormat::legacy(u32::try_from(number).ok()?));
+    }
+    if let Some(array) = value.as_array() {
+        if array.len() != 2 {
+            return None;
+        }
+        return Some(ResourceFormat {
+            major: u32::try_from(array[0].as_u64()?).ok()?,
+            minor: u32::try_from(array[1].as_u64()?).ok()?,
+        });
+    }
+    if let Some(object) = value.as_object() {
+        let major = u32::try_from(object.get("major")?.as_u64()?).ok()?;
+        let minor = object.get("minor").and_then(Value::as_u64).unwrap_or(0);
+        return Some(ResourceFormat {
+            major,
+            minor: u32::try_from(minor).ok()?,
+        });
+    }
+    None
+}
+
+fn resource_format_from_jar(path: &Path) -> Option<ResourceFormat> {
+    let file = fs::File::open(path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    let mut entry = archive.by_name("version.json").ok()?;
+    let mut json_text = String::new();
+    entry.read_to_string(&mut json_text).ok()?;
+    parse_pack_version(&json_text)
+}
+
+fn resource_format_from_client(mc: &Path, version: &str) -> Option<ResourceFormat> {
+    version_jar_candidates(mc, version)
+        .into_iter()
+        .find_map(|path| resource_format_from_jar(&path))
+}
+
+/// Prefiere el `pack_version` real del cliente; si el JAR falta o está roto,
+/// cae en la tabla por versión.
+fn resource_format_for_client(mc: &Path, version: Option<&str>) -> ResourceFormat {
+    let fallback = resource_format_for(version);
+    let Some(raw) = version else {
+        return fallback;
+    };
+    let Some(id) = client_version_id(raw) else {
+        return fallback;
+    };
+    resource_format_from_client(mc, id).unwrap_or(fallback)
+}
+
+fn pack_meta_json_for_format(format: ResourceFormat) -> String {
+    let pack = if format.is_legacy() {
+        json!({
+            "pack_format": format.major,
+            "description": "Obsidia offline skin",
+            "supported_formats": {
+                "min_inclusive": 1,
+                "max_inclusive": 64,
+            }
+        })
+    } else {
+        json!({
+            "description": "Obsidia offline skin",
+            "min_format": format.as_json(),
+            "max_format": format.as_json(),
+        })
+    };
+    json!({ "pack": pack }).to_string()
+}
+
+/// JSON de `pack.mcmeta` usando solo la tabla por versión.
+#[allow(dead_code)]
 pub fn pack_meta_json(version: Option<&str>) -> String {
-    format!(
-        "{{\"pack\":{{\"pack_format\":{},\"description\":\"Obsidia offline skin\",\"supported_formats\":{{\"min_inclusive\":1,\"max_inclusive\":999}}}}}}",
-        pack_format_for(version)
-    )
+    pack_meta_json_for_format(resource_format_for(version))
+}
+
+/// JSON real para el pack, leyendo el JAR del cliente cuando está disponible.
+fn pack_meta_json_for_client(mc: &Path, version: Option<&str>) -> String {
+    pack_meta_json_for_format(resource_format_for_client(mc, version))
 }
 
 // ───────────────────────────── Aplicar / quitar ──────────────────────────────
@@ -153,7 +353,10 @@ fn write_pack(mc: &Path, png: &[u8], version: Option<&str>) -> Result<(), String
     }
     fs::create_dir_all(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
 
-    write_file(&tmp.join("pack.mcmeta"), pack_meta_json(version).as_bytes())?;
+    write_file(
+        &tmp.join("pack.mcmeta"),
+        pack_meta_json_for_client(mc, version).as_bytes(),
+    )?;
     write_file(&tmp.join("pack.png"), png)?;
 
     let entity = tmp
@@ -316,6 +519,30 @@ mod tests {
         dir
     }
 
+    /// JAR mínimo con `version.json` en la raíz, como el cliente real.
+    fn version_jar(root: &Path, version: &str, major: u32, minor: u32) {
+        use std::io::Write;
+        let path = root
+            .join("versions")
+            .join(version)
+            .join(format!("{version}.jar"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = fs::File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file("version.json", options).unwrap();
+        let json = format!(
+            r#"{{"id":"{version}","pack_version":{{"resource_major":{major},"resource_minor":{minor},"data_major":1,"data_minor":0}}}}"#
+        );
+        zip.write_all(json.as_bytes()).unwrap();
+        zip.finish().unwrap();
+    }
+
+    fn pack_json(text: &str) -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(text).unwrap()["pack"].clone()
+    }
+
     #[test]
     fn valida_png() {
         assert!(decode_skin(&b64(&png(64, 64))).is_ok());
@@ -436,7 +663,185 @@ mod tests {
         assert_eq!(pack_format_for(Some("1.21.4")), 46);
         assert!(pack_meta_json(Some("1.13")).contains("\"pack_format\":4"));
         assert!(pack_meta_json(Some("1.21.4")).contains("\"pack_format\":46"));
-        assert!(pack_meta_json(None).contains("\"max_inclusive\":999"));
+        assert!(!pack_meta_json(None).contains("999"));
+    }
+
+    #[test]
+    fn formatos_de_recursos_por_version() {
+        let cases = [
+            ("1.8.9", 1, 0),
+            ("1.12.2", 3, 0),
+            ("1.16.5", 6, 0),
+            ("1.20.1", 15, 0),
+            ("1.21.4", 46, 0),
+            ("1.21.5", 55, 0),
+            ("1.21.6", 63, 0),
+            ("1.21.7", 64, 0),
+            ("1.21.8", 64, 0),
+            ("1.21.9", 69, 0),
+            ("1.21.10", 69, 0),
+            ("1.21.11", 75, 0),
+            ("26.1", 84, 0),
+            ("26.1.2", 84, 0),
+            ("26.2", 88, 0),
+            ("26.3", 97, 1),
+        ];
+        for (version, major, minor) in cases {
+            let format = resource_format_for(Some(version));
+            assert_eq!(format, ResourceFormat { major, minor }, "versión {version}");
+            assert_eq!(pack_format_for(Some(version)), major, "versión {version}");
+        }
+    }
+
+    #[test]
+    fn metadatos_legacy_no_superan_64_ni_usan_campos_modernos() {
+        let cases = [
+            ("1.8.9", 1),
+            ("1.12.2", 3),
+            ("1.16.5", 6),
+            ("1.20.1", 15),
+            ("1.21.4", 46),
+            ("1.21.5", 55),
+            ("1.21.6", 63),
+            ("1.21.7", 64),
+            ("1.21.8", 64),
+        ];
+        for (version, format) in cases {
+            let text = pack_meta_json(Some(version));
+            let pack = pack_json(&text);
+            assert_eq!(pack["pack_format"], json!(format), "versión {version}");
+            assert_eq!(
+                pack["supported_formats"]["min_inclusive"],
+                json!(1),
+                "versión {version}"
+            );
+            assert_eq!(
+                pack["supported_formats"]["max_inclusive"],
+                json!(64),
+                "versión {version}"
+            );
+            assert!(format < 65, "versión {version}");
+            assert!(pack.get("min_format").is_none(), "versión {version}");
+            assert!(pack.get("max_format").is_none(), "versión {version}");
+            assert!(!text.contains("999"), "versión {version}");
+        }
+    }
+
+    #[test]
+    fn metadatos_modernos_no_usan_campos_legacy() {
+        let cases = [
+            ("1.21.9", json!(69)),
+            ("1.21.11", json!(75)),
+            ("26.3", json!([97, 1])),
+        ];
+        for (version, expected) in cases {
+            let text = pack_meta_json(Some(version));
+            let pack = pack_json(&text);
+            assert!(pack.get("pack_format").is_none(), "versión {version}");
+            assert!(pack.get("supported_formats").is_none(), "versión {version}");
+            assert_eq!(pack["min_format"], expected, "versión {version}");
+            assert_eq!(pack["max_format"], expected, "versión {version}");
+            assert!(!text.contains("max_inclusive"), "versión {version}");
+        }
+    }
+
+    #[test]
+    fn sin_version_usa_legacy_4_sin_999() {
+        let text = pack_meta_json(None);
+        let pack = pack_json(&text);
+        assert_eq!(pack["pack_format"], json!(4));
+        assert_eq!(pack["supported_formats"]["max_inclusive"], json!(64));
+        assert!(!text.contains("999"));
+    }
+
+    #[test]
+    fn interpreta_pack_version_del_cliente() {
+        assert_eq!(
+            parse_pack_version(
+                r#"{"pack_version":{"resource_major":97,"resource_minor":1,"data_major":121,"data_minor":0}}"#
+            ),
+            Some(ResourceFormat {
+                major: 97,
+                minor: 1
+            })
+        );
+        assert_eq!(
+            parse_pack_version(r#"{"pack_version":{"resource":46,"data":61}}"#),
+            Some(ResourceFormat {
+                major: 46,
+                minor: 0
+            })
+        );
+        assert_eq!(
+            parse_pack_version(r#"{"pack_version":15}"#),
+            Some(ResourceFormat {
+                major: 15,
+                minor: 0
+            })
+        );
+        assert_eq!(
+            parse_pack_version(r#"{"pack_version":[64,0]}"#),
+            Some(ResourceFormat {
+                major: 64,
+                minor: 0
+            })
+        );
+        assert_eq!(parse_pack_version("{}"), None);
+    }
+
+    #[test]
+    fn prefiere_el_version_json_del_jar() {
+        let root = temp_mc("jar-pref");
+        let instance = root.join("instances").join("probe");
+        fs::create_dir_all(&instance).unwrap();
+        // La tabla diría 46 para 1.21.4; el cliente real manda.
+        version_jar(&root, "1.21.4", 97, 1);
+
+        let text = pack_meta_json_for_client(&instance, Some("1.21.4"));
+        let pack = pack_json(&text);
+        assert_eq!(pack["min_format"], json!([97, 1]));
+        assert_eq!(pack["max_format"], json!([97, 1]));
+        assert!(pack.get("pack_format").is_none());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fallback_si_el_jar_no_existe_o_esta_roto() {
+        let root = temp_mc("jar-fallback");
+        let instance = root.join("instances").join("probe");
+        fs::create_dir_all(&instance).unwrap();
+
+        let text = pack_meta_json_for_client(&instance, Some("26.3"));
+        let pack = pack_json(&text);
+        assert_eq!(pack["min_format"], json!([97, 1]));
+
+        let jar = root.join("versions").join("26.3").join("26.3.jar");
+        fs::create_dir_all(jar.parent().unwrap()).unwrap();
+        fs::write(&jar, b"no es un zip").unwrap();
+        let text = pack_meta_json_for_client(&instance, Some("26.3"));
+        let pack = pack_json(&text);
+        assert_eq!(pack["min_format"], json!([97, 1]));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn apply_skin_26_3_escribe_metadata_moderna() {
+        let mc = temp_mc("apply-263");
+        fs::write(mc.join("options.txt"), "resourcePacks:[]\n").unwrap();
+
+        apply_skin(&mc, &png(64, 64), "classic", Some("26.3")).unwrap();
+
+        let text = fs::read_to_string(mc.join("resourcepacks").join(PACK_NAME).join("pack.mcmeta"))
+            .unwrap();
+        let pack = pack_json(&text);
+        assert_eq!(pack["min_format"], json!([97, 1]));
+        assert_eq!(pack["max_format"], json!([97, 1]));
+        assert!(pack.get("pack_format").is_none());
+        assert!(pack.get("supported_formats").is_none());
+
+        let _ = fs::remove_dir_all(&mc);
     }
 
     #[test]

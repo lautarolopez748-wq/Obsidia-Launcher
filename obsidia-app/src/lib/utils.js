@@ -113,6 +113,40 @@ export function safeImageUrl(src) {
   try { return encodeURI(s).replace(/'/g, '%27').replace(/&/g, '%26'); } catch(e){ return ''; }
 }
 
+export function modCard(kind, r, busy, installedFile, progress) {
+  const inst = installedFile;
+  const safe = safeImageUrl(r.icon_url);
+  const ico = safe
+    ? `<img src="${safe}" alt="${esc(r.title)}" style="width:60px;height:60px;object-fit:contain">`
+    : `<div class="ico">${r.title.charAt(0).toUpperCase()}</div>`;
+
+  let tags = '';
+  if (r.categories && Array.isArray(r.categories)) {
+    tags += r.categories.map(cat => `<span class="tag">${esc(cat)}</span>`).join('');
+  }
+  if (r.loaders && Array.isArray(r.loaders)) {
+    tags += r.loaders.map(l => `<span class="tag">${esc(l)}</span>`).join('');
+  }
+
+  const dl = (r.downloads || 0).toLocaleString('es-AR') + ' descargas';
+
+  let btnLabel = 'Instalar';
+  let btnDisabled = false;
+  if (progress) {
+    if (progress.stage === 'resolving') { btnLabel = 'Instalar'; btnDisabled = true; }
+    else if (progress.stage === 'downloading') {
+      const pct = progress.total > 0 ? Math.round(100 * progress.done / progress.total) : 0;
+      btnLabel = `Descargando ${pct} %`; btnDisabled = true;
+    }
+    else if (progress.stage === 'applying') { btnLabel = 'Instalar'; btnDisabled = true; }
+  }
+  if (busy) { btnLabel = 'Instalando...'; btnDisabled = true; }
+  else if (btnDisabled) btnDisabled = true;
+  if (inst) { btnLabel = 'Instalado ✓'; }
+
+  return `<article class="card"><div class="head">${ico}<div><h3>${esc(r.title)}</h3><div class="by">por ${esc(r.author || '')}</div></div></div><div class="desc">${esc(r.description || '')}</div><div class="meta">${tags}<span>${dl}</span></div><div class="foot">${inst ? '<button class="btn done" disabled>Instalado</button>' : `<button class="ib" ${btnDisabled ? 'disabled' : ''} data-act="inst" data-kind="${kind}" data-slug="${esc(r.slug)}">${btnLabel}</button>`}<button class="btn sec" data-act="openmod" data-kind="${kind}" data-slug="${esc(r.slug)}">Ver</button></div></article>`;
+}
+
 export function resCard(kind, r, busy, installedFile, progress) {
   const inst = installedFile;
   /** @param {any} src @param {string} grad */

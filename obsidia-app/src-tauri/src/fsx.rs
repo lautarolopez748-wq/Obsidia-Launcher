@@ -28,6 +28,7 @@ use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::content;
@@ -36,6 +37,24 @@ pub fn sha1_hex(bytes: &[u8]) -> String {
     let mut h = Sha1::new();
     h.update(bytes);
     format!("{:x}", h.finalize())
+}
+
+/// Calcula el SHA1 de un archivo leyéndolo por chunks, sin cargarlo entero en RAM.
+pub fn sha1_hex_file(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+    let mut f = fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut h = Sha1::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = f
+            .read(&mut buf)
+            .map_err(|e| format!("leer {}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", h.finalize()))
 }
 
 // ───────────────────────────── Serialización por instancia ─────────────────────────────
@@ -616,8 +635,10 @@ pub fn apply_update_transactional(
             dest: dest.to_path_buf(),
             bytes: bytes.to_vec(),
             expected_sha1: expected_sha1.map(String::from),
+            source_file: None,
             entry,
         }],
+        &std::sync::atomic::AtomicBool::new(false),
     )
 }
 
@@ -762,6 +783,11 @@ pub struct BatchItem {
     pub bytes: Vec<u8>,
     pub expected_sha1: Option<String>,
     pub entry: content::ContentEntry,
+    /// Si se tiene `Some`, el contenido se lee de este archivo temporal en
+    /// disco en lugar de de `bytes`. Permite instalar archivos grandes sin
+    /// mantenerlos en RAM. El llamador es responsable de calcular y validar
+    /// el hash antes de crear el ítem.
+    pub source_file: Option<PathBuf>,
 }
 
 /// Escribe `bytes` en `dest` de forma atómica, saltando la verificación de SHA1
@@ -791,6 +817,44 @@ pub fn write_atomic_prehashed(dest: &Path, bytes: &[u8], new_hash: &str) -> Resu
     }
     if let Err(e) = fs::rename(&tmp, dest) {
         // Restaurar el original si el reemplazo falla.
+        if backup.exists() {
+            fs::rename(&backup, dest)
+                .map_err(|e2| format!("{}: {e}; restauración falló: {e2}", dest.display()))?;
+        }
+        return Err(format!("{}: {e}", dest.display()));
+    }
+    Ok(())
+}
+
+/// Escribe `source_file` en `dest` de forma atómica, copiando de disco a disco
+/// sin cargar el contenido en RAM. Equivalente a `write_atomic_prehashed` pero
+/// leyendo desde un archivo temporal ya preparado.
+pub fn write_atomic_from_file(
+    dest: &Path,
+    source_file: &Path,
+    new_hash: &str,
+) -> Result<(), String> {
+    let _ = new_hash; // El hash ya fue validado por el llamador.
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+
+    let mut tmp = dest.to_path_buf().into_os_string();
+    tmp.push(".part");
+    let tmp = PathBuf::from(tmp);
+    fs::copy(source_file, &tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
+
+    let backup = dest.with_file_name(format!(
+        "{}.old",
+        dest.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    if dest.exists() {
+        if backup.exists() {
+            fs::remove_file(&backup).map_err(|e| format!("{}: {e}", backup.display()))?;
+        }
+        fs::rename(dest, &backup).map_err(|e| format!("{}: {e}", dest.display()))?;
+    }
+    if let Err(e) = fs::rename(&tmp, dest) {
         if backup.exists() {
             fs::rename(&backup, dest)
                 .map_err(|e2| format!("{}: {e}; restauración falló: {e2}", dest.display()))?;
@@ -865,6 +929,7 @@ pub fn apply_batch_transactional(
     kind: &str,
     subdir: &Path,
     items: Vec<BatchItem>,
+    cancelled: &AtomicBool,
 ) -> Result<(), String> {
     if items.is_empty() {
         return Ok(());
@@ -917,7 +982,11 @@ pub fn apply_batch_transactional(
             });
         let old_filename = old_entry.map(|e| e.filename.clone());
         let old_slug = old_entry.map(|e| e.slug.clone());
-        let new_hash = sha1_hex(&item.bytes);
+        let new_hash = if let Some(source) = &item.source_file {
+            sha1_hex_file(source)?
+        } else {
+            sha1_hex(&item.bytes)
+        };
 
         let journal_entry = JournalEntry {
             op: "install".to_string(),
@@ -955,11 +1024,35 @@ pub fn apply_batch_transactional(
     journal.pending.extend(journal_entries.clone());
     write_journal(instance_dir, &journal)?;
 
-    // 7. Escribir cada archivo con write_atomic_prehashed en el orden recibido.
-    //    Si alguno falla, hacer rollback verificado de los ya escritos.
+    // 7. Escribir cada archivo en el orden recibido.
+    //    Si alguno falla o se solicita cancelación, hacer rollback verificado
+    //    de los ya escritos.
     let mut written: Vec<usize> = Vec::new();
     for (i, item) in items.iter().enumerate() {
-        if let Err(e) = write_atomic_prehashed(&item.dest, &item.bytes, &new_hashes[i]) {
+        // Comprobar cancelación antes de tocar cada archivo: punto seguro,
+        // ningún archivo queda a medias porque aún no se ha escrito este ítem.
+        if cancelled.load(Ordering::Relaxed) {
+            // Rollback de archivos ya escritos.
+            let mut revertidos: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            for &j in &written {
+                if let Err(_) = restaurar_y_verificar(&items[j].dest, &prev_contents[j]) {
+                    // Si el rollback falla, la entrada se conserva en el journal
+                    // para recuperación posterior.
+                } else {
+                    revertidos.insert(j);
+                }
+            }
+            let escritos: std::collections::HashSet<usize> = written.iter().copied().collect();
+            let _ = retirar_entradas_journal(instance_dir, &items, &revertidos, &escritos);
+            return Err("Instalación cancelada".to_string());
+        }
+
+        let write_result = if let Some(source) = &item.source_file {
+            write_atomic_from_file(&item.dest, source, &new_hashes[i])
+        } else {
+            write_atomic_prehashed(&item.dest, &item.bytes, &new_hashes[i])
+        };
+        if let Err(e) = write_result {
             // Rollback verificado de archivos ya escritos (0..i).
             let mut revertidos: std::collections::HashSet<usize> = std::collections::HashSet::new();
             let mut _rollback_fallo = false;
@@ -3922,6 +4015,7 @@ mod tests {
             dest: base_dir.join(dest_rel),
             bytes: content.to_vec(),
             expected_sha1: None,
+            source_file: None,
             entry: crate::content::ContentEntry {
                 slug: slug.to_string(),
                 project_id: None,
@@ -3951,7 +4045,14 @@ mod tests {
             batch_entry(&dir, "c", "mods/c.jar", "vc", b"contenido-c"),
         ];
 
-        apply_batch_transactional(&dir, "mods", &dir.join("mods"), items).unwrap();
+        apply_batch_transactional(
+            &dir,
+            "mods",
+            &dir.join("mods"),
+            items,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
 
         // Índice con 3 entradas.
         let entries = read_index(&dir, "mods").unwrap();
@@ -4002,6 +4103,7 @@ mod tests {
                 dest: dir.join("mods").join("b.jar"),
                 bytes: b"corrupto".to_vec(),
                 expected_sha1: Some("0000000000000000000000000000000000000000".to_string()),
+                source_file: None,
                 entry: crate::content::ContentEntry {
                     slug: "b".to_string(),
                     project_id: None,
@@ -4017,7 +4119,13 @@ mod tests {
             },
         ];
 
-        let res = apply_batch_transactional(&dir, "mods", &dir.join("mods"), items);
+        let res = apply_batch_transactional(
+            &dir,
+            "mods",
+            &dir.join("mods"),
+            items,
+            &std::sync::atomic::AtomicBool::new(false),
+        );
         assert!(res.is_err());
 
         // El 1er item se revierte: no existe ni está en el índice.
@@ -4069,7 +4177,13 @@ mod tests {
 
         let items = vec![batch_entry(&dir, "a", "mods/a.jar", "va", b"contenido-a")];
 
-        let res = apply_batch_transactional(&dir, "mods", &dir.join("mods"), items);
+        let res = apply_batch_transactional(
+            &dir,
+            "mods",
+            &dir.join("mods"),
+            items,
+            &std::sync::atomic::AtomicBool::new(false),
+        );
         assert!(res.is_err());
 
         // Archivo restaurado al contenido previo (write_index falló, todo se revirtió).
@@ -4111,6 +4225,7 @@ mod tests {
                 dest: dir.join("mods").join("b.jar"),
                 bytes: b"corrupto".to_vec(),
                 expected_sha1: Some("0000000000000000000000000000000000000000".to_string()),
+                source_file: None,
                 entry: crate::content::ContentEntry {
                     slug: "b".to_string(),
                     project_id: None,
@@ -4127,7 +4242,13 @@ mod tests {
             batch_entry(&dir, "c", "mods/c.jar", "vc", b"contenido-c"),
         ];
 
-        let res = apply_batch_transactional(&dir, "mods", &dir.join("mods"), items);
+        let res = apply_batch_transactional(
+            &dir,
+            "mods",
+            &dir.join("mods"),
+            items,
+            &std::sync::atomic::AtomicBool::new(false),
+        );
         assert!(res.is_err());
 
         // Ninguno de los 3 archivos se escribió.
@@ -4182,7 +4303,13 @@ mod tests {
 
         let items = vec![batch_entry(&dir, "a", "mods/a.jar", "va", b"contenido-a")];
 
-        let res = apply_batch_transactional(&dir, "mods", &dir.join("mods"), items);
+        let res = apply_batch_transactional(
+            &dir,
+            "mods",
+            &dir.join("mods"),
+            items,
+            &std::sync::atomic::AtomicBool::new(false),
+        );
         assert!(res.is_err());
 
         // Archivo restaurado al contenido previo.
@@ -4230,7 +4357,14 @@ mod tests {
         // Actualizar con filename distinto (mod-v2.jar). El v1 debe borrarse.
         let items = vec![batch_entry(&dir, "mod", "mods/mod-v2.jar", "v2", b"v2")];
 
-        apply_batch_transactional(&dir, "mods", &dir.join("mods"), items).unwrap();
+        apply_batch_transactional(
+            &dir,
+            "mods",
+            &dir.join("mods"),
+            items,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
 
         assert!(!dir.join("mods").join("mod-v1.jar").exists());
         assert!(dir.join("mods").join("mod-v2.jar").exists());

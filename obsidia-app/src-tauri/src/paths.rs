@@ -284,7 +284,7 @@ pub(crate) fn is_windows_reserved(name: &str) -> bool {
 /// la comprobación léxica. Si la instancia existe, se canonicaliza y se compara
 /// contra la raíz canonicalizada: un junction o symlink que apunte afuera se
 /// rechaza. Un enlace roto también se rechaza porque no se puede verificar.
-fn ensure_inside(root: &Path, candidate: &Path) -> Result<(), String> {
+pub(crate) fn ensure_inside(root: &Path, candidate: &Path) -> Result<(), String> {
     if !candidate.starts_with(root) {
         return Err(format!(
             "La ruta {} queda fuera de {}",

@@ -5,6 +5,9 @@ mod fsx;
 mod instances;
 mod launcher;
 mod loader_version;
+mod modpack_manager;
+mod mrpack;
+mod mrpack_install;
 mod options;
 mod packs;
 mod paths;
@@ -12,6 +15,10 @@ mod skin;
 
 use crate::instances::InstanceMarker;
 use crate::launcher::sha1_hex;
+use crate::modpack_manager::{
+    cancel_modpack_install, install_modpack_from_local, install_modpack_from_modrinth,
+    install_modpack_into_instance,
+};
 use crate::paths::InstanceId;
 use base64::Engine;
 use futures_util::StreamExt;
@@ -149,7 +156,7 @@ async fn log_performance_event(event: String) {
 
 /// Progreso de instalación de mods para el evento `install-progress`.
 #[derive(Serialize, Clone)]
-struct InstallProgress {
+pub(crate) struct InstallProgress {
     stage: &'static str,
     slug: String,
     instance: String,
@@ -159,7 +166,7 @@ struct InstallProgress {
 
 /// Emite el evento `install-progress` → { stage, slug, instance, done, total }.
 /// Nunca falla el comando si el envío falla.
-fn install_progress(
+pub(crate) fn install_progress(
     app: &tauri::AppHandle,
     stage: &'static str,
     slug: &str,
@@ -1514,7 +1521,26 @@ async fn launch_instance_inner(
         .ok_or_else(|| format!("No existe la instancia {}", id))?
         .clone();
 
-    let version = profile.version.clone();
+    // Resolver el ID de versión: si hay loader, usar el ID completo del loader
+    // (ej. "1.21.4-fabric-0.16.0" o "1.21.4-forge-40.1.0"); si es Vanilla, usar
+    // la versión de Minecraft directamente.
+    let version = match profile.loader.as_deref() {
+        Some("Fabric") | Some("fabric") => {
+            if let Some(lv) = &profile.loader_version {
+                format!("fabric-loader-{lv}-{}", profile.version)
+            } else {
+                profile.version.clone()
+            }
+        }
+        Some("Forge") | Some("forge") => {
+            if let Some(lv) = &profile.loader_version {
+                format!("{}-forge-{}", profile.version, lv)
+            } else {
+                profile.version.clone()
+            }
+        }
+        _ => profile.version.clone(),
+    };
     let ram = Some(profile.ram.clone());
     let java_path = profile.java_path.clone();
     let fullscreen = profile.fullscreen;
@@ -1580,7 +1606,7 @@ async fn launch_instance_inner(
 /// Descarga un instalador y comprueba su SHA1 contra el archivo `<url>.sha1` que publica el
 /// mismo Maven. Si ya está descargado y coincide no se vuelve a bajar; nunca se ejecuta un
 /// archivo cuyo hash no se pudo comprobar.
-fn download_verified(url: &str, dest: &Path) -> Result<(), String> {
+pub(crate) fn download_verified(url: &str, dest: &Path) -> Result<(), String> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -1636,7 +1662,7 @@ const FABRIC_INSTALLER_FALLBACK: (&str, &str) = (
 );
 
 /// (versión, url) del instalador estable más nuevo de Fabric.
-fn fabric_installer() -> (String, String) {
+pub(crate) fn fabric_installer() -> (String, String) {
     let fallback = || {
         (
             FABRIC_INSTALLER_FALLBACK.0.to_string(),
@@ -1828,6 +1854,23 @@ pub struct ModResult {
     pub downloads: u64,
     #[serde(default)]
     pub icon_url: Option<String>,
+}
+
+/// Resultado de búsqueda de modpacks en Modrinth.
+/// Contiene todos los campos necesarios para mostrar en la UI sin consultas adicionales.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModpackResult {
+    pub id: String,
+    pub slug: String,
+    pub title: String,
+    pub description: String,
+    pub downloads: u64,
+    #[serde(default)]
+    pub icon_url: Option<String>,
+    pub author: String,
+    pub categories: Vec<String>,
+    pub versions: Vec<String>,
+    pub loaders: Vec<String>,
 }
 
 // Los tipos del plan viven en `dependencies` (resolución pura, sin red ni disco).
@@ -2140,7 +2183,7 @@ async fn list_content(
     kind: String,
 ) -> Result<Vec<content::ContentItem>, String> {
     let kind = match kind.as_str() {
-        "mods" | "shaders" | "packs" => kind,
+        "mods" | "shaders" | "packs" | "modpacks" => kind,
         _ => return Err("Tipo de contenido no válido".to_string()),
     };
     let paths = paths.inner().clone();
@@ -2154,7 +2197,7 @@ async fn check_content_updates(
     kind: String,
 ) -> Result<Vec<content::UpdateStatus>, String> {
     let kind = match kind.as_str() {
-        "mods" | "shaders" | "packs" => kind,
+        "mods" | "shaders" | "packs" | "modpacks" => kind,
         _ => return Err("Tipo de contenido no válido".to_string()),
     };
     let paths = paths.inner().clone();
@@ -2330,6 +2373,178 @@ async fn search_resourcepacks(
     version: Option<String>,
 ) -> Result<Vec<ModResult>, String> {
     search_modrinth(query, "resourcepack", None, version.as_deref(), None).await
+}
+
+/// Busca modpacks en Modrinth (`project_type:modpack`).
+///
+/// Reutiliza el cliente HTTP y User-Agent de Obsidia. Filtra obligatoriamente por
+/// `project_type:modpack` y permite búsqueda por nombre, versión de Minecraft y loader.
+/// No realiza consultas individuales por resultado: todos los campos necesarios están
+/// en la respuesta de búsqueda.
+async fn search_modpacks_internal(
+    query: String,
+    version: Option<&str>,
+    loader: Option<&str>,
+    offset: usize,
+    limit: usize,
+) -> Result<Vec<ModpackResult>, String> {
+    // Validar límites de paginación.
+    if limit == 0 || limit > 100 {
+        return Err("Límite de resultados inválido (1-100)".to_string());
+    }
+
+    // Construir facets: project_type:modpack es obligatorio.
+    let mut groups: Vec<String> = vec!["[\"project_type:modpack\"]".to_string()];
+    if let Some(v) = version {
+        groups.push(format!("[\"versions:{}\"]", v));
+    }
+    if let Some(l) = loader {
+        groups.push(format!("[\"categories:{}\"]", l.to_lowercase()));
+    }
+    let facets = format!("[{}]", groups.join(", "));
+
+    let client = http()?;
+    let resp = client
+        .get("https://api.modrinth.com/v2/search")
+        .query(&[
+            ("query", query.as_str()),
+            ("facets", facets.as_str()),
+            ("limit", limit.to_string().as_str()),
+            ("offset", offset.to_string().as_str()),
+            ("index", "downloads"),
+        ])
+        .send()
+        .await
+        .map_err(|e| format!("Error consultando Modrinth: {e}"))?;
+
+    // Manejar errores HTTP explícitamente.
+    if !resp.status().is_success() {
+        return Err(format!(
+            "Modrinth respondió HTTP {}",
+            resp.status().as_u16()
+        ));
+    }
+
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Respuesta JSON inválida: {e}"))?;
+
+    let hits = json
+        .get("hits")
+        .and_then(|h| h.as_array())
+        .ok_or_else(|| "Modrinth no devolvió hits".to_string())?;
+
+    let mut out = Vec::with_capacity(hits.len());
+    for h in hits {
+        let slug = h
+            .get("slug")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+        if slug.is_empty() {
+            continue; // Saltar resultados sin slug (inválidos)
+        }
+
+        let project_id = h
+            .get("project_id")
+            .and_then(|s| s.as_str())
+            .unwrap_or(&slug)
+            .to_string();
+
+        let title = h
+            .get("title")
+            .and_then(|s| s.as_str())
+            .unwrap_or(&slug)
+            .to_string();
+
+        let description = h
+            .get("description")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let downloads = h.get("downloads").and_then(|d| d.as_u64()).unwrap_or(0);
+
+        let icon_url = h
+            .get("icon_url")
+            .and_then(|v| v.as_str())
+            .map(|x| x.to_string());
+
+        // El autor puede estar en "author" (team) o "team".
+        let author = h
+            .get("author")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        // Categorías (incluye loaders en Modrinth).
+        let categories: Vec<String> = h
+            .get("categories")
+            .and_then(|c| c.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Versiones de Minecraft compatibles.
+        let versions: Vec<String> = h
+            .get("versions")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Loaders compatibles.
+        let loaders: Vec<String> = h
+            .get("loaders")
+            .and_then(|l| l.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        out.push(ModpackResult {
+            id: project_id,
+            slug,
+            title,
+            description,
+            downloads,
+            icon_url,
+            author,
+            categories,
+            versions,
+            loaders,
+        });
+    }
+
+    Ok(out)
+}
+
+/// Comando Tauri: busca modpacks en Modrinth.
+#[tauri::command]
+async fn search_modpacks(
+    query: String,
+    version: Option<String>,
+    loader: Option<String>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<Vec<ModpackResult>, String> {
+    search_modpacks_internal(
+        query,
+        version.as_deref(),
+        loader.as_deref(),
+        offset.unwrap_or(0),
+        limit.unwrap_or(20),
+    )
+    .await
 }
 
 /// Modrinth devuelve primero lo más nuevo, alphas y betas incluidas: se prefiere la
@@ -3008,6 +3223,7 @@ async fn install_mod(
             dest: mods_dir.join(&filename),
             bytes,
             expected_sha1: sha1.clone(),
+            source_file: None,
             entry: content::ContentEntry {
                 slug: dep.slug.clone(),
                 project_id: dep.project_id.clone(),
@@ -3031,6 +3247,7 @@ async fn install_mod(
         dest: mods_dir.join(&root_dl_filename),
         bytes: root_dl_bytes,
         expected_sha1: root_dl_sha1.clone(),
+        source_file: None,
         entry: content::ContentEntry {
             slug: slug.clone(),
             project_id: root_project_id,
@@ -3048,8 +3265,15 @@ async fn install_mod(
     let instance_root_batch = instance_root.clone();
     let mods_dir_batch = mods_dir.clone();
     install_progress(&app, "applying", &slug, &instance, 0, 1);
+    let cancel_false = std::sync::atomic::AtomicBool::new(false);
     spawn_blocking_result(move || {
-        fsx::apply_batch_transactional(&instance_root_batch, "mods", &mods_dir_batch, batch_items)
+        fsx::apply_batch_transactional(
+            &instance_root_batch,
+            "mods",
+            &mods_dir_batch,
+            batch_items,
+            &cancel_false,
+        )
     })
     .await?;
     install_progress(&app, "applying", &slug, &instance, 1, 1);
@@ -3311,6 +3535,7 @@ async fn download_project_file(
     install_progress(app, "applying", slug, instance, 0, 1);
     let instance_root_batch = instance_root.clone();
     let kind_for_index_batch = kind_for_index.clone();
+    let cancel_false = std::sync::atomic::AtomicBool::new(false);
     spawn_blocking_result(move || {
         fsx::apply_batch_transactional(
             &instance_root_batch,
@@ -3320,8 +3545,10 @@ async fn download_project_file(
                 dest,
                 bytes,
                 expected_sha1: entry.sha1.clone(),
+                source_file: None,
                 entry,
             }],
+            &cancel_false,
         )
     })
     .await?;
@@ -3608,6 +3835,11 @@ pub fn run() {
             search_mods,
             search_shaders,
             search_resourcepacks,
+            search_modpacks,
+            install_modpack_from_modrinth,
+            install_modpack_into_instance,
+            install_modpack_from_local,
+            cancel_modpack_install,
             install_mod,
             log_performance_event,
             plan_mod_dependencies,
@@ -5976,5 +6208,106 @@ mod tests {
         ri.release(&lock_key);
         assert!(!ri.is_running(&lock_key));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ───── Pruebas de search_modpacks ─────
+
+    /// Construye la cadena de facets para búsqueda de modpacks (extraída para pruebas).
+    fn build_modpack_facets(version: Option<&str>, loader: Option<&str>) -> String {
+        let mut groups: Vec<String> = vec!["[\"project_type:modpack\"]".to_string()];
+        if let Some(v) = version {
+            groups.push(format!("[\"versions:{}\"]", v));
+        }
+        if let Some(l) = loader {
+            groups.push(format!("[\"categories:{}\"]", l.to_lowercase()));
+        }
+        format!("[{}]", groups.join(", "))
+    }
+
+    #[test]
+    fn modpack_facets_incluye_project_type_modpack() {
+        let f = build_modpack_facets(None, None);
+        assert!(f.contains("\"project_type:modpack\""));
+    }
+
+    #[test]
+    fn modpack_facets_con_version_y_loader() {
+        let f = build_modpack_facets(Some("1.21.4"), Some("Fabric"));
+        assert!(f.contains("\"versions:1.21.4\""));
+        assert!(f.contains("\"categories:fabric\""));
+        assert!(f.contains("\"project_type:modpack\""));
+    }
+
+    #[test]
+    fn modpack_facets_loader_minusculas() {
+        let f = build_modpack_facets(None, Some("NeoForge"));
+        assert!(f.contains("\"categories:neoforge\""));
+    }
+
+    #[test]
+    fn modpack_result_deserializa_como_campos_completos() {
+        let json = json!({
+            "project_id": "abc123",
+            "slug": "mi-modpack",
+            "title": "Mi Modpack",
+            "description": "Un modpack de prueba",
+            "downloads": 42000,
+            "icon_url": "https://cdn.modrinth.com/icon.png",
+            "author": "AutorTest",
+            "categories": ["fabric", "adventure"],
+            "versions": ["1.21.4", "1.21.1"],
+            "loaders": ["fabric", "forge"]
+        });
+        let r: ModpackResult = serde_json::from_value(json).unwrap();
+        assert_eq!(r.id, "abc123");
+        assert_eq!(r.slug, "mi-modpack");
+        assert_eq!(r.title, "Mi Modpack");
+        assert_eq!(r.description, "Un modpack de prueba");
+        assert_eq!(r.downloads, 42000);
+        assert_eq!(
+            r.icon_url,
+            Some("https://cdn.modrinth.com/icon.png".to_string())
+        );
+        assert_eq!(r.author, "AutorTest");
+        assert_eq!(
+            r.categories,
+            vec!["fabric".to_string(), "adventure".to_string()]
+        );
+        assert_eq!(r.versions, vec!["1.21.4".to_string(), "1.21.1".to_string()]);
+        assert_eq!(r.loaders, vec!["fabric".to_string(), "forge".to_string()]);
+    }
+
+    #[test]
+    fn modpack_result_deserializa_campos_opcionales_ausentes() {
+        let json = json!({
+            "project_id": "x",
+            "slug": "x-slug",
+            "title": "X",
+            "downloads": 0
+        });
+        let r: ModpackResult = serde_json::from_value(json).unwrap();
+        assert_eq!(r.id, "x");
+        assert_eq!(r.slug, "x-slug");
+        assert_eq!(r.title, "X");
+        assert_eq!(r.description, "");
+        assert_eq!(r.downloads, 0);
+        assert_eq!(r.icon_url, None);
+        assert_eq!(r.author, "");
+        assert_eq!(r.categories, Vec::<String>::new());
+        assert_eq!(r.versions, Vec::<String>::new());
+        assert_eq!(r.loaders, Vec::<String>::new());
+    }
+
+    #[test]
+    fn modpack_result_deserializa_author_vacio() {
+        let json = json!({
+            "project_id": "a",
+            "slug": "a-slug",
+            "title": "A",
+            "downloads": 5,
+            "author": null
+        });
+        let r: ModpackResult = serde_json::from_value(json).unwrap();
+        assert_eq!(r.author, "");
     }
 }

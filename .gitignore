@@ -12,3 +12,10 @@ Thumbs.db
 # Secrets
 obsidia-app/src-tauri/updater.key
 obsidia-app/src-tauri/updater.key.pub
+# temporales de trabajo
+tmp_*
+fix_render.py
+obsidia-app/build_out.txt
+obsidia-app/tmp_*.js
+obsidia-app/tmp_*.cjs
+obsidia-app/tmp_*.py

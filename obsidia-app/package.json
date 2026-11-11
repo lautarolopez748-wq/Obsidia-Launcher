@@ -16,7 +16,9 @@
   "dependencies": {
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-opener": "^2",
-    "@tauri-apps/plugin-updater": "^2.14.1"
+    "@tauri-apps/plugin-updater": "^2.14.1",
+    "skinview3d": "3.4.2",
+    "three": "0.156.1"
   },
   "devDependencies": {
     "@sveltejs/adapter-static": "^3.0.10",
